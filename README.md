@@ -12,7 +12,7 @@ Released under Apache 2.0. The code in this repository is extracted from the mai
 - **Argon2id key derivation** for password-based keys (`simple/keys.go`)
 - **Content-addressed chunking** (CDC) for binary deduplication (`simple/chunk_cdc.go`)
 - **GBF format** — blob store, manifest, snapshot pipeline (`simple/`)
-- **Local storage engine** — blob read/write/verify (`simple/local_store.go`)
+- **Local storage engine** — blob read/write with atomic commits (`simple/local_store.go`)
 - **Restore pipeline** — snapshot → file reconstruction (`simple/restore.go`)
 - **Compression** — zstd, deflate, s2, none (`compress/`)
 - **Rate limiting** — token bucket writer (`ratelimit/`)
