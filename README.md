@@ -6,6 +6,18 @@ The core encryption and content-addressed storage engine powering [Ginkgo Backup
 
 Released under Apache 2.0. The code in this repository is extracted from the main Ginkgo Backup codebase and is independently buildable and testable.
 
+## Quickstart
+
+Verify the engine actually runs a backup, end to end:
+
+```bash
+git clone https://github.com/ginkgobackup/gbf-core
+cd gbf-core
+go run ./cmd/demo/
+```
+
+The demo initializes an encrypted repo (GEK1 format), backs up three test files, runs an incremental pass (dedup), restores them, and verifies content integrity.
+
 ## What's included
 
 - **AES-256-GCM encryption** with HKDF key derivation (`crypto/`)
@@ -22,6 +34,7 @@ Released under Apache 2.0. The code in this repository is extracted from the mai
 
 ```
 gbf-core/
+├── cmd/demo/      End-to-end backup + restore demo
 ├── vault/         Encryptor interface (3 methods, zero dependencies)
 ├── crypto/        AES-256-GCM + HKDF implementation
 ├── simple/        GBF storage engine (15 source + 7 test files)
