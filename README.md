@@ -4,15 +4,33 @@ The core encryption and content-addressed storage engine powering [Ginkgo Backup
 
 ## Status
 
-This repository is being prepared for public release. The code is currently being extracted from the main Ginkgo Backup codebase and will be published here under Apache 2.0.
+Released under Apache 2.0. The code in this repository is extracted from the main Ginkgo Backup codebase and is independently buildable and testable.
 
-## What will be open sourced
+## What's included
 
-- **AES-256-GCM encryption** with HKDF key derivation
-- **Content-addressed chunking** (CDC) for binary deduplication
-- **GBF format** — blob store, manifest, snapshot pipeline
-- **Local storage engine** — blob read/write/verify
-- **Restore pipeline** — snapshot → file reconstruction
+- **AES-256-GCM encryption** with HKDF key derivation (`crypto/`)
+- **Argon2id key derivation** for password-based keys (`simple/keys.go`)
+- **Content-addressed chunking** (CDC) for binary deduplication (`simple/chunk_cdc.go`)
+- **GBF format** — blob store, manifest, snapshot pipeline (`simple/`)
+- **Local storage engine** — blob read/write/verify (`simple/local_store.go`)
+- **Restore pipeline** — snapshot → file reconstruction (`simple/restore.go`)
+- **Compression** — zstd, deflate, s2, none (`compress/`)
+- **Rate limiting** — token bucket writer (`ratelimit/`)
+- **Filesystem utilities** — atomic writes, ignore patterns (`fsutil/`)
+
+## Repository structure
+
+```
+gbf-core/
+├── vault/         Encryptor interface (3 methods, zero dependencies)
+├── crypto/        AES-256-GCM + HKDF implementation
+├── simple/        GBF storage engine (15 source + 7 test files)
+├── compress/      Compression backends (zstd, deflate, s2, none)
+├── fsutil/        Filesystem helpers (atomic write, ignore patterns)
+├── ratelimit/     Token bucket rate limiter
+├── go.mod         module github.com/ginkgobackup/gbf-core
+└── LICENSE        Apache-2.0
+```
 
 ## What stays proprietary
 
