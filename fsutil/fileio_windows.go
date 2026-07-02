@@ -9,7 +9,68 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/sys/windows"
 )
+
+const (
+	_FlagSequentialScan  = 0x08000000
+	_FileAttributeNormal = 0x00000080
+)
+
+func OpenFileSequential(path string) (*os.File, error) {
+	pathPtr, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, fmt.Errorf("OpenFileSequential: %w", err)
+	}
+
+	handle, err := windows.CreateFile(
+		pathPtr,
+		windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		_FlagSequentialScan|_FileAttributeNormal,
+		0,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("OpenFileSequential CreateFile: %w", err)
+	}
+
+	f := os.NewFile(uintptr(handle), path)
+	if f == nil {
+		windows.CloseHandle(handle)
+		return nil, fmt.Errorf("OpenFileSequential: os.NewFile returned nil")
+	}
+
+	return f, nil
+}
+
+func ReadFileSequential(path string) ([]byte, error) {
+	f, err := OpenFileSequential(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("ReadFileSequential Stat: %w", err)
+	}
+
+	size := stat.Size()
+	if size < 0 {
+		return nil, fmt.Errorf("ReadFileSequential: negative file size")
+	}
+
+	data := make([]byte, size)
+	n, err := f.Read(data)
+	if err != nil {
+		return nil, fmt.Errorf("ReadFileSequential Read: %w", err)
+	}
+
+	return data[:n], nil
+}
 
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)

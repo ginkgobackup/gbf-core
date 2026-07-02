@@ -1169,10 +1169,10 @@ func extractHashesFromJSON(data []byte) ([]string, error) {
 }
 
 type RegistryPin struct {
-	RepoPath      string `json:"repoPath"`
-	SnapshotTime  int64  `json:"snapshotTime"`
-	Note          string `json:"note"`
-	CreatedAt     int64  `json:"createdAt"`
+	RepoPath     string `json:"repoPath"`
+	SnapshotTime int64  `json:"snapshotTime"`
+	Note         string `json:"note"`
+	CreatedAt    int64  `json:"createdAt"`
 }
 
 type RegistryNote struct {

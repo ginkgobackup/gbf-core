@@ -11,6 +11,14 @@ import (
 	"path/filepath"
 )
 
+func OpenFileSequential(path string) (*os.File, error) {
+	return os.Open(path)
+}
+
+func ReadFileSequential(path string) ([]byte, error) {
+	return os.ReadFile(path)
+}
+
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
