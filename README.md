@@ -47,16 +47,17 @@ gbf-core/
 
 ## On-disk format
 
-Four magic byte prefixes identify the four blob kinds produced by this engine. They are not version-compatible with each other and a given file always carries exactly one:
+Four magic byte prefixes identify the blob kinds produced by this engine. They are not version-compatible with each other and a given file always carries exactly one:
 
-| Magic    | Kind                 | Source                       | Layout                                                                                                |
-|----------|----------------------|------------------------------|-------------------------------------------------------------------------------------------------------|
-| `GB1\0`  | Small blob           | `simple.Encryptor.Encrypt`   | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (single AEAD block)                                         |
-| `GB2\0`  | Large multi-chunk blob | `simple.Encryptor.Encrypt`  | `magic` ‖ `chunkCount` ‖ for each chunk: `nonce` ‖ `ciphertext` ‖ `tag` (chunked AEAD with IV per chunk) |
-| `GKM1`   | Encrypted manifest   | `simple.EncryptManifest`     | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (manifest key derived via HKDF from the master key)         |
-| `GEK1`   | Encrypted keyfile     | `simple/keys.go`             | `magic` ‖ `salt` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (master key wrapped by Argon2id-derived key; Argon2id parameters are compile-time constants, see `simple/keys.go`) |
+| Magic    | Kind                            | Source                          | Layout                                                                                                                          |
+|----------|---------------------------------|---------------------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| `GB1\0`  | Small blob                      | `Encryptor.Encrypt` (small)     | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (single AEAD block)                                                                   |
+| `GB1\0`  | Large blob, no compression      | `Encryptor.Encrypt` (large)     | `magic` ‖ `chunkCount` ‖ for each chunk: `nonce` ‖ `ciphertext` ‖ `tag` (chunked AEAD, distinguished from small form by a valid chunkCount prefix) |
+| `GB2\0`  | Large blob, per-chunk compression | `encryptFileToWriter` (stream)  | `magic` ‖ `chunkCount` ‖ for each chunk: `size` ‖ `flags` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (each chunk carries its own size header and a compression flag) |
+| `GKM1`   | Encrypted manifest              | `EncryptManifest`               | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (manifest key derived via HKDF from the master key)                                   |
+| `GEK1`   | Encrypted keyfile               | `simple/keys.go`                | `magic` ‖ `salt` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (master key wrapped by Argon2id-derived key; Argon2id parameters are compile-time constants, see `simple/keys.go`) |
 
-`GB1\0` and `GB2\0` are produced by the same encryptor and selected automatically based on plaintext size relative to the configured chunk size. The decryptor inspects the magic byte and handles either form transparently.
+`GB1\0` covers two layouts distinguished by a valid `chunkCount` prefix: small blobs (no chunk header, single AEAD block) and large blobs (chunk header followed by per-chunk `nonce‖ciphertext‖tag` without per-chunk size). `GB2\0` is the streaming variant that adds a per-chunk size header and compression flag, allowing each chunk to be compressed independently before encryption. The decryptor inspects the magic byte and layout to handle all forms transparently.
 
 ## Content-Defined Chunking (CDC)
 
