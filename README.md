@@ -4,7 +4,7 @@ The core encryption and content-addressed storage engine powering [Ginkgo Backup
 
 ## Status
 
-Released under Apache 2.0. The code in this repository is extracted from the main Ginkgo Backup codebase and is independently buildable and testable. The API is pre-1.0 and may change between minor versions until v1.0.
+Released under Apache 2.0. This is the standalone core engine that the main Ginkgo Backup product depends on. It is independently buildable and testable. The API is pre-1.0 and may change between minor versions until v1.0.
 
 ## Quickstart
 
