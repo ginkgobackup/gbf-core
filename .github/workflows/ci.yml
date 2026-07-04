@@ -29,7 +29,7 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
           # v1.x is built with Go 1.23 and cannot parse go.mod's go 1.25.
           # v2.x is built with a newer Go and is the current release.
