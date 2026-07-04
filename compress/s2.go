@@ -32,7 +32,7 @@ func (c *S2Compressor) Compress(data []byte) ([]byte, error) {
 		w = s2.NewWriter(&buf)
 	}
 	if _, err := w.Write(data); err != nil {
-		w.Close()
+		_ = w.Close()
 		return nil, err
 	}
 	if err := w.Close(); err != nil {

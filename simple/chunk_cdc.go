@@ -87,7 +87,7 @@ func (p *SimplePipeline) hashFileWithCDC(ctx context.Context, filePath string, s
 	if err != nil {
 		return "", nil, fmt.Errorf("open: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Prefer the per-instance polynomial (set in NewSimplePipeline) so that
 	// concurrent pipelines targeting different repos don't clobber each

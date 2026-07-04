@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -34,7 +35,7 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 	if err != nil {
 		return "", fmt.Errorf("open: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var contentHash string
 	if knownHash != "" {
@@ -84,8 +85,8 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 		return "", fmt.Errorf("create tmp: %w", err)
 	}
 	defer func() {
-		tmpF.Close()
-		os.Remove(tmpPath)
+		_ = tmpF.Close()
+		_ = os.Remove(tmpPath)
 	}()
 
 	var streamCompressor *compress.ZstdCompressor
@@ -99,13 +100,15 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 	if err := tmpF.Sync(); err != nil {
 		return "", fmt.Errorf("sync: %w", err)
 	}
-	tmpF.Close()
+	if err := tmpF.Close(); err != nil {
+		return "", fmt.Errorf("close tmp: %w", err)
+	}
 
 	tmpF2, err := os.Open(tmpPath)
 	if err != nil {
 		return "", fmt.Errorf("reopen tmp: %w", err)
 	}
-	defer tmpF2.Close()
+	defer func() { _ = tmpF2.Close() }()
 
 	tmpInfo, err := tmpF2.Stat()
 	if err != nil {
@@ -236,7 +239,7 @@ func DownloadBlobToFile(ctx context.Context, store SimpleBlobStore, dec *Decrypt
 		}
 		return os.Rename(tmp, targetPath)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	dir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -248,20 +251,26 @@ func DownloadBlobToFile(ctx context.Context, store SimpleBlobStore, dec *Decrypt
 		return fmt.Errorf("create tmp: %w", err)
 	}
 	defer func() {
-		tmpF.Close()
-		os.Remove(tmp)
+		_ = tmpF.Close()
+		_ = os.Remove(tmp)
 	}()
 
 	if err := decryptStreamToFile(dec, rc, tmpF); err != nil {
 		return fmt.Errorf("stream decrypt: %w", err)
 	}
 
+	// Apply the source file's mode bits to the staged tmp file. Non-fatal
+	// — content is already written, so log and continue on failure.
 	if err := tmpF.Chmod(os.FileMode(mode)); err != nil {
+		slog.Warn("GBF stream restore: chmod tmp file failed",
+			"path", targetPath, "mode", mode, "error", err)
 	}
 	if err := tmpF.Sync(); err != nil {
 		return fmt.Errorf("sync: %w", err)
 	}
-	tmpF.Close()
+	if err := tmpF.Close(); err != nil {
+		return fmt.Errorf("close tmp: %w", err)
+	}
 
 	return os.Rename(tmp, targetPath)
 }

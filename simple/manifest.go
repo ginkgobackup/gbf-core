@@ -859,7 +859,7 @@ func renameWithFallback(src, dst string) error {
 	if openErr != nil {
 		return fmt.Errorf("rename fallback open: %w", openErr)
 	}
-	defer srcFile.Close()
+	defer func() { _ = srcFile.Close() }()
 	dstDir := filepath.Dir(dst)
 	if mkErr := os.MkdirAll(dstDir, 0755); mkErr != nil {
 		return fmt.Errorf("rename fallback mkdir: %w", mkErr)
@@ -868,9 +868,9 @@ func renameWithFallback(src, dst string) error {
 	if createErr != nil {
 		return fmt.Errorf("rename fallback create: %w", createErr)
 	}
-	defer dstFile.Close()
+	defer func() { _ = dstFile.Close() }()
 	if _, copyErr := io.Copy(dstFile, srcFile); copyErr != nil {
-		os.Remove(dst)
+		_ = os.Remove(dst)
 		return fmt.Errorf("rename fallback copy: %w", copyErr)
 	}
 	if removeErr := os.Remove(src); removeErr != nil {
@@ -919,7 +919,7 @@ func TrashAllSourceManifests(metaDir string, cloudID string) (int, error) {
 	}
 	remaining, _ := os.ReadDir(srcDir)
 	if len(remaining) == 0 {
-		os.Remove(srcDir)
+		_ = os.Remove(srcDir)
 	}
 	return moved, nil
 }
@@ -946,7 +946,7 @@ func DeleteAllSourceManifests(metaDir string, cloudID string) (int, error) {
 	}
 	remaining, _ := os.ReadDir(srcDir)
 	if len(remaining) == 0 {
-		os.Remove(srcDir)
+		_ = os.Remove(srcDir)
 	}
 	return deleted, nil
 }
@@ -1030,7 +1030,7 @@ func CleanTrashManifestsForSource(metaDir string, cloudID string, maxAge time.Du
 	}
 	remaining, _ := os.ReadDir(dir)
 	if len(remaining) == 0 {
-		os.Remove(dir)
+		_ = os.Remove(dir)
 		cleanTrashSourceRegistry(metaDir, cloudID)
 	}
 	return cleaned, nil
@@ -1039,10 +1039,10 @@ func CleanTrashManifestsForSource(metaDir string, cloudID string, maxAge time.Du
 func cleanTrashSourceRegistry(metaDir string, cloudID string) {
 	dir := filepath.Join(metaDir, "trash", "_sources")
 	path := filepath.Join(dir, cloudID+".json.zst")
-	os.Remove(path)
+	_ = os.Remove(path)
 	remaining, _ := os.ReadDir(dir)
 	if len(remaining) == 0 {
-		os.Remove(dir)
+		_ = os.Remove(dir)
 	}
 }
 

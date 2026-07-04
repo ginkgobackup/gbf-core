@@ -24,7 +24,7 @@ func SHA256File(path string) (*HashResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	size, err := io.Copy(h, f)
 	if err != nil {

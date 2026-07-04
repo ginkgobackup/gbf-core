@@ -6,6 +6,7 @@ package simple
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -173,14 +174,20 @@ func (r *SimpleRestore) Run(ctx context.Context) (*RestoreResult, error) {
 				return nil, fmt.Errorf("write %s: %w", file.Name, err)
 			}
 			if err := os.Rename(tmp, targetPath); err != nil {
-				os.Remove(tmp)
+				_ = os.Remove(tmp)
 				return nil, fmt.Errorf("rename %s: %w", file.Name, err)
 			}
 		}
 
 		mtime := file.MtimeTime()
 		if !mtime.IsZero() {
-			os.Chtimes(targetPath, mtime, mtime)
+			// Restoring mtime is best-effort — if it fails (e.g. readonly
+			// target dir) the file content is still correct, so log and
+			// continue rather than failing the restore.
+			if err := os.Chtimes(targetPath, mtime, mtime); err != nil {
+				slog.Warn("GBF restore: chtimes failed",
+					"file", file.Name, "error", err)
+			}
 		}
 		result.RestoredFiles++
 		result.RestoredBytes += file.Size
@@ -208,8 +215,8 @@ func (r *SimpleRestore) restoreChunkedFile(ctx context.Context, file FileEntry, 
 		return fmt.Errorf("create tmp: %w", err)
 	}
 	defer func() {
-		tmpF.Close()
-		os.Remove(tmp)
+		_ = tmpF.Close()
+		_ = os.Remove(tmp)
 	}()
 
 	for _, chunk := range file.Chunks {
@@ -225,12 +232,19 @@ func (r *SimpleRestore) restoreChunkedFile(ctx context.Context, file FileEntry, 
 		}
 	}
 
+	// Apply the source file's mode bits to the staged tmp file. A failure
+	// here is non-fatal — the file content is already written and durable —
+	// so we log and continue rather than failing the whole restore.
 	if err := tmpF.Chmod(os.FileMode(file.Mode)); err != nil {
+		slog.Warn("GBF restore: chmod tmp file failed",
+			"file", file.Name, "mode", file.Mode, "error", err)
 	}
 	if err := tmpF.Sync(); err != nil {
 		return fmt.Errorf("sync: %w", err)
 	}
-	tmpF.Close()
+	if err := tmpF.Close(); err != nil {
+		return fmt.Errorf("close tmp: %w", err)
+	}
 
 	return os.Rename(tmp, targetPath)
 }

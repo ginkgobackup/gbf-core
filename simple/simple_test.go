@@ -114,8 +114,12 @@ func TestLocalBlobStoreList(t *testing.T) {
 	ctx := context.Background()
 	hash1 := SHA256Bytes([]byte("data1"))
 	hash2 := SHA256Bytes([]byte("data2"))
-	store.Put(ctx, hash1, []byte("encrypted1"))
-	store.Put(ctx, hash2, []byte("encrypted2"))
+	if err := store.Put(ctx, hash1, []byte("encrypted1")); err != nil {
+		t.Fatalf("put hash1: %v", err)
+	}
+	if err := store.Put(ctx, hash2, []byte("encrypted2")); err != nil {
+		t.Fatalf("put hash2: %v", err)
+	}
 	list, err := store.List(ctx, "")
 	if err != nil {
 		t.Fatalf("list: %v", err)
@@ -130,7 +134,9 @@ func TestLocalBlobStoreDelete(t *testing.T) {
 	store := NewLocalBlobStore(dir)
 	ctx := context.Background()
 	hash := SHA256Bytes([]byte("test"))
-	store.Put(ctx, hash, []byte("data"))
+	if err := store.Put(ctx, hash, []byte("data")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
 	if err := store.Delete(ctx, hash); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -248,7 +254,9 @@ func TestUploadBlobFromPath(t *testing.T) {
 	ctx := context.Background()
 
 	smallFile := filepath.Join(dir, "small.txt")
-	os.WriteFile(smallFile, []byte("small file content"), 0644)
+	if err := os.WriteFile(smallFile, []byte("small file content"), 0644); err != nil {
+		t.Fatalf("write small: %v", err)
+	}
 	hash, err := UploadBlobFromPath(ctx, store, enc, smallFile, "")
 	if err != nil {
 		t.Fatalf("upload small from path: %v", err)
@@ -266,7 +274,9 @@ func TestUploadBlobFromPath(t *testing.T) {
 		largeData[i] = byte(i % 256)
 	}
 	largeFile := filepath.Join(dir, "large.bin")
-	os.WriteFile(largeFile, largeData, 0644)
+	if err := os.WriteFile(largeFile, largeData, 0644); err != nil {
+		t.Fatalf("write large: %v", err)
+	}
 	hash2, err := UploadBlobFromPath(ctx, store, enc, largeFile, "")
 	if err != nil {
 		t.Fatalf("upload large from path: %v", err)
@@ -377,9 +387,15 @@ func TestUploadBlobFromPath_SkipsCompressionForIncompressible(t *testing.T) {
 func TestPipelineBackupRestore(t *testing.T) {
 	repoDir := t.TempDir()
 	sourceDir := filepath.Join(t.TempDir(), "source")
-	os.MkdirAll(filepath.Join(sourceDir, "subdir"), 0755)
-	os.WriteFile(filepath.Join(sourceDir, "file1.txt"), []byte("hello world"), 0644)
-	os.WriteFile(filepath.Join(sourceDir, "subdir", "file2.txt"), []byte("nested file"), 0644)
+	if err := os.MkdirAll(filepath.Join(sourceDir, "subdir"), 0755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "file1.txt"), []byte("hello world"), 0644); err != nil {
+		t.Fatalf("write file1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "subdir", "file2.txt"), []byte("nested file"), 0644); err != nil {
+		t.Fatalf("write file2: %v", err)
+	}
 
 	if err := InitRepo(InitParams{RepoRoot: repoDir, DeviceID: "test"}); err != nil {
 		t.Fatalf("init: %v", err)
@@ -433,8 +449,12 @@ func TestPipelineBackupRestore(t *testing.T) {
 func TestPipelineIncremental(t *testing.T) {
 	repoDir := t.TempDir()
 	sourceDir := filepath.Join(t.TempDir(), "source")
-	os.MkdirAll(sourceDir, 0755)
-	os.WriteFile(filepath.Join(sourceDir, "file.txt"), []byte("original"), 0644)
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "file.txt"), []byte("original"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
 
 	if err := InitRepo(InitParams{RepoRoot: repoDir, DeviceID: "test"}); err != nil {
 		t.Fatalf("init: %v", err)
@@ -483,7 +503,9 @@ func TestFormatDetection(t *testing.T) {
 	if format != RepoFormatUnknown {
 		t.Fatalf("unknown repo: got %v", format)
 	}
-	InitRepo(InitParams{RepoRoot: dir, DeviceID: "test"})
+	if err := InitRepo(InitParams{RepoRoot: dir, DeviceID: "test"}); err != nil {
+		t.Fatalf("init repo: %v", err)
+	}
 	format = DetectRepoFormat(dir)
 	if format != RepoFormatGBF {
 		t.Fatalf("gb repo: got %v", format)

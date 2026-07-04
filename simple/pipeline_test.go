@@ -259,7 +259,9 @@ func (m *mockBlobStore) GetStream(_ context.Context, hash string) (io.ReadCloser
 	if !ok {
 		return nil, fmt.Errorf("blob %s not found", hash)
 	}
-	return io.NopCloser(bytesReader(data)), nil
+	// Take the address so the pointer-receiver Read can advance the slice.
+	r := bytesReader(data)
+	return io.NopCloser(&r), nil
 }
 
 func (m *mockBlobStore) List(_ context.Context, _ string) ([]string, error) {
@@ -291,12 +293,16 @@ func (m *mockBlobStore) BlobPath(hash string) string {
 
 type bytesReader []byte
 
-func (b bytesReader) Read(p []byte) (int, error) {
-	if len(b) == 0 {
+// Pointer receiver so the b = b[n:] slice advance persists across Read
+// calls. With a value receiver the slice header is copied on every call,
+// the advance is lost, and the reader loops forever returning the same
+// prefix — staticcheck flags the assignment as unused (SA4006).
+func (b *bytesReader) Read(p []byte) (int, error) {
+	if len(*b) == 0 {
 		return 0, io.EOF
 	}
-	n := copy(p, b)
-	b = b[n:]
+	n := copy(p, *b)
+	*b = (*b)[n:]
 	return n, nil
 }
 
@@ -647,14 +653,26 @@ func bytesEqual(a, b []byte) bool {
 
 func TestPipelineEmptyDirDetection(t *testing.T) {
 	dir := t.TempDir()
-	os.MkdirAll(filepath.Join(dir, "empty"), 0755)
-	os.MkdirAll(filepath.Join(dir, "parent", "child_empty"), 0755)
-	os.MkdirAll(filepath.Join(dir, "has_files"), 0755)
-	os.WriteFile(filepath.Join(dir, "has_files", "file.txt"), []byte("data"), 0644)
-	os.WriteFile(filepath.Join(dir, "root.txt"), []byte("root"), 0644)
+	if err := os.MkdirAll(filepath.Join(dir, "empty"), 0755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "parent", "child_empty"), 0755); err != nil {
+		t.Fatalf("mkdir child_empty: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "has_files"), 0755); err != nil {
+		t.Fatalf("mkdir has_files: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "has_files", "file.txt"), []byte("data"), 0644); err != nil {
+		t.Fatalf("write file.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "root.txt"), []byte("root"), 0644); err != nil {
+		t.Fatalf("write root.txt: %v", err)
+	}
 
 	repoDir := filepath.Join(dir, "repo")
-	os.MkdirAll(repoDir, 0755)
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
 	if err := InitRepoWithPassword(repoDir, "test", "demo-password"); err != nil {
 		t.Fatalf("init repo: %v", err)
 	}

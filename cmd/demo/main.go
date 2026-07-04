@@ -17,7 +17,7 @@ func main() {
 	if err != nil {
 		fail("create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() { _ = os.RemoveAll(tempDir) }()
 
 	sourceDir := filepath.Join(tempDir, "source")
 	repoDir := filepath.Join(tempDir, "repo")

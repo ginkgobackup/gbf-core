@@ -43,7 +43,7 @@ func OpenFileSequential(path string) (*os.File, error) {
 
 	f := os.NewFile(uintptr(handle), path)
 	if f == nil {
-		windows.CloseHandle(handle)
+		_ = windows.CloseHandle(handle)
 		return nil, fmt.Errorf("OpenFileSequential: os.NewFile returned nil")
 	}
 
@@ -55,7 +55,7 @@ func ReadFileSequential(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	stat, err := f.Stat()
 	if err != nil {
@@ -115,7 +115,7 @@ func syncParentDir(dir string) error {
 		}
 		return fmt.Errorf("syncParentDir CreateFile: %w", err)
 	}
-	defer windows.CloseHandle(handle)
+	defer func() { _ = windows.CloseHandle(handle) }()
 
 	if err := windows.FlushFileBuffers(handle); err != nil {
 		return fmt.Errorf("syncParentDir FlushFileBuffers: %w", err)

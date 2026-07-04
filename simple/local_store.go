@@ -56,7 +56,8 @@ func validateHash(hash string) bool {
 	for i := 0; i < len(hash); i++ {
 		c := hash[i]
 		// Only accept 0-9 and a-f. Reject A-F (uppercase) explicitly.
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		// De Morgan's form: "not (0-9 or a-f)" == "not 0-9 and not a-f".
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
@@ -142,23 +143,23 @@ func (s *LocalBlobStore) putBlob(ctx context.Context, hash string, writeBlob fun
 	}
 
 	if err := writeBlob(f); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 
 	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("sync tmp blob: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return fmt.Errorf("close tmp blob: %w", err)
 	}
 
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		// A concurrent put for the same hash may have completed first.
 		// Treat "target already exists" as success rather than a race failure.
 		if _, statErr := os.Stat(path); statErr == nil {

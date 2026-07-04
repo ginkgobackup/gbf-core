@@ -27,7 +27,7 @@ func syncParentDir(dir string) error {
 	if err != nil {
 		return fmt.Errorf("open parent dir: %w", err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	if err := d.Sync(); err != nil {
 		return fmt.Errorf("fsync parent dir: %w", err)

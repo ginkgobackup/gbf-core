@@ -532,11 +532,15 @@ func TestListManifests(t *testing.T) {
 
 		m1 := NewManifest(1, "", "src", "/data", "dev1")
 		m1.Timestamp = "2026-05-19T10:00:00Z"
-		SaveManifest(dir, m1)
+		if err := SaveManifest(dir, m1); err != nil {
+			t.Fatalf("save m1: %v", err)
+		}
 
 		m2 := NewManifest(1, "", "src", "/data", "dev1")
 		m2.Timestamp = "2026-05-19T12:00:00Z"
-		SaveManifest(dir, m2)
+		if err := SaveManifest(dir, m2); err != nil {
+			t.Fatalf("save m2: %v", err)
+		}
 
 		manifests, loadErrors, err := ListManifests(dir, ManifestPathKey("dev1", "1"))
 		if err != nil {
@@ -570,14 +574,20 @@ func TestListManifests(t *testing.T) {
 	t.Run("corrupted_file", func(t *testing.T) {
 		dir := t.TempDir()
 		manifestDir := ManifestDir(dir, ManifestPathKey("dev1", "1"))
-		os.MkdirAll(manifestDir, 0755)
+		if err := os.MkdirAll(manifestDir, 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
 
 		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.Timestamp = "2026-05-19T10:00:00Z"
-		SaveManifest(dir, m)
+		if err := SaveManifest(dir, m); err != nil {
+			t.Fatalf("save: %v", err)
+		}
 
 		corruptPath := filepath.Join(manifestDir, "9999999999_dev1.json.zst")
-		os.WriteFile(corruptPath, []byte("corrupted data"), 0644)
+		if err := os.WriteFile(corruptPath, []byte("corrupted data"), 0644); err != nil {
+			t.Fatalf("write corrupt: %v", err)
+		}
 
 		manifests, loadErrors, err := ListManifests(dir, ManifestPathKey("dev1", "1"))
 		if err != nil {
@@ -598,7 +608,9 @@ func TestDeleteManifest(t *testing.T) {
 
 		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.Timestamp = "2026-05-19T10:00:00Z"
-		SaveManifest(dir, m)
+		if err := SaveManifest(dir, m); err != nil {
+			t.Fatalf("save: %v", err)
+		}
 
 		if err := DeleteManifest(dir, ManifestPathKey("dev1", "1"), "2026-05-19T10:00:00Z", "dev1"); err != nil {
 			t.Fatalf("delete: %v", err)
@@ -625,7 +637,9 @@ func TestTrashManifest(t *testing.T) {
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	m.AddFile(FileEntry{Name: "a.txt", Size: 10})
-	SaveManifest(dir, m)
+	if err := SaveManifest(dir, m); err != nil {
+		t.Fatalf("save: %v", err)
+	}
 
 	if err := TrashManifest(dir, ManifestPathKey("dev1", "1"), "2026-05-19T10:00:00Z", "dev1"); err != nil {
 		t.Fatalf("trash: %v", err)
@@ -666,16 +680,22 @@ func TestCleanTrashManifests(t *testing.T) {
 
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
-	SaveManifest(dir, m)
+	if err := SaveManifest(dir, m); err != nil {
+		t.Fatalf("save: %v", err)
+	}
 
-	TrashManifest(dir, ManifestPathKey("dev1", "1"), "2026-05-19T10:00:00Z", "dev1")
+	if err := TrashManifest(dir, ManifestPathKey("dev1", "1"), "2026-05-19T10:00:00Z", "dev1"); err != nil {
+		t.Fatalf("trash: %v", err)
+	}
 
 	trashDir := ManifestTrashDir(dir, ManifestPathKey("dev1", "1"))
 	entries, _ := os.ReadDir(trashDir)
 	for _, e := range entries {
 		oldPath := filepath.Join(trashDir, e.Name())
 		newTime := time.Now().Add(-2 * time.Hour)
-		os.Chtimes(oldPath, newTime, newTime)
+		if err := os.Chtimes(oldPath, newTime, newTime); err != nil {
+			t.Fatalf("chtimes %s: %v", oldPath, err)
+		}
 	}
 
 	cleaned, err := CleanTrashManifests(dir, time.Hour)
@@ -697,9 +717,13 @@ func TestCleanTrashManifestsRecentFilesKept(t *testing.T) {
 
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
-	SaveManifest(dir, m)
+	if err := SaveManifest(dir, m); err != nil {
+		t.Fatalf("save: %v", err)
+	}
 
-	TrashManifest(dir, ManifestPathKey("dev1", "1"), "2026-05-19T10:00:00Z", "dev1")
+	if err := TrashManifest(dir, ManifestPathKey("dev1", "1"), "2026-05-19T10:00:00Z", "dev1"); err != nil {
+		t.Fatalf("trash: %v", err)
+	}
 
 	cleaned, err := CleanTrashManifests(dir, 24*time.Hour)
 	if err != nil {
@@ -733,7 +757,9 @@ func TestManifestExistsByTimestamp(t *testing.T) {
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	ts := "2026-05-19T10:00:00Z"
 	m.Timestamp = ts
-	SaveManifest(dir, m)
+	if err := SaveManifest(dir, m); err != nil {
+		t.Fatalf("save: %v", err)
+	}
 
 	parsed, _ := time.Parse(time.RFC3339, ts)
 
@@ -757,7 +783,9 @@ func TestLoadManifestByTimestamp(t *testing.T) {
 		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.Timestamp = "2026-05-19T10:00:00Z"
 		m.AddFile(FileEntry{Name: "found.txt", Size: 10})
-		SaveManifest(dir, m)
+		if err := SaveManifest(dir, m); err != nil {
+			t.Fatalf("save: %v", err)
+		}
 
 		loaded, err := LoadManifestByTimestamp(dir, ManifestPathKey("dev1", "1"), "2026-05-19T10:00:00Z")
 		if err != nil {
@@ -840,8 +868,12 @@ func TestSourceRegistryMultiple(t *testing.T) {
 	reg1 := &SourceRegistry{CloudID: "1", Name: "Source1", Path: "/a"}
 	reg2 := &SourceRegistry{CloudID: "2", Name: "Source2", Path: "/b"}
 
-	SaveSourceRegistry(dir, reg1)
-	SaveSourceRegistry(dir, reg2)
+	if err := SaveSourceRegistry(dir, reg1); err != nil {
+		t.Fatalf("save reg1: %v", err)
+	}
+	if err := SaveSourceRegistry(dir, reg2); err != nil {
+		t.Fatalf("save reg2: %v", err)
+	}
 
 	list, err := ListSourceRegistries(dir)
 	if err != nil {
@@ -970,13 +1002,19 @@ func TestDeleteManifestPreservesOtherManifests(t *testing.T) {
 
 	m1 := NewManifest(1, "", "src", "/data", "dev1")
 	m1.Timestamp = "2026-05-19T10:00:00Z"
-	SaveManifest(dir, m1)
+	if err := SaveManifest(dir, m1); err != nil {
+		t.Fatalf("save m1: %v", err)
+	}
 
 	m2 := NewManifest(1, "", "src", "/data", "dev1")
 	m2.Timestamp = "2026-05-19T12:00:00Z"
-	SaveManifest(dir, m2)
+	if err := SaveManifest(dir, m2); err != nil {
+		t.Fatalf("save m2: %v", err)
+	}
 
-	DeleteManifest(dir, ManifestPathKey("dev1", "1"), "2026-05-19T10:00:00Z", "dev1")
+	if err := DeleteManifest(dir, ManifestPathKey("dev1", "1"), "2026-05-19T10:00:00Z", "dev1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
 
 	manifests, _, err := ListManifests(dir, ManifestPathKey("dev1", "1"))
 	if err != nil {

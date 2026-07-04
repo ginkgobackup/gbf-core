@@ -394,7 +394,12 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 		select {
 		case ch <- fe:
 		case <-ctx.Done():
-			break
+			// The select returned because ctx was cancelled; the
+			// ctx.Err() check at the top of the next iteration (or the
+			// one right after the select) terminates the loop. A bare
+			// `break` here would only exit the select, not the for —
+			// staticcheck flags it as ineffective, so we rely on the
+			// explicit ctx.Err() check below instead.
 		}
 		if ctx.Err() != nil {
 			break
@@ -744,7 +749,7 @@ func (p *SimplePipeline) hashAndEncryptFile(ctx context.Context, path string, si
 	if err != nil {
 		return "", nil, fmt.Errorf("open: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if size < int64(p.enc.chunkSize) {
 		data, err := io.ReadAll(f)
@@ -785,7 +790,7 @@ func (p *SimplePipeline) hashOnlyFile(ctx context.Context, path string, size int
 	if err != nil {
 		return "", nil, fmt.Errorf("open: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	buf := make([]byte, p.enc.chunkSize)
 	if _, err := io.CopyBuffer(h, f, buf); err != nil {
@@ -805,16 +810,12 @@ func (p *SimplePipeline) hashOnlyFile(ctx context.Context, path string, size int
 	return contentHash, nil, fmt.Errorf("large unencrypted file (%d bytes) must use streaming path", size)
 }
 
-func (p *SimplePipeline) isExcluded(relPath string) bool {
-	return fsutil.IsExcluded(relPath, p.posExcludes, p.negExcludes)
-}
-
 func (p *SimplePipeline) hashFileWithChunks(ctx context.Context, filePath string, size int64) (string, []ChunkRef, error) {
 	f, err := openFileWithRetry(ctx, filePath)
 	if err != nil {
 		return "", nil, fmt.Errorf("open: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
 	buf := make([]byte, p.enc.chunkSize)
@@ -878,7 +879,7 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 	if err != nil {
 		return 0, fmt.Errorf("open: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	gcm, gcmErr := p.getGCM()
 	if gcmErr != nil {
