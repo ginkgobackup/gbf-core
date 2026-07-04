@@ -100,9 +100,18 @@ func (f *FlexTime) UnmarshalJSON(data []byte) error {
 	}
 	s := n.String()
 	if iv, err := n.Int64(); err == nil {
-		if iv > 1e12 {
+		// Heuristic unit detection based on magnitude. Thresholds are chosen
+		// so that any plausible present-day timestamp (seconds, millis, or
+		// micros) is decoded with the unit that yields a sane date:
+		//   - seconds   today: ~1.7e9
+		//   - millis    today: ~1.7e12
+		//   - micros    today: ~1.7e15
+		// With iv > 1e14 we must be looking at microseconds (a 2024 millis
+		// value ~1.7e12 would otherwise be misread as µs and land in 1970).
+		// With iv > 1e11 (and <= 1e14) we must be looking at millis.
+		if iv > 1e14 {
 			s = time.UnixMicro(iv).UTC().Format(time.RFC3339Nano)
-		} else if iv > 1e9 {
+		} else if iv > 1e11 {
 			s = time.UnixMilli(iv).UTC().Format(time.RFC3339Nano)
 		} else {
 			s = time.Unix(iv, 0).UTC().Format(time.RFC3339Nano)
@@ -1292,25 +1301,39 @@ func LoadSourceRegistry(metaDir string, cloudID string) (*SourceRegistry, error)
 
 func ListSourceRegistries(metaDir string) ([]*SourceRegistry, error) {
 	dir := sourceRegistriesDir(metaDir)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("readdir source registries: %w", err)
-	}
+	// Walk recursively: when a deviceID is set, ResolveCloudID returns
+	// "<deviceID>/<sourceID>", so the registry file lives in a per-device
+	// subdirectory. A flat ReadDir would skip those subdirectories and
+	// silently drop every source that has a device fingerprint.
 	var result []*SourceRegistry
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json.zst") {
-			continue
-		}
-		cloudID := strings.TrimSuffix(e.Name(), ".json.zst")
-		reg, err := LoadSourceRegistry(metaDir, cloudID)
+	walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			slog.Warn("source registry load failed", "cloud_id", cloudID, "error", err)
-			continue
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return fmt.Errorf("walk source registries: %w", err)
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(path, ".json.zst") {
+			return nil
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return nil
+		}
+		cloudID := strings.TrimSuffix(filepath.ToSlash(rel), ".json.zst")
+		reg, loadErr := LoadSourceRegistry(metaDir, cloudID)
+		if loadErr != nil {
+			slog.Warn("source registry load failed", "cloud_id", cloudID, "error", loadErr)
+			return nil
 		}
 		result = append(result, reg)
+		return nil
+	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("walk source registries: %w", walkErr)
 	}
 	return result, nil
 }

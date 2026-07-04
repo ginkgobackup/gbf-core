@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/google/uuid"
 )
 
 func OpenFileSequential(path string) (*os.File, error) {
@@ -25,7 +27,9 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
-	tmp := path + ".tmp"
+	// Use a per-call unique temp name so concurrent WriteFileAtomic calls
+	// on the same path do not clobber each other's staging file.
+	tmp := path + "." + uuid.NewString() + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
 		return fmt.Errorf("create tmp file: %w", err)

@@ -343,6 +343,14 @@ func decryptGB2StreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error 
 		storedSize := binary.BigEndian.Uint32(headerBuf[:ChunkCountSize])
 		compressed := headerBuf[ChunkCountSize] != 0
 
+		// Bound storedSize to prevent a crafted blob from triggering an
+		// OOM via make([]byte, storedSize). Each chunk is at most
+		// chunkSize + TagSize of ciphertext, plus a small margin for
+		// compression expansion.
+		if storedSize > uint32(MaxStoredSize) {
+			return fmt.Errorf("chunk %d: storedSize %d exceeds max %d", i, storedSize, MaxStoredSize)
+		}
+
 		iv := make([]byte, IVSize)
 		if _, err := io.ReadFull(src, iv); err != nil {
 			return fmt.Errorf("read iv chunk %d: %w", i, err)

@@ -7,9 +7,11 @@ package fsutil
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
+	"github.com/google/uuid"
 	"golang.org/x/sys/windows"
 )
 
@@ -64,12 +66,16 @@ func ReadFileSequential(path string) ([]byte, error) {
 	}
 
 	data := make([]byte, size)
-	n, err := f.Read(data)
-	if err != nil {
+	// io.ReadFull guarantees we read exactly `size` bytes. A bare f.Read can
+	// return a short read, silently truncating the file content that gets
+	// hashed and stored. If the file was truncated between Stat and Read,
+	// io.ReadFull returns ErrUnexpectedEOF, which we surface as an error
+	// rather than persisting a partial buffer under the original hash.
+	if _, err := io.ReadFull(f, data); err != nil {
 		return nil, fmt.Errorf("ReadFileSequential Read: %w", err)
 	}
 
-	return data[:n], nil
+	return data, nil
 }
 
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
@@ -78,7 +84,9 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
-	tmp := path + ".tmp"
+	// Use a per-call unique temp name so concurrent WriteFileAtomic calls
+	// on the same path do not clobber each other's staging file.
+	tmp := path + "." + uuid.NewString() + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
 		return fmt.Errorf("create tmp file: %w", err)

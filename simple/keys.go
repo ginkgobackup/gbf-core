@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 
 	"golang.org/x/crypto/argon2"
+
+	"github.com/ginkgobackup/gbf-core/fsutil"
 )
 
 const (
@@ -84,11 +86,10 @@ func SaveGEK1KeyFile(repoRoot string, masterKey []byte, password string) error {
 		return err
 	}
 	path := KeyFilePath(repoRoot)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, keyFileData, 0600); err != nil {
-		return fmt.Errorf("write: %w", err)
+	if err := fsutil.WriteFileAtomic(path, keyFileData, 0600); err != nil {
+		return fmt.Errorf("write key file: %w", err)
 	}
-	return os.Rename(tmp, path)
+	return nil
 }
 
 func InitRepoWithPassword(repoRoot string, deviceID string, password string) error {
@@ -232,10 +233,7 @@ func InitRepoWithKeyFile(repoRoot string, deviceID string) error {
 		return fmt.Errorf("marshal key file: %w", err)
 	}
 	path := KeyFilePath(repoRoot)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return fmt.Errorf("mkdir keyfile dir: %w", err)
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := fsutil.WriteFileAtomic(path, data, 0600); err != nil {
 		return fmt.Errorf("write key file: %w", err)
 	}
 	cfg, err := LoadConfig(repoRoot)

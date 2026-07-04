@@ -21,6 +21,20 @@ const (
 	TagSize        = 16
 	ChunkCountSize = 4
 	FlagsSize      = 1
+	// MaxChunkCount is the upper bound on chunk counts accepted by the
+	// decryptor (see isChunkCount). It must match the threshold used to
+	// disambiguate GB1 small vs large blobs. encryptLarge refuses to write
+	// blobs with chunkCount >= MaxChunkCount so the decryptor's heuristic
+	// never mis-classifies a legitimately produced blob. With the default
+	// 4 MiB chunk size, 100000 chunks ≈ 390 GiB; files larger than that
+	// must use a larger chunk size.
+	MaxChunkCount = 100000
+	// MaxStoredSize is the upper bound on the per-chunk storedSize header
+	// in GB2 blobs. It bounds the size of any single make() in the
+	// decryptor to prevent OOM via a crafted blob. We allow chunkSize +
+	// TagSize plus a 1 KiB margin to accommodate compression expansion
+	// in pathological cases.
+	MaxStoredSize = DefaultChunkSize + TagSize + 1024
 )
 
 // Encryptor is the on-disk format encryptor: a stateful AEAD wrapper bound
@@ -73,6 +87,13 @@ func (e *Encryptor) encryptSmall(plaintext []byte) ([]byte, error) {
 
 func (e *Encryptor) encryptLarge(plaintext []byte) ([]byte, error) {
 	chunkCount := (len(plaintext) + e.chunkSize - 1) / e.chunkSize
+	if chunkCount >= MaxChunkCount {
+		// The decryptor uses isChunkCount (v < 100000) to distinguish
+		// GB1 small from GB1 large; producing a blob whose chunkCount
+		// falls outside that range would make it undecryptable. Refuse
+		// instead and tell the caller to raise the chunk size.
+		return nil, fmt.Errorf("encryptLarge: chunk count %d exceeds MaxChunkCount %d (file too large for chunk size %d; increase chunk size)", chunkCount, MaxChunkCount, e.chunkSize)
+	}
 	result := make([]byte, 0, MagicSize+ChunkCountSize+len(plaintext)+chunkCount*(IVSize+TagSize)+len(plaintext)*2/10)
 	result = append(result, MagicGB1...)
 	countBuf := make([]byte, ChunkCountSize)
@@ -225,6 +246,14 @@ func (d *Decryptor) decryptLargeV2(data []byte) ([]byte, error) {
 		storedSize := binary.BigEndian.Uint32(data[:ChunkCountSize])
 		compressed := data[ChunkCountSize] != 0
 		data = data[ChunkCountSize+FlagsSize:]
+
+		// Bound storedSize to prevent a crafted blob from triggering
+		// an OOM via a huge allocation. Each chunk is at most
+		// chunkSize + TagSize of ciphertext, plus a small margin for
+		// compression expansion.
+		if storedSize > uint32(MaxStoredSize) {
+			return nil, fmt.Errorf("chunk %d: storedSize %d exceeds max %d", i, storedSize, MaxStoredSize)
+		}
 
 		if len(data) < IVSize {
 			return nil, fmt.Errorf("chunk %d: missing IV", i)

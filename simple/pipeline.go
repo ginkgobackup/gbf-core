@@ -1027,7 +1027,15 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 			readSize = int64(len(buf))
 		}
 		n, readErr := io.ReadFull(f, buf[:readSize])
-		if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
+		if readErr != nil && readErr != io.EOF {
+			if readErr == io.ErrUnexpectedEOF {
+				// File was truncated/modified since the manifest was built:
+				// we requested chunks[chunkIdx].Size bytes but got fewer.
+				// Uploading the partial buffer would store data under a hash
+				// that does not match the bytes, corrupting the blob store.
+				// Surface as an error so the caller can re-process the file.
+				return uploaded, fmt.Errorf("read chunk %d: file truncated (expected %d bytes, got %d): %w", chunkIdx, readSize, n, readErr)
+			}
 			return uploaded, fmt.Errorf("read chunk %d: %w", chunkIdx, readErr)
 		}
 		if n == 0 {
