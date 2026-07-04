@@ -53,7 +53,7 @@ Four magic byte prefixes identify the blob kinds produced by this engine. They a
 |----------|---------------------|-------------------------|-----------------------------------------------------------------------------------------------------------------------|
 | `GB1\0`  | Single-block blob   | Backup pipeline (default) | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (one AEAD block). Used for every chunk the pipeline writes: small files are stored as one GB1 blob, large files are split into chunks (CDC or fixed-size) and each chunk is stored as its own GB1 blob. |
 | `GB2\0`  | Streaming blob with per-chunk compression | `encryptFileToWriter` (stream helper) | `magic` ‖ `chunkCount` ‖ for each chunk: `size` ‖ `flags` ‖ `nonce` ‖ `ciphertext` ‖ `tag`. Variant emitted only by the streaming helper when a compressor is supplied; the main pipeline does not currently take this path. |
-| `GKM1`   | Encrypted manifest  | `EncryptManifest`       | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (manifest key derived via HKDF from the master key)                          |
+| `GKM1`   | Encrypted manifest  | `EncryptManifest`       | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (manifest encrypted directly with the master key via AES-256-GCM; no HKDF derivation) |
 | `GEK1`   | Encrypted keyfile   | `simple/keys.go`        | `magic` ‖ `salt` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (master key wrapped by Argon2id-derived key; Argon2id parameters are compile-time constants, see `simple/keys.go`) |
 
 The decryptor inspects the magic byte and handles GB1, GB2, and GKM1 transparently. In the current pipeline, every encrypted blob written to the store is GB1: files below the chunk size are stored whole, files at or above the chunk size are split into chunks (CDC by default, fixed-size otherwise) and each chunk is uploaded as an independent GB1 blob. GB2 is supported by the decryptor and the streaming helper for future use, but the pipeline currently stores each chunk separately as GB1 rather than packaging them into a single GB2 blob.
@@ -83,7 +83,7 @@ The manifest does **not** collect: hostname, OS, username, environment variables
 
 Two encryptor interfaces exist and are intentionally distinct:
 
-- **`vault.Encryptor`** — stateless, single-block AEAD. Takes the key per call, returns a bare `nonce‖ciphertext` with no framing. Used by `crypto.AESEncryptor` for HKDF-derived subkeys (e.g. manifest keys). Zero dependencies outside the standard library.
+- **`vault.Encryptor`** — stateless, single-block AEAD. Takes the key per call, returns a bare `nonce‖ciphertext` with no framing. `crypto.AESEncryptor` implements this interface and also exposes HKDF key derivation (`DeriveKey`). The interface is retained as a reusable AEAD primitive, but it is **not** currently wired into the main backup path: manifests are encrypted directly with the master key by `simple.EncryptManifest`, and blob encryption goes through `simple.Encryptor`. Zero dependencies outside the standard library.
 - **`simple.Encryptor`** — stateful, bound to a fixed master key and chunk size. Emits the `GB1`/`GB2` on-disk format with magic bytes, chunk counts, and per-chunk IVs. Lives in `simple/crypto.go`.
 
 They do not share an interface because the contracts differ: one is a primitive AEAD wrapper, the other is a format-bound streaming encryptor. Forcing them under a common interface would imply interchangeability that does not exist. See `vault/encryptor.go` and `simple/doc.go` for the rationale.

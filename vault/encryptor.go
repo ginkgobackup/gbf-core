@@ -7,8 +7,15 @@ package vault
 //
 // This interface is intentionally distinct from simple.Encryptor: the
 // vault.Encryptor is stateless, takes the key per call, and produces a
-// bare nonce||ciphertext blob without any framing. It is used by
-// crypto.AESEncryptor for HKDF-derived subkeys (e.g. manifest keys).
+// bare nonce||ciphertext blob without any framing. crypto.AESEncryptor
+// implements this interface and also exposes HKDF key derivation
+// (DeriveKey).
+//
+// Note: the main backup path does not currently route through
+// vault.Encryptor. Manifests are encrypted directly with the master key
+// by simple.EncryptManifest, and blob encryption goes through
+// simple.Encryptor. This interface is retained as a reusable AEAD
+// primitive for future callers.
 //
 // simple.Encryptor, in contrast, is a stateful encryptor bound to a fixed
 // master key and chunk size; it emits the GB1/GB2 on-disk format with

@@ -27,8 +27,10 @@ const (
 // to a single master key and chunk size. Its Encrypt/Decrypt methods emit
 // and parse the GB1/GB2 chunked blob format (magic bytes + chunk count +
 // per-chunk IV+ciphertext), not raw AEAD. It is intentionally distinct from
-// vault.Encryptor, which is the stateless single-block AEAD interface used
-// for HKDF-derived subkeys (manifests, etc.). See vault/encryptor.go.
+// vault.Encryptor, which is the stateless single-block AEAD interface in
+// crypto/. The main backup path does not currently route through
+// vault.Encryptor: manifests are encrypted directly with the master key
+// by EncryptManifest below. See vault/encryptor.go.
 type Encryptor struct {
 	key       []byte
 	chunkSize int
