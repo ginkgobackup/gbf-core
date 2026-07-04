@@ -6,8 +6,10 @@ package simple
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -507,4 +509,127 @@ func TestMatchExclude(t *testing.T) {
 			t.Errorf("MatchExclude(%q, %v) = %v, want %v", tt.path, tt.patterns, got, tt.want)
 		}
 	}
+}
+
+// TestSafeRestorePath_RejectsTraversal verifies that the restore path
+// sanitizer refuses manifest entries that would escape TargetDir. This is
+// the regression test for the path-traversal vulnerability fixed in
+// restore.go: safeRestorePath must reject "..", absolute paths, and
+// any combination that resolves outside the target.
+func TestSafeRestorePath_RejectsTraversal(t *testing.T) {
+	target := t.TempDir()
+	cases := []struct {
+		name    string
+		relPath string
+		wantErr bool
+	}{
+		{"parent", "../../etc/passwd", true},
+		{"parent_single", "..", true},
+		{"parent_nested", "subdir/../../../etc/passwd", true},
+		{"absolute_unix", "/etc/passwd", true},
+		{"absolute_windows", `C:\Windows\System32`, true},
+		{"dotdot_only", "../", true},
+		{"valid_simple", "file.txt", false},
+		{"valid_nested", "subdir/file.txt", false},
+		{"valid_deep", "a/b/c/file.txt", false},
+		{"valid_dot", ".", false},
+		{"valid_inner_dotdot", "a/../b/file.txt", false}, // resolves to b/file.txt
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := safeRestorePath(target, tc.relPath)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("safeRestorePath(%q) = %q; want error", tc.relPath, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("safeRestorePath(%q) returned error: %v", tc.relPath, err)
+			}
+			// The resolved path must live inside target.
+			absTarget, _ := filepath.Abs(target)
+			if !strings.HasPrefix(got, absTarget+string(os.PathSeparator)) && got != absTarget {
+				t.Fatalf("safeRestorePath(%q) = %q; want inside %s", tc.relPath, got, absTarget)
+			}
+		})
+	}
+}
+
+// TestLocalBlobStore_RejectsInvalidHash verifies that all blob operations
+// refuse hashes that are not 64-character hex SHA-256. This is the regression
+// test for the blob path-traversal vulnerability (B4): crafted hash values
+// like "../../etc/passwd" must not be joined into the storage path.
+func TestLocalBlobStore_RejectsInvalidHash(t *testing.T) {
+	store := NewLocalBlobStore(t.TempDir())
+	ctx := context.Background()
+
+	badHashes := []string{
+		"",
+		"abc",
+		"../../etc/passwd",
+		strings.Repeat("x", 64), // wrong charset
+		strings.Repeat("A", 64), // uppercase rejected
+		strings.Repeat("0", 63), // too short
+		strings.Repeat("0", 65), // too long
+	}
+	for _, h := range badHashes {
+		t.Run("Put_"+h, func(t *testing.T) {
+			if err := store.Put(ctx, h, []byte("data")); err != ErrInvalidHash {
+				t.Errorf("Put(%q) err = %v; want ErrInvalidHash", h, err)
+			}
+		})
+		t.Run("Get_"+h, func(t *testing.T) {
+			if _, err := store.Get(ctx, h); err != ErrInvalidHash {
+				t.Errorf("Get(%q) err = %v; want ErrInvalidHash", h, err)
+			}
+		})
+		t.Run("Exists_"+h, func(t *testing.T) {
+			exists, err := store.Exists(ctx, h)
+			if err != nil || exists {
+				t.Errorf("Exists(%q) = (%v, %v); want (false, nil)", h, exists, err)
+			}
+		})
+		t.Run("Delete_"+h, func(t *testing.T) {
+			if err := store.Delete(ctx, h); err != ErrInvalidHash {
+				t.Errorf("Delete(%q) err = %v; want ErrInvalidHash", h, err)
+			}
+		})
+		t.Run("BlobPath_"+h, func(t *testing.T) {
+			if got := store.BlobPath(h); got != "" {
+				t.Errorf("BlobPath(%q) = %q; want empty", h, got)
+			}
+		})
+	}
+}
+
+// TestLocalBlobStore_WarmExistsCache_ConcurrentSafety runs WarmExistsCache
+// concurrently with Exists calls to verify the lock fix (B5). Before the fix,
+// this would intermittently panic with "concurrent map writes".
+func TestLocalBlobStore_WarmExistsCache_ConcurrentSafety(t *testing.T) {
+	store := NewLocalBlobStore(t.TempDir())
+	ctx := context.Background()
+
+	// Pre-populate a few blobs so WarmExistsCache has work to do.
+	for i := 0; i < 5; i++ {
+		hash := fmt.Sprintf("%064x", i)
+		if err := store.Put(ctx, hash, []byte{byte(i)}); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			_, _ = store.Exists(ctx, fmt.Sprintf("%064x", i%10))
+		}
+	}()
+
+	for i := 0; i < 10; i++ {
+		if err := store.WarmExistsCache(ctx); err != nil {
+			t.Fatalf("warm: %v", err)
+		}
+	}
+	<-done
 }

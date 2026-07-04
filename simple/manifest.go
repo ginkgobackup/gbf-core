@@ -444,7 +444,10 @@ func verifyManifestChecksum(manifestPath string, data []byte) error {
 	expectedBytes, err := os.ReadFile(checksumPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			// A manifest without a sidecar checksum is not trustworthy: an
+			// attacker (or a partial sync) can tamper with the manifest body
+			// without detection. Reject it instead of silently accepting.
+			return fmt.Errorf("manifest checksum missing: %s", checksumPath)
 		}
 		return fmt.Errorf("read manifest checksum: %w", err)
 	}

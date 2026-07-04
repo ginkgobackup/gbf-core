@@ -5,7 +5,6 @@ package simple
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -40,8 +39,32 @@ func (s *LocalBlobStore) SetWriteLimiter(l *ratelimit.Limiter) {
 	s.writeLimiter = l
 }
 
+// ErrInvalidHash is returned when a blob hash is not a valid 64-character
+// lowercase hex SHA-256. Rejecting early prevents path-traversal via crafted
+// hash values (e.g. "../../etc/passwd") that would otherwise be joined into
+// the blob storage path.
+var ErrInvalidHash = fmt.Errorf("invalid blob hash: expected 64-character hex SHA-256")
+
+// validateHash returns true if hash is a 64-character lowercase hex string.
+// We accept lowercase only to match hex.EncodeToString output; uppercase
+// is rejected to avoid case-sensitive filesystem surprises on case-insensitive
+// filesystems (NTFS, HFS+).
+func validateHash(hash string) bool {
+	if len(hash) != 64 {
+		return false
+	}
+	for i := 0; i < len(hash); i++ {
+		c := hash[i]
+		// Only accept 0-9 and a-f. Reject A-F (uppercase) explicitly.
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *LocalBlobStore) BlobPath(hash string) string {
-	if len(hash) < 2 {
+	if !validateHash(hash) {
 		return ""
 	}
 	return filepath.Join(s.baseDir, "gb", hash[:2], hash+".gb")
@@ -81,6 +104,9 @@ func (s *LocalBlobStore) lockPut(hash string) func() {
 }
 
 func (s *LocalBlobStore) Put(ctx context.Context, hash string, data []byte) error {
+	if !validateHash(hash) {
+		return ErrInvalidHash
+	}
 	unlock := s.lockPut(hash)
 	defer unlock()
 
@@ -165,10 +191,16 @@ func (s *LocalBlobStore) Put(ctx context.Context, hash string, data []byte) erro
 }
 
 func (s *LocalBlobStore) Get(ctx context.Context, hash string) ([]byte, error) {
+	if !validateHash(hash) {
+		return nil, ErrInvalidHash
+	}
 	return os.ReadFile(s.resolveBlobPath(hash))
 }
 
 func (s *LocalBlobStore) PutStream(ctx context.Context, hash string, r io.Reader, size int64) error {
+	if !validateHash(hash) {
+		return ErrInvalidHash
+	}
 	unlock := s.lockPut(hash)
 	defer unlock()
 
@@ -239,11 +271,14 @@ func (s *LocalBlobStore) PutStream(ctx context.Context, hash string, r io.Reader
 }
 
 func (s *LocalBlobStore) GetStream(ctx context.Context, hash string) (io.ReadCloser, error) {
+	if !validateHash(hash) {
+		return nil, ErrInvalidHash
+	}
 	return os.Open(s.resolveBlobPath(hash))
 }
 
 func (s *LocalBlobStore) Exists(ctx context.Context, hash string) (bool, error) {
-	if len(hash) < 2 {
+	if !validateHash(hash) {
 		return false, nil
 	}
 	s.existsMu.RLock()
@@ -275,6 +310,10 @@ func (s *LocalBlobStore) WarmExistsCache(ctx context.Context) error {
 		}
 		return err
 	}
+	// Build the new entries in a local map first, then merge under the lock.
+	// Writing directly to existsSet without the lock would race with concurrent
+	// Exists/Put/Get callers and trigger "concurrent map writes" panics.
+	newEntries := make(map[string]bool, 256)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -289,11 +328,16 @@ func (s *LocalBlobStore) WarmExistsCache(ctx context.Context) error {
 				continue
 			}
 			name := strings.TrimSuffix(b.Name(), ".gb")
-			if _, err := hex.DecodeString(name); err == nil {
-				s.existsSet[name] = true
+			if validateHash(name) {
+				newEntries[name] = true
 			}
 		}
 	}
+	s.existsMu.Lock()
+	for k, v := range newEntries {
+		s.existsSet[k] = v
+	}
+	s.existsMu.Unlock()
 	return nil
 }
 
@@ -325,7 +369,7 @@ func (s *LocalBlobStore) List(ctx context.Context, prefix string) ([]string, err
 				continue
 			}
 			name := strings.TrimSuffix(b.Name(), ".gb")
-			if _, err := hex.DecodeString(name); err == nil {
+			if validateHash(name) {
 				result = append(result, name)
 			}
 		}
@@ -361,7 +405,7 @@ func (s *LocalBlobStore) ListWithModTime(ctx context.Context, prefix string) ([]
 				continue
 			}
 			name := strings.TrimSuffix(b.Name(), ".gb")
-			if _, err := hex.DecodeString(name); err == nil {
+			if validateHash(name) {
 				info, statErr := b.Info()
 				modTime := int64(0)
 				size := int64(0)
@@ -377,6 +421,9 @@ func (s *LocalBlobStore) ListWithModTime(ctx context.Context, prefix string) ([]
 }
 
 func (s *LocalBlobStore) Delete(ctx context.Context, hash string) error {
+	if !validateHash(hash) {
+		return ErrInvalidHash
+	}
 	p := s.blobPath(hash)
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return err

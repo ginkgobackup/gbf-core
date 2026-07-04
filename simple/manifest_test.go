@@ -116,7 +116,7 @@ func TestManifestChecksumSidecar(t *testing.T) {
 	}
 }
 
-func TestManifestChecksumSidecarMissingIsAllowed(t *testing.T) {
+func TestManifestChecksumSidecarMissingIsRejected(t *testing.T) {
 	dir := t.TempDir()
 
 	m := NewManifest(1, "", "src", "/data", "dev1")
@@ -146,8 +146,11 @@ func TestManifestChecksumSidecarMissingIsAllowed(t *testing.T) {
 		t.Fatalf("remove checksum: %v", err)
 	}
 
-	if _, err := LoadManifest(manifestPath); err != nil {
-		t.Fatalf("load should succeed without checksum sidecar: %v", err)
+	// A manifest without a sidecar checksum is not trustworthy: an attacker
+	// (or partial sync) could tamper with the body without detection. Load
+	// must refuse rather than silently accept.
+	if _, err := LoadManifest(manifestPath); err == nil {
+		t.Fatal("expected error when checksum sidecar is missing")
 	}
 }
 

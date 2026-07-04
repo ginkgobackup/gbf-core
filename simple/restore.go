@@ -8,10 +8,58 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// safeRestorePath sanitizes a manifest-supplied relative path so it cannot
+// escape TargetDir via ".." or absolute paths. Returns the cleaned absolute
+// path, or an error if the path would escape TargetDir.
+//
+// This is a defense-in-depth boundary: manifests are normally written by this
+// engine, but in a multi-device or cloud-sync scenario a malicious peer can
+// push a crafted manifest entry whose Name is "../../etc/passwd". Without
+// sanitization, filepath.Join would resolve the ".." segments and write
+// outside TargetDir.
+func safeRestorePath(targetDir, relPath string) (string, error) {
+	// Reject empty paths outright.
+	if relPath == "" {
+		return "", fmt.Errorf("manifest path is empty")
+	}
+	// Reject Unix absolute paths. filepath.FromSlash + Clean would otherwise
+	// turn "/etc/passwd" into "etc/passwd" (a relative path) on Windows, which
+	// is a cross-platform bug we need to catch at the source.
+	if strings.HasPrefix(relPath, "/") || strings.HasPrefix(relPath, "\\") {
+		return "", fmt.Errorf("manifest path is absolute: %q", relPath)
+	}
+	// Reject Windows drive paths like "C:\..." or "C:/...".
+	if len(relPath) >= 2 && relPath[1] == ':' && ((relPath[0] >= 'A' && relPath[0] <= 'Z') || (relPath[0] >= 'a' && relPath[0] <= 'z')) {
+		return "", fmt.Errorf("manifest path is absolute: %q", relPath)
+	}
+	// Normalize separators and strip any residual leading "/" (we already
+	// rejected absolute paths above, so this is belt-and-suspenders).
+	clean := filepath.Clean(filepath.FromSlash(relPath))
+	// Reject ".." at the start or any ".." that escapes after Clean.
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("manifest path escapes target dir: %q", relPath)
+	}
+	absTarget, err := filepath.Abs(targetDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve target dir: %w", err)
+	}
+	joined := filepath.Join(absTarget, clean)
+	// Final check: the joined path must be inside absTarget.
+	rel, err := filepath.Rel(absTarget, joined)
+	if err != nil {
+		return "", fmt.Errorf("manifest path escapes target dir: %q", relPath)
+	}
+	if rel != "." && strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("manifest path escapes target dir: %q", relPath)
+	}
+	return joined, nil
+}
 
 type RestoreConfig struct {
 	RepoRoot  string
@@ -89,7 +137,10 @@ func (r *SimpleRestore) Run(ctx context.Context) (*RestoreResult, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		targetPath := filepath.Join(r.cfg.TargetDir, filepath.FromSlash(file.Name))
+		targetPath, err := safeRestorePath(r.cfg.TargetDir, file.Name)
+		if err != nil {
+			return nil, fmt.Errorf("restore %s: %w", file.Name, err)
+		}
 		if !r.cfg.Overwrite {
 			if _, err := os.Stat(targetPath); err == nil {
 				result.SkippedFiles++

@@ -97,23 +97,23 @@ Keep the summary line under 72 characters. Use the imperative mood
 ## Pull Request Flow
 
 1. **Fork** the repository and clone your fork.
-2. **Create a branch** off `main`:
+2. **Create a branch** off `master`:
 
    ```bash
-   git checkout -b feat/my-change main
+   git checkout -b feat/my-change master
    ```
 
 3. **Commit** your changes, one logical change per commit, using conventional
    commit messages.
-4. **Rebase** on `main` if it has moved forward. Keep history clean.
+4. **Rebase** on `master` if it has moved forward. Keep history clean.
 5. **Push** to your fork.
-6. **Open a Pull Request** against `gbf-core/main`. Fill in the PR template.
+6. **Open a Pull Request** against `gbf-core/master`. Fill in the PR template.
 7. Respond to review feedback. New commits are fine; do not force-push during
    review unless asked.
 
 ### Signing
 
-All commits merged to `main` must be **cryptographically signed** (GPG or
+All commits merged to `master` must be **cryptographically signed** (GPG or
 SSH signing, configured per the GitHub docs). Enable
 `Always sign commits` in your git config or use `git commit -S`.
 Unverified commits will not be merged.
