@@ -31,7 +31,9 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.62
+          # v1.x is built with Go 1.23 and cannot parse go.mod's go 1.25.
+          # v2.x is built with a newer Go and is the current release.
+          version: v2.12.2
           args: --timeout=5m
 
   vet:
