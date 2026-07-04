@@ -50,12 +50,14 @@ func (c *S2Compressor) Decompress(data []byte) ([]byte, error) {
 }
 
 // s2 stream magic bytes (two variants supported by the reader).
+// The S2 stream identifier chunk is 4 bytes of chunk header followed by
+// 6 bytes of identifier ("S2sTwO" or "sNaPpY"), for a 10-byte prefix.
 var s2Magic = []byte("\xff\x06\x00\x00S2sTwO")
 var s2MagicSnappy = []byte("\xff\x06\x00\x00sNaPpY")
 
 func (c *S2Compressor) IsCompressed(data []byte) bool {
-	if len(data) < 12 {
+	if len(data) < 10 {
 		return false
 	}
-	return string(data[:12]) == string(s2Magic) || string(data[:12]) == string(s2MagicSnappy)
+	return string(data[:10]) == string(s2Magic) || string(data[:10]) == string(s2MagicSnappy)
 }

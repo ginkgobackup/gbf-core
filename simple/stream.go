@@ -71,7 +71,7 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 		return UploadBlob(ctx, store, enc, data)
 	}
 
-	tmpPath := filepath.Join(os.TempDir(), "gb-upload-"+uuid.New().String()+".tmp")
+	tmpPath := filepath.Join(os.TempDir(), "gbf-tmp-"+uuid.New().String()+".tmp")
 	tmpF, err := os.Create(tmpPath)
 	if err != nil {
 		return "", fmt.Errorf("create tmp: %w", err)

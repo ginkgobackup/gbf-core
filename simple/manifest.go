@@ -13,11 +13,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ginkgobackup/gbf-core/compress"
@@ -290,7 +290,7 @@ func (m *Manifest) FindFile(filePath string) (FileEntry, bool) {
 }
 
 // FindFileTolerant tries to locate a file when FindFile fails, tolerating
-// common path discrepancies between AI-pushed rel_path and the manifest key.
+// common path discrepancies between caller-supplied paths and manifest keys.
 // It handles: (1) leading-dot differences ("agent/..." vs ".agent/...") and
 // (2) case-insensitive matching (important on Windows/case-insensitive FS).
 // Callers should always try FindFile first and only fall back to this method.
@@ -397,7 +397,10 @@ func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) error {
 	if err != nil {
 		ts = time.Now()
 	}
-	cloudID := ManifestPathKey(m.DeviceID, fmt.Sprintf("%d", m.SourceID))
+	cloudID := m.CloudID
+	if cloudID == "" {
+		cloudID = ManifestPathKey(m.DeviceID, fmt.Sprintf("%d", m.SourceID))
+	}
 	path := ManifestFilePath(metaDir, cloudID, ts, m.DeviceID)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -420,12 +423,12 @@ func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) error {
 	sum := sha256.Sum256(compressed)
 	checksumHex := hex.EncodeToString(sum[:])
 
-	if err := fsutil.WriteFileAtomic(path, compressed, 0644); err != nil {
+	if err := fsutil.WriteFileAtomic(path, compressed, 0600); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
 
 	checksumPath := manifestChecksumPath(path)
-	if err := fsutil.WriteFileAtomic(checksumPath, []byte(checksumHex), 0644); err != nil {
+	if err := fsutil.WriteFileAtomic(checksumPath, []byte(checksumHex), 0600); err != nil {
 		return fmt.Errorf("write manifest checksum: %w", err)
 	}
 
@@ -824,7 +827,11 @@ func renameWithFallback(src, dst string) error {
 func isCrossDeviceError(err error) bool {
 	var linkErr *os.LinkError
 	if errors.As(err, &linkErr) {
-		return true
+		errno, ok := linkErr.Err.(syscall.Errno)
+		if !ok {
+			return false
+		}
+		return errno == syscall.EXDEV
 	}
 	return false
 }
@@ -1070,7 +1077,7 @@ func CollectAliveHashesStreaming(metaDir string, cloudID string) (map[string]boo
 
 	alive := make(map[string]bool)
 	var loadErrors []string
-	for i, e := range entries {
+	for _, e := range entries {
 		if e.IsDir() || !isManifestFile(e.Name()) {
 			continue
 		}
@@ -1081,9 +1088,6 @@ func CollectAliveHashesStreaming(metaDir string, cloudID string) (map[string]boo
 		}
 		for _, h := range hashes {
 			alive[h] = true
-		}
-		if i%10 == 9 {
-			runtime.GC()
 		}
 	}
 	return alive, loadErrors, nil
@@ -1168,30 +1172,50 @@ func extractHashesFromJSON(data []byte) ([]string, error) {
 	return hashes, nil
 }
 
+type SourceRegistry struct {
+	CloudID       string             `json:"cloudId"`
+	Name          string             `json:"name"`
+	Path          string             `json:"path"`
+	DeviceID      string             `json:"deviceId"`
+	Hostname      string             `json:"hostname,omitempty"`
+	OS            string             `json:"os,omitempty"`
+	Pins          []RegistryPin      `json:"pins,omitempty"`
+	Notes         []RegistryNote     `json:"notes,omitempty"`
+	Snapshots     []RegistrySnapshot `json:"snapshots,omitempty"`
+	Settings      *RegistrySettings  `json:"settings,omitempty"`
+	LastSnapshot  string             `json:"lastSnapshot"`
+	SnapshotCount int                `json:"snapshotCount"`
+	CreatedAt     string             `json:"createdAt"`
+}
+
+// RegistryPin represents a pinned snapshot in a source registry. It is a
+// value type so the registry can be serialized without referencing the
+// higher-level snapshot domain package. SnapshotTime and CreatedAt are
+// Unix microseconds, matching the snapshot domain's time representation.
 type RegistryPin struct {
 	RepoPath     string `json:"repoPath"`
 	SnapshotTime int64  `json:"snapshotTime"`
-	Note         string `json:"note"`
-	CreatedAt    int64  `json:"createdAt"`
+	Note         string `json:"note,omitempty"`
+	CreatedAt    int64  `json:"createdAt,omitempty"`
 }
 
+// RegistryNote represents a snapshot note stored in a source registry. It
+// mirrors snapshot.SnapshotNote but is a value type so the registry can be
+// serialized without importing the snapshot domain package.
 type RegistryNote struct {
 	RepoPath       string `json:"repoPath"`
 	SnapshotTime   int64  `json:"snapshotTime"`
-	Content        string `json:"content"`
+	Content        string `json:"content,omitempty"`
 	PushedFiles    string `json:"pushedFiles,omitempty"`
 	Source         string `json:"source,omitempty"`
-	CreatedAt      int64  `json:"createdAt"`
+	CreatedAt      int64  `json:"createdAt,omitempty"`
 	AuthorDeviceID string `json:"authorDeviceId,omitempty"`
 	AuthorName     string `json:"authorName,omitempty"`
 }
 
-type RegistrySnapshot struct {
-	Timestamp string `json:"ts"`
-	FileCount int64  `json:"fc,omitempty"`
-	TotalSize int64  `json:"sz,omitempty"`
-}
-
+// RegistrySettings captures a source's user-facing settings so they can be
+// round-tripped through the source registry (e.g. for cross-device import).
+// All fields are optional; absent fields preserve the existing settings.
 type RegistrySettings struct {
 	Schedule        string   `json:"schedule,omitempty"`
 	ScheduleConfig  string   `json:"scheduleConfig,omitempty"`
@@ -1202,20 +1226,14 @@ type RegistrySettings struct {
 	WatchMode       string   `json:"watchMode,omitempty"`
 }
 
-type SourceRegistry struct {
-	CloudID       string             `json:"cloudId"`
-	Name          string             `json:"name"`
-	Path          string             `json:"path"`
-	DeviceID      string             `json:"deviceId"`
-	Hostname      string             `json:"hostname"`
-	OS            string             `json:"os"`
-	LastSnapshot  string             `json:"lastSnapshot"`
-	SnapshotCount int                `json:"snapshotCount"`
-	CreatedAt     string             `json:"createdAt"`
-	Settings      *RegistrySettings  `json:"settings,omitempty"`
-	Pins          []RegistryPin      `json:"pins,omitempty"`
-	Notes         []RegistryNote     `json:"notes,omitempty"`
-	Snapshots     []RegistrySnapshot `json:"snapshots,omitempty"`
+// RegistrySnapshot represents a snapshot entry embedded in the source
+// registry. It is a value type so the registry can be serialized without
+// importing the snapshot domain package. Timestamp is RFC3339; FileCount
+// and TotalSize mirror the snapshot domain fields of the same name.
+type RegistrySnapshot struct {
+	Timestamp string `json:"timestamp"`
+	FileCount int64  `json:"fileCount,omitempty"`
+	TotalSize int64  `json:"totalSize,omitempty"`
 }
 
 func sourceRegistriesDir(metaDir string) string {
@@ -1235,9 +1253,15 @@ func SaveSourceRegistry(metaDir string, reg *SourceRegistry) error {
 	if err != nil {
 		return fmt.Errorf("compress source registry: %w", err)
 	}
+	// CloudID may contain path separators (it's a path key like "dev1/42"),
+	// so the final filename can be nested. Make sure the full parent dir
+	// exists before writing the tmp file.
 	path := filepath.Join(dir, reg.CloudID+".json.zst")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("mkdir source registry parent: %w", err)
+	}
 	tmp := path + "." + uuid.New().String() + ".tmp"
-	if err := os.WriteFile(tmp, compressed, 0644); err != nil {
+	if err := os.WriteFile(tmp, compressed, 0600); err != nil {
 		return fmt.Errorf("write source registry: %w", err)
 	}
 	return os.Rename(tmp, path)

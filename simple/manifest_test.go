@@ -76,7 +76,7 @@ func TestFileEntryMtimeTime(t *testing.T) {
 func TestManifestChecksumSidecar(t *testing.T) {
 	dir := t.TempDir()
 
-	m := NewManifest(1, "1", "src", "/data", "dev1")
+	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	m.AddFile(FileEntry{Name: "a.txt", Size: 10})
 	if err := SaveManifest(dir, m); err != nil {
@@ -119,7 +119,7 @@ func TestManifestChecksumSidecar(t *testing.T) {
 func TestManifestChecksumSidecarMissingIsAllowed(t *testing.T) {
 	dir := t.TempDir()
 
-	m := NewManifest(1, "1", "src", "/data", "dev1")
+	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	m.AddFile(FileEntry{Name: "a.txt", Size: 10})
 	if err := SaveManifest(dir, m); err != nil {
@@ -159,7 +159,7 @@ func TestExtractHashesFromJSON_InvalidJSONReturnsError(t *testing.T) {
 }
 
 func TestExtractHashesFromJSON_ValidManifest(t *testing.T) {
-	m := NewManifest(1, "1", "src", "/data", "dev1")
+	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.AddFile(FileEntry{Name: "a.txt", ContentHash: "hash_a", Size: 10})
 	data, err := json.Marshal(m)
 	if err != nil {
@@ -176,7 +176,7 @@ func TestExtractHashesFromJSON_ValidManifest(t *testing.T) {
 
 func TestManifestBuildFileMap(t *testing.T) {
 	t.Run("multiple_files", func(t *testing.T) {
-		m := NewManifest(1, "1", "src", "/data", "dev1")
+		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.AddFile(FileEntry{Name: "a.txt", ContentHash: "hash_a", Size: 10})
 		m.AddFile(FileEntry{Name: "b.txt", ContentHash: "hash_b", Size: 20})
 		m.AddFile(FileEntry{Name: "c.txt", ContentHash: "hash_c", Size: 30})
@@ -196,7 +196,7 @@ func TestManifestBuildFileMap(t *testing.T) {
 	})
 
 	t.Run("duplicate_paths_last_wins", func(t *testing.T) {
-		m := NewManifest(1, "1", "src", "/data", "dev1")
+		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.AddFile(FileEntry{Name: "a.txt", ContentHash: "hash_old", Size: 10})
 		m.AddFile(FileEntry{Name: "a.txt", ContentHash: "hash_new", Size: 20})
 		fm := m.BuildFileMap()
@@ -212,7 +212,7 @@ func TestManifestBuildFileMap(t *testing.T) {
 	})
 
 	t.Run("empty_manifest", func(t *testing.T) {
-		m := NewManifest(1, "1", "src", "/data", "dev1")
+		m := NewManifest(1, "", "src", "/data", "dev1")
 		fm := m.BuildFileMap()
 		if len(fm) != 0 {
 			t.Fatalf("got %d entries, want 0", len(fm))
@@ -221,7 +221,7 @@ func TestManifestBuildFileMap(t *testing.T) {
 }
 
 func TestManifestAddFile(t *testing.T) {
-	m := NewManifest(1, "1", "src", "/data", "dev1")
+	m := NewManifest(1, "", "src", "/data", "dev1")
 	if m.Stats.FileCount != 0 || m.Stats.TotalSize != 0 {
 		t.Fatalf("initial stats: FileCount=%d TotalSize=%d", m.Stats.FileCount, m.Stats.TotalSize)
 	}
@@ -271,7 +271,7 @@ func TestSaveManifestWithKey(t *testing.T) {
 		t.Fatalf("generate key: %v", err)
 	}
 
-	m := NewManifest(1, "1", "src", "/data", "dev1")
+	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.AddFile(FileEntry{Name: "secret.txt", ContentHash: "abc123", Size: 42, Mtime: "2026-05-19T10:00:00Z", Mode: 0644})
 
 	if err := SaveManifestWithKey(dir, m, key); err != nil {
@@ -308,7 +308,7 @@ func TestSaveManifestWithKey(t *testing.T) {
 
 func TestLoadManifestFromData(t *testing.T) {
 	t.Run("plain_json", func(t *testing.T) {
-		m := NewManifest(1, "1", "src", "/data", "dev1")
+		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.AddFile(FileEntry{Name: "a.txt", Size: 10})
 		data, err := json.Marshal(m)
 		if err != nil {
@@ -476,21 +476,21 @@ func TestLoadLatestManifest(t *testing.T) {
 	t.Run("multiple_manifests_returns_latest", func(t *testing.T) {
 		dir := t.TempDir()
 
-		m1 := NewManifest(1, "1", "src", "/data", "dev1")
+		m1 := NewManifest(1, "", "src", "/data", "dev1")
 		m1.Timestamp = "2026-05-19T10:00:00Z"
 		m1.AddFile(FileEntry{Name: "old.txt", Size: 10})
 		if err := SaveManifest(dir, m1); err != nil {
 			t.Fatalf("save m1: %v", err)
 		}
 
-		m2 := NewManifest(1, "1", "src", "/data", "dev1")
+		m2 := NewManifest(1, "", "src", "/data", "dev1")
 		m2.Timestamp = "2026-05-19T12:00:00Z"
 		m2.AddFile(FileEntry{Name: "new.txt", Size: 20})
 		if err := SaveManifest(dir, m2); err != nil {
 			t.Fatalf("save m2: %v", err)
 		}
 
-		m3 := NewManifest(1, "1", "src", "/data", "dev1")
+		m3 := NewManifest(1, "", "src", "/data", "dev1")
 		m3.Timestamp = "2026-05-19T11:00:00Z"
 		m3.AddFile(FileEntry{Name: "mid.txt", Size: 15})
 		if err := SaveManifest(dir, m3); err != nil {
@@ -527,11 +527,11 @@ func TestListManifests(t *testing.T) {
 	t.Run("multiple_manifests", func(t *testing.T) {
 		dir := t.TempDir()
 
-		m1 := NewManifest(1, "1", "src", "/data", "dev1")
+		m1 := NewManifest(1, "", "src", "/data", "dev1")
 		m1.Timestamp = "2026-05-19T10:00:00Z"
 		SaveManifest(dir, m1)
 
-		m2 := NewManifest(1, "1", "src", "/data", "dev1")
+		m2 := NewManifest(1, "", "src", "/data", "dev1")
 		m2.Timestamp = "2026-05-19T12:00:00Z"
 		SaveManifest(dir, m2)
 
@@ -569,7 +569,7 @@ func TestListManifests(t *testing.T) {
 		manifestDir := ManifestDir(dir, ManifestPathKey("dev1", "1"))
 		os.MkdirAll(manifestDir, 0755)
 
-		m := NewManifest(1, "1", "src", "/data", "dev1")
+		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.Timestamp = "2026-05-19T10:00:00Z"
 		SaveManifest(dir, m)
 
@@ -593,7 +593,7 @@ func TestDeleteManifest(t *testing.T) {
 	t.Run("successful_delete", func(t *testing.T) {
 		dir := t.TempDir()
 
-		m := NewManifest(1, "1", "src", "/data", "dev1")
+		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.Timestamp = "2026-05-19T10:00:00Z"
 		SaveManifest(dir, m)
 
@@ -619,7 +619,7 @@ func TestDeleteManifest(t *testing.T) {
 func TestTrashManifest(t *testing.T) {
 	dir := t.TempDir()
 
-	m := NewManifest(1, "1", "src", "/data", "dev1")
+	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	m.AddFile(FileEntry{Name: "a.txt", Size: 10})
 	SaveManifest(dir, m)
@@ -661,7 +661,7 @@ func TestTrashManifest(t *testing.T) {
 func TestCleanTrashManifests(t *testing.T) {
 	dir := t.TempDir()
 
-	m := NewManifest(1, "1", "src", "/data", "dev1")
+	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	SaveManifest(dir, m)
 
@@ -692,7 +692,7 @@ func TestCleanTrashManifests(t *testing.T) {
 func TestCleanTrashManifestsRecentFilesKept(t *testing.T) {
 	dir := t.TempDir()
 
-	m := NewManifest(1, "1", "src", "/data", "dev1")
+	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	SaveManifest(dir, m)
 
@@ -727,7 +727,7 @@ func TestCleanTrashManifestsNoTrashDir(t *testing.T) {
 func TestManifestExistsByTimestamp(t *testing.T) {
 	dir := t.TempDir()
 
-	m := NewManifest(1, "1", "src", "/data", "dev1")
+	m := NewManifest(1, "", "src", "/data", "dev1")
 	ts := "2026-05-19T10:00:00Z"
 	m.Timestamp = ts
 	SaveManifest(dir, m)
@@ -751,7 +751,7 @@ func TestLoadManifestByTimestamp(t *testing.T) {
 	t.Run("found", func(t *testing.T) {
 		dir := t.TempDir()
 
-		m := NewManifest(1, "1", "src", "/data", "dev1")
+		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.Timestamp = "2026-05-19T10:00:00Z"
 		m.AddFile(FileEntry{Name: "found.txt", Size: 10})
 		SaveManifest(dir, m)
@@ -790,8 +790,6 @@ func TestSourceRegistryRoundtrip(t *testing.T) {
 		Name:          "MySource",
 		Path:          "/data/important",
 		DeviceID:      "dev1",
-		Hostname:      "workstation",
-		OS:            "linux",
 		LastSnapshot:  "2026-05-19T10:00:00Z",
 		SnapshotCount: 7,
 		CreatedAt:     "2026-01-01T00:00:00Z",
@@ -816,12 +814,6 @@ func TestSourceRegistryRoundtrip(t *testing.T) {
 	}
 	if loaded.DeviceID != "dev1" {
 		t.Fatalf("DeviceID: got %q", loaded.DeviceID)
-	}
-	if loaded.Hostname != "workstation" {
-		t.Fatalf("Hostname: got %q", loaded.Hostname)
-	}
-	if loaded.OS != "linux" {
-		t.Fatalf("OS: got %q", loaded.OS)
 	}
 	if loaded.SnapshotCount != 7 {
 		t.Fatalf("SnapshotCount: got %d, want 7", loaded.SnapshotCount)
@@ -920,10 +912,14 @@ func TestManifestDir(t *testing.T) {
 	}
 }
 
-func TestSaveManifestWithKeyUsesSourceIDAsCloudID(t *testing.T) {
+func TestSaveManifestWithKeyFallsBackToDevicePathKey(t *testing.T) {
 	dir := t.TempDir()
 	key, _ := GenerateRandomKey()
 
+	// CloudID is empty: SaveManifestWithKey must fall back to the device
+	// fingerprint + sourceID path key, not the bare sourceID. Codifies
+	// the H3 fix — a stale earlier version wrote to "42/" instead of
+	// "dev1/42/".
 	m := NewManifest(42, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	if err := SaveManifestWithKey(dir, m, key); err != nil {
@@ -936,14 +932,20 @@ func TestSaveManifestWithKeyUsesSourceIDAsCloudID(t *testing.T) {
 		t.Fatalf("read dir: %v", err)
 	}
 	if len(entries) == 0 {
-		t.Fatal("no manifests saved in cloudID=42 dir")
+		t.Fatal("no manifests saved in device-fingerprint path key dir")
+	}
+
+	// And the legacy bare-sourceID dir must NOT exist.
+	legacyDir := ManifestDir(dir, "42")
+	if _, err := os.Stat(legacyDir); err == nil {
+		t.Fatalf("legacy bare-sourceID cloudID dir should not exist, but does: %s", legacyDir)
 	}
 }
 
 func TestSaveManifestInvalidTimestamp(t *testing.T) {
 	dir := t.TempDir()
 
-	m := NewManifest(1, "1", "src", "/data", "dev1")
+	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "invalid-timestamp"
 	m.AddFile(FileEntry{Name: "a.txt", Size: 10})
 
@@ -963,11 +965,11 @@ func TestSaveManifestInvalidTimestamp(t *testing.T) {
 func TestDeleteManifestPreservesOtherManifests(t *testing.T) {
 	dir := t.TempDir()
 
-	m1 := NewManifest(1, "1", "src", "/data", "dev1")
+	m1 := NewManifest(1, "", "src", "/data", "dev1")
 	m1.Timestamp = "2026-05-19T10:00:00Z"
 	SaveManifest(dir, m1)
 
-	m2 := NewManifest(1, "1", "src", "/data", "dev1")
+	m2 := NewManifest(1, "", "src", "/data", "dev1")
 	m2.Timestamp = "2026-05-19T12:00:00Z"
 	SaveManifest(dir, m2)
 

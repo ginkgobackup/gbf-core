@@ -13,18 +13,29 @@ import (
 )
 
 func main() {
-	tempDir, _ := os.MkdirTemp("", "gbf-demo-*")
+	tempDir, err := os.MkdirTemp("", "gbf-demo-*")
+	if err != nil {
+		fail("create temp dir: %v", err)
+	}
 	defer os.RemoveAll(tempDir)
 
 	sourceDir := filepath.Join(tempDir, "source")
 	repoDir := filepath.Join(tempDir, "repo")
 	restoreDir := filepath.Join(tempDir, "restore")
-	os.MkdirAll(filepath.Join(sourceDir, "notes"), 0755)
+	if err := os.MkdirAll(filepath.Join(sourceDir, "notes"), 0755); err != nil {
+		fail("mkdir source: %v", err)
+	}
 
 	// Create test files
-	os.WriteFile(filepath.Join(sourceDir, "README.md"), []byte("# My Vault\n\nSecret notes."), 0644)
-	os.WriteFile(filepath.Join(sourceDir, "notes", "ideas.md"), []byte("Ship the open source core.\nAuditable encryption.\n"), 0644)
-	os.WriteFile(filepath.Join(sourceDir, "notes", "todo.md"), []byte("- [ ] backup\n- [x] encrypt\n"), 0644)
+	if err := os.WriteFile(filepath.Join(sourceDir, "README.md"), []byte("# My Vault\n\nSecret notes."), 0644); err != nil {
+		fail("write README.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "notes", "ideas.md"), []byte("Ship the open source core.\nAuditable encryption.\n"), 0644); err != nil {
+		fail("write ideas.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "notes", "todo.md"), []byte("- [ ] backup\n- [x] encrypt\n"), 0644); err != nil {
+		fail("write todo.md: %v", err)
+	}
 
 	fmt.Println("=== gbf-core backup demo ===")
 	fmt.Printf("source:  %s\n", sourceDir)
@@ -98,7 +109,10 @@ func main() {
 	checkContent(filepath.Join(restoreDir, "notes", "todo.md"), "- [ ] backup\n- [x] encrypt\n")
 
 	// 8. Verify blob store is encrypted (no plaintext on disk)
-	blobs, _ := store.List(context.Background(), "")
+	blobs, err := store.List(context.Background(), "")
+	if err != nil {
+		fail("list blobs: %v", err)
+	}
 	fmt.Printf("\n[6] blob store contains %d encrypted blobs — plaintext never touches disk\n", len(blobs))
 
 	fmt.Println("\n=== ALL CHECKS PASSED ===")

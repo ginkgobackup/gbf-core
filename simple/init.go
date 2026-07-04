@@ -29,6 +29,15 @@ func InitRepo(params InitParams) error {
 		}
 	}
 	cfg := DefaultConfig(params.DeviceID)
+
+	// Derive a per-repo CDC polynomial from crypto/rand so chunk boundaries
+	// are stable for this repo but not shared with every other installation.
+	pol, err := GenerateCDCPolynomial()
+	if err != nil {
+		return fmt.Errorf("derive cdc polynomial: %w", err)
+	}
+	cfg.CDCPolynomial = pol
+
 	if err := SaveConfig(params.RepoRoot, cfg); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}

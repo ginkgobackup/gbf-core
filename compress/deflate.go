@@ -5,7 +5,7 @@ package compress
 
 import (
 	"bytes"
-	"compress/flate"
+	"compress/zlib"
 	"io"
 )
 
@@ -24,7 +24,7 @@ func (c *DeflateCompressor) Type() CompressorType { return CompressDeflate }
 
 func (c *DeflateCompressor) Compress(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	w, err := flate.NewWriter(&buf, c.level)
+	w, err := zlib.NewWriterLevel(&buf, c.level)
 	if err != nil {
 		return nil, err
 	}
@@ -37,7 +37,10 @@ func (c *DeflateCompressor) Compress(data []byte) ([]byte, error) {
 }
 
 func (c *DeflateCompressor) Decompress(data []byte) ([]byte, error) {
-	r := flate.NewReader(bytes.NewReader(data))
+	r, err := zlib.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
 	decompressed, err := io.ReadAll(r)
 	r.Close()
 	if err != nil {

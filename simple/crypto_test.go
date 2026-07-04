@@ -159,13 +159,14 @@ func TestDecryptIfEncryptedGB1(t *testing.T) {
 
 func TestDecryptIfEncryptedPlain(t *testing.T) {
 	key := make([]byte, 32)
+	// Plaintext longer than MagicSize with bytes that don't match any known
+	// magic should now error rather than silently passing through. This is
+	// the C3.3 fix: an unknown 4-byte prefix is treated as a corrupted
+	// encrypted blob, not as plaintext.
 	plain := []byte("plain text data")
-	result, err := DecryptIfEncrypted(plain, key)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !bytes.Equal(result, plain) {
-		t.Fatalf("mismatch: got %q, want %q", result, plain)
+	_, err := DecryptIfEncrypted(plain, key)
+	if err == nil {
+		t.Fatal("expected error for plaintext with unknown magic prefix")
 	}
 }
 
@@ -196,13 +197,12 @@ func TestDecryptIfEncryptedEmptyKeyGB1(t *testing.T) {
 }
 
 func TestDecryptIfEncryptedEmptyKeyPlain(t *testing.T) {
+	// Same as TestDecryptIfEncryptedPlain: plaintext with unknown magic
+	// prefix should error regardless of whether a key is provided.
 	plain := []byte("plain data")
-	result, err := DecryptIfEncrypted(plain, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !bytes.Equal(result, plain) {
-		t.Fatalf("mismatch: got %q, want %q", result, plain)
+	_, err := DecryptIfEncrypted(plain, nil)
+	if err == nil {
+		t.Fatal("expected error for plaintext with unknown magic prefix")
 	}
 }
 

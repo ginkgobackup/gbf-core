@@ -23,6 +23,12 @@ const (
 	FlagsSize      = 1
 )
 
+// Encryptor is the on-disk format encryptor: a stateful AEAD wrapper bound
+// to a single master key and chunk size. Its Encrypt/Decrypt methods emit
+// and parse the GB1/GB2 chunked blob format (magic bytes + chunk count +
+// per-chunk IV+ciphertext), not raw AEAD. It is intentionally distinct from
+// vault.Encryptor, which is the stateless single-block AEAD interface used
+// for HKDF-derived subkeys (manifests, etc.). See vault/encryptor.go.
 type Encryptor struct {
 	key       []byte
 	chunkSize int
@@ -119,11 +125,7 @@ func (d *Decryptor) Decrypt(ciphertext []byte) ([]byte, error) {
 		return d.decryptLargeV2(data)
 	case MagicGB1:
 		if len(data) > ChunkCountSize && isChunkCount(data[:ChunkCountSize]) {
-			result, err := d.decryptLarge(data)
-			if err == nil {
-				return result, nil
-			}
-			return d.decryptSmall(data)
+			return d.decryptLarge(data)
 		}
 		return d.decryptSmall(data)
 	default:
@@ -295,8 +297,7 @@ func DecryptIfEncrypted(data []byte, key []byte) ([]byte, error) {
 		return DecryptManifest(data, key)
 	}
 	if magic != MagicGB1 && magic != MagicGB2 {
-		// Unknown magic: treat as plaintext (could be legitimately unencrypted data).
-		return data, nil
+		return nil, fmt.Errorf("unknown magic %q: expected GB1, GB2, or GKM1", magic)
 	}
 	if len(key) == 0 {
 		return nil, fmt.Errorf("encrypted blob requires key but none provided (magic %q)", magic)

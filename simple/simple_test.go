@@ -158,7 +158,7 @@ func TestConfigSaveLoad(t *testing.T) {
 
 func TestManifestSaveLoad(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManifest(1, "1", "TestSource", "/test/path", "device-1")
+	m := NewManifest(1, "", "TestSource", "/test/path", "device-1")
 	m.AddFile(FileEntry{
 		Name:        "test/file.txt",
 		ContentHash: SHA256Bytes([]byte("file content")),

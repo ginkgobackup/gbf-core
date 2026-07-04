@@ -126,11 +126,11 @@ func (s *LocalBlobStore) Put(ctx context.Context, hash string, data []byte) erro
 			return fmt.Errorf("close tmp blob: %w", err)
 		}
 	} else {
-		if err := os.WriteFile(tmp, data, 0644); err != nil {
+		if err := os.WriteFile(tmp, data, 0600); err != nil {
 			os.Remove(tmp)
 			return fmt.Errorf("write tmp blob: %w", err)
 		}
-		f, err := os.OpenFile(tmp, os.O_WRONLY, 0644)
+		f, err := os.OpenFile(tmp, os.O_WRONLY, 0600)
 		if err != nil {
 			os.Remove(tmp)
 			return fmt.Errorf("open tmp blob for sync: %w", err)

@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/restic/chunker"
 )
 
 func TestIsLikelyIncompressible_ImageExtensions(t *testing.T) {
@@ -129,23 +131,19 @@ func TestNewSimplePipeline_SetsFields(t *testing.T) {
 	dir := t.TempDir()
 	store := NewLocalBlobStore(dir)
 	cfg := PipelineConfig{
-		RepoRoot:   dir,
-		SourceID:   42,
-		CloudID:    "cloud-1",
-		SourceName: "test-source",
-		SourcePath: "/data",
-		DeviceID:   "dev-1",
-		Key:        nil,
-		Excludes:   []string{"*.tmp"},
-		DataDir:    dir,
-		ForceFull:  false,
+		RepoRoot:    dir,
+		SourceID:    42,
+		SourceName:  "test-source",
+		SourcePath:  "/data",
+		DeviceID:    "dev-1",
+		Key:         nil,
+		Excludes:    []string{"*.tmp"},
+		ForceFull:   false,
+		WorkerCount: 4,
 	}
 	p := NewSimplePipeline(cfg, store)
 	if p.cfg.SourceID != 42 {
 		t.Errorf("SourceID = %d, want 42", p.cfg.SourceID)
-	}
-	if p.cfg.CloudID != "cloud-1" {
-		t.Errorf("CloudID = %q, want %q", p.cfg.CloudID, "cloud-1")
 	}
 	if p.cfg.SourceName != "test-source" {
 		t.Errorf("SourceName = %q, want %q", p.cfg.SourceName, "test-source")
@@ -155,6 +153,9 @@ func TestNewSimplePipeline_SetsFields(t *testing.T) {
 	}
 	if p.cfg.DeviceID != "dev-1" {
 		t.Errorf("DeviceID = %q, want %q", p.cfg.DeviceID, "dev-1")
+	}
+	if p.cfg.WorkerCount != 4 {
+		t.Errorf("WorkerCount = %d, want 4", p.cfg.WorkerCount)
 	}
 	if p.store != store {
 		t.Error("store not set correctly")
@@ -654,7 +655,9 @@ func TestPipelineEmptyDirDetection(t *testing.T) {
 
 	repoDir := filepath.Join(dir, "repo")
 	os.MkdirAll(repoDir, 0755)
-	InitRepoWithKeyFile(repoDir, "default")
+	if err := InitRepoWithPassword(repoDir, "test", "demo-password"); err != nil {
+		t.Fatalf("init repo: %v", err)
+	}
 
 	store := NewLocalBlobStore(repoDir)
 	cfg := PipelineConfig{
@@ -821,6 +824,13 @@ func TestProcessFileStreaming_SkipsCompressionForIncompressible(t *testing.T) {
 
 func TestHashFileWithCDC_Basic(t *testing.T) {
 	t.Setenv("GINKGO_CDC", "1")
+	// Derive a valid irreducible polynomial since this test bypasses Run()
+	// and therefore never loads the per-repo polynomial from config.
+	pol, err := GenerateCDCPolynomial()
+	if err != nil {
+		t.Fatalf("derive polynomial: %v", err)
+	}
+	SetCDCPolynomial(pol)
 	dir := t.TempDir()
 	size := int64(8 * 1024 * 1024)
 	data := make([]byte, size)
@@ -853,6 +863,15 @@ func TestHashFileWithCDC_Basic(t *testing.T) {
 
 func TestProcessFileStreaming_CDC_DedupsShiftedData(t *testing.T) {
 	t.Setenv("GINKGO_CDC", "1")
+	// Derive a deterministic irreducible polynomial so the test is
+	// reproducible. Using crypto/rand per run makes the dedup ratio
+	// non-deterministic and the test flaky. The seed below yields a
+	// polynomial that produces stable chunk boundaries for shifted data.
+	pol, err := chunker.DerivePolynomial(rand.New(rand.NewSource(42)))
+	if err != nil {
+		t.Fatalf("derive deterministic polynomial: %v", err)
+	}
+	SetCDCPolynomial(uint64(pol))
 	dir := t.TempDir()
 	store := newMockBlobStore()
 	key := make([]byte, 32)

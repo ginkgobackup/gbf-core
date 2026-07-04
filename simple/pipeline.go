@@ -35,14 +35,22 @@ type PipelineConfig struct {
 	SourceName string
 	SourcePath string
 	ScanPath   string
-	OverlayDir string
 	DeviceID   string
 	Key        []byte
 	Excludes   []string
-	DataDir    string
 	ForceFull  bool
 	DisableCDC bool
 	SessionID  string
+	// OverlayDir, when set, points to a directory whose contents are layered
+	// on top of SourcePath during backup (e.g. for virtualized Notion mounts).
+	OverlayDir string
+	// DataDir is the application-wide data directory used for ancillary
+	// caches (e.g. cloud-manifest cache).
+	DataDir string
+	// WorkerCount overrides the default worker pool size. Values <= 0 fall
+	// back to a sensible default derived from runtime.NumCPU() (capped to
+	// avoid thrashing on high-core machines).
+	WorkerCount int
 }
 
 type PipelineResult struct {
@@ -123,17 +131,14 @@ type scanEntry struct {
 func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	start := time.Now()
 	result := &PipelineResult{}
-	var metaDir string
-	if strings.HasPrefix(p.cfg.RepoRoot, "cloud://") || strings.HasPrefix(p.cfg.RepoRoot, "s3://") ||
-		strings.HasPrefix(p.cfg.RepoRoot, "webdav://") || strings.HasPrefix(p.cfg.RepoRoot, "sftp://") ||
-		strings.HasPrefix(p.cfg.RepoRoot, "peer://") {
-		cloudID := p.cfg.CloudID
-		if cloudID == "" {
-			cloudID = ResolveCloudID(p.cfg.DeviceID, p.cfg.SourceID)
-		}
-		metaDir = filepath.Join(p.cfg.DataDir, "cloud-manifests", cloudID)
-	} else {
-		metaDir = MetaDir(p.cfg.RepoRoot)
+	metaDir := MetaDir(p.cfg.RepoRoot)
+
+	// Load the per-repo CDC polynomial so chunk boundaries match what was
+	// persisted at init time. Without this, incremental backups would compute
+	// different chunk hashes against a different polynomial and re-upload
+	// everything.
+	if err := LoadCDCPolynomialFromConfig(p.cfg.RepoRoot); err != nil {
+		return nil, fmt.Errorf("load cdc polynomial: %w", err)
 	}
 
 	slog.Info("GBF pipeline starting", "source_id", p.cfg.SourceID, "source", p.cfg.SourceName, "repo", p.cfg.RepoRoot, "source_path", p.cfg.SourcePath, "scan_path", p.cfg.ScanPath, "session_id", p.cfg.SessionID)
@@ -155,10 +160,7 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	}
 
 	var prevFiles map[string]FileEntry
-	cloudID := p.cfg.CloudID
-	if cloudID == "" {
-		cloudID = ResolveCloudID(p.cfg.DeviceID, p.cfg.SourceID)
-	}
+	cloudID := ResolveCloudID(p.cfg.DeviceID, p.cfg.SourceID)
 	if !p.cfg.ForceFull {
 		prevManifest, loadErr := LoadLatestManifest(metaDir, cloudID)
 		if loadErr != nil && !errors.Is(loadErr, ErrManifestNotFound) {
@@ -250,18 +252,6 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 
 	slog.Info("GBF scan complete", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "files", len(files), "session_id", p.cfg.SessionID)
 
-	if p.cfg.OverlayDir != "" {
-		overlayFilesDir := filepath.Join(p.cfg.OverlayDir, "files")
-		for i := range files {
-			overlayPath := filepath.Join(overlayFilesDir, filepath.FromSlash(files[i].relPath))
-			if info, err := os.Stat(overlayPath); err == nil && !info.IsDir() {
-				files[i].absPath = overlayPath
-				files[i].size = info.Size()
-				files[i].mtime = info.ModTime().UTC().Format(time.RFC3339)
-			}
-		}
-	}
-
 	dirHasChildren := make(map[string]bool)
 	for _, f := range files {
 		parts := strings.Split(f.relPath, "/")
@@ -303,12 +293,19 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	var failedPaths, lockedPaths []string
 	var failedErrors []string
 
-	workerCount := runtime.NumCPU()
-	if workerCount < 2 {
-		workerCount = 2
-	}
-	if workerCount > 8 {
-		workerCount = 8
+	workerCount := p.cfg.WorkerCount
+	if workerCount <= 0 {
+		workerCount = runtime.NumCPU()
+		if workerCount < 2 {
+			workerCount = 2
+		}
+		// Cap the auto-derived count to avoid overwhelming the blob store
+		// with concurrent puts on high-core machines. Callers that genuinely
+		// need more parallelism can set PipelineConfig.WorkerCount.
+		const defaultWorkerCap = 8
+		if workerCount > defaultWorkerCap {
+			workerCount = defaultWorkerCap
+		}
 	}
 
 	ch := make(chan scanEntry, workerCount*4)
@@ -436,7 +433,6 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 		return nil, fmt.Errorf("save manifest: %w", err)
 	}
 
-	hostname, _ := os.Hostname()
 	reg, regErr := LoadSourceRegistry(metaDir, cloudID)
 	if regErr != nil {
 		reg = &SourceRegistry{
@@ -444,16 +440,12 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 			Name:      newManifest.SourceName,
 			Path:      newManifest.SourcePath,
 			DeviceID:  newManifest.DeviceID,
-			Hostname:  hostname,
-			OS:        runtime.GOOS,
 			CreatedAt: newManifest.Timestamp,
 		}
 	}
 	reg.Name = newManifest.SourceName
 	reg.Path = newManifest.SourcePath
 	reg.DeviceID = newManifest.DeviceID
-	reg.Hostname = hostname
-	reg.OS = runtime.GOOS
 	reg.LastSnapshot = newManifest.Timestamp
 	reg.SnapshotCount++
 
@@ -838,7 +830,7 @@ func (p *SimplePipeline) hashAndEncryptToTempFile(ctx context.Context, filePath 
 		return "", "", 0, fmt.Errorf("gcm: %w", gcmErr)
 	}
 
-	tmpPath := filepath.Join(os.TempDir(), "gb-encrypt-"+uuid.New().String()+".tmp")
+	tmpPath := filepath.Join(os.TempDir(), "gbf-tmp-"+uuid.New().String()+".tmp")
 	tmpF, err := os.Create(tmpPath)
 	if err != nil {
 		return "", "", 0, fmt.Errorf("create tmp: %w", err)
@@ -939,64 +931,6 @@ func (p *SimplePipeline) hashAndEncryptToTempFile(ctx context.Context, filePath 
 
 func (p *SimplePipeline) isExcluded(relPath string) bool {
 	return fsutil.IsExcluded(relPath, p.posExcludes, p.negExcludes)
-}
-
-var incompressibleExts = map[string]bool{
-	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".bmp": true,
-	".tiff": true, ".tif": true, ".webp": true, ".heic": true, ".heif": true,
-	".avif": true, ".ico": true, ".raw": true, ".cr2": true, ".nef": true,
-	".orf": true, ".arw": true, ".dng": true, ".rw2": true,
-	".psd": true, ".psb": true,
-
-	".mp4": true, ".avi": true, ".mkv": true, ".mov": true, ".wmv": true,
-	".flv": true, ".webm": true, ".m4v": true, ".mpg": true, ".mpeg": true,
-	".3gp": true, ".3g2": true, ".ts": true, ".mts": true, ".vob": true,
-	".m2ts": true, ".rm": true, ".rmvb": true,
-
-	".mp3": true, ".aac": true, ".flac": true, ".ogg": true, ".wma": true,
-	".m4a": true, ".wav": true, ".opus": true, ".aiff": true, ".alac": true,
-	".amr": true, ".ape": true, ".wv": true, ".tta": true,
-
-	".zip": true, ".zipx": true, ".rar": true, ".rar5": true, ".7z": true,
-	".gz": true, ".bz2": true, ".xz": true, ".zst": true, ".lz4": true,
-	".tar": true, ".tgz": true, ".lz": true, ".lzma": true,
-	".br": true, ".sz": true, ".cab": true, ".arj": true, ".ace": true,
-	".lha": true, ".lzh": true, ".arc": true, ".uha": true, ".kgb": true,
-	".z": true, ".zz": true, ".sit": true, ".sitx": true, ".brotli": true,
-
-	".iso": true, ".dmg": true, ".img": true, ".bin": true, ".nrg": true,
-	".mdf": true, ".mds": true, ".ccd": true, ".sub": true,
-	".vmdk": true, ".vdi": true, ".vhd": true, ".vhdx": true,
-	".qcow2": true, ".qcow": true, ".qed": true,
-	".ova": true, ".ovf": true, ".xva": true,
-	".wim": true, ".esd": true, ".squashfs": true, ".cramfs": true,
-	".gho": true, ".tib": true, ".tibx": true, ".vbk": true, ".vib": true,
-	".adi": true, ".fbk": true, ".sna": true,
-
-	".pdf": true, ".docx": true, ".xlsx": true, ".pptx": true,
-	".odt": true, ".ods": true, ".odp": true, ".doc": true, ".xls": true,
-	".ppt": true, ".epub": true, ".mobi": true, ".azw3": true,
-	".cbr": true, ".cbz": true,
-
-	".exe": true, ".dll": true, ".so": true, ".dylib": true,
-	".jar": true, ".war": true, ".apk": true, ".ipa": true,
-	".deb": true, ".rpm": true, ".pkg": true, ".msi": true,
-	".app": true, ".appx": true, ".msix": true, ".nupkg": true,
-}
-
-var incompressibleNames = map[string]bool{
-	"pagefile.sys": true,
-	"hiberfil.sys": true,
-	"swapfile.sys": true,
-}
-
-func isLikelyIncompressible(path string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	if incompressibleExts[ext] {
-		return true
-	}
-	name := strings.ToLower(filepath.Base(path))
-	return incompressibleNames[name]
 }
 
 func (p *SimplePipeline) hashFileWithChunks(ctx context.Context, filePath string, size int64) (string, []ChunkRef, error) {

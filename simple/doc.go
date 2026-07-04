@@ -4,60 +4,23 @@
 // Package simple implements the GBF backup format pipeline, blob storage,
 // manifest management, and encryption.
 //
-// # Stability: FROZEN (v1)
+// # Stability: pre-1.0
 //
-// The exported API surface listed below is frozen. No breaking changes
-// (removals, signature changes, semantic behavior changes) will be made
-// without a major version bump. Internal refactoring and additive changes
-// (new methods, new fields with zero-value compatibility) are permitted.
+// This package is under active development. The exported API may change
+// between minor versions while the project is below v1.0. Consumers should
+// pin to a specific tag and re-run tests after upgrading. Once the API
+// stabilizes at v1.0, a formal compatibility policy will be documented here.
 //
-// ## Frozen Types
+// # Main entry points
 //
-//   - SimpleBlobStore (interface) — blob read/write/delete contract
-//   - BlobInfo — blob metadata
-//   - SimplePipeline — backup pipeline entry point
-//   - PipelineConfig — pipeline configuration
-//   - PipelineResult — pipeline output
-//   - Manifest — snapshot manifest
-//   - FileEntry — file record in manifest
-//   - Dir — directory record in manifest (files + subdirs)
-//   - ManifestStats — manifest statistics
-//   - LocalBlobStore — local blob storage (implements SimpleBlobStore)
-//   - Encryptor / Decryptor — AES-256-GCM encrypt/decrypt
-//   - HashResult — file hash result
-//   - ProgressTracker — backup progress tracking
+//   - NewSimplePipeline — backup pipeline entry point
+//   - SaveManifest / LoadManifest — manifest persistence
+//   - NewLocalBlobStore — local blob storage
+//   - NewEncryptor / NewDecryptor — AES-256-GCM encrypt/decrypt
+//   - InitRepoWithPassword / UnlockRepoWithPassword — GEK1 keyfile workflow
+//   - NewSimpleRestore — restore pipeline
 //
-// ## Frozen Functions
-//
-//   - NewSimplePipeline(cfg PipelineConfig, store SimpleBlobStore) *SimplePipeline
-//   - (*SimplePipeline).Run(ctx, sourcePath, prevManifest) (*PipelineResult, error)
-//   - NewManifest(sourceID, cloudID, sourceName, sourcePath, deviceID) *Manifest
-//   - SaveManifest / SaveManifestWithKey / LoadManifest / LoadManifestFromData
-//   - LoadLatestManifest / LoadManifestByTimestamp / ManifestExistsByTimestamp
-//   - ListManifests / DeleteManifest / TrashManifest / CleanTrashManifests
-//   - CollectAliveHashes / ManifestDir / ManifestFilePath
-//   - NewLocalBlobStore
-//   - NewEncryptor / NewDecryptor
-//   - SHA256File / SHA256Bytes
-//   - NewProgressTracker
-//   - MetaDir
-//   - SetManifestDecryptHook
-//   - SaveSourceRegistry / LoadSourceRegistry / ListSourceRegistries
-//
-// ## Frozen Error Values
+// # Error values
 //
 //   - ErrManifestNotFound
-//
-// ## Internal (unfrozen) — do not depend on these from outside this package
-//
-//   - processFile, processFileStreaming (pipeline internals)
-//   - hashAndEncryptFile, hashAndEncryptToTempFile, hashOnlyFile (hash internals)
-//   - uploadBlob, downloadBlob (blob transfer internals)
-//   - All unexported functions and types
-//
-// ## Additive-only change policy
-//
-// New exported functions and types may be added. New struct fields must
-// have zero-value semantics that are backward-compatible. Existing function
-// signatures must not change.
 package simple

@@ -1,0 +1,58 @@
+name: Feature request
+description: Suggest a new feature or an improvement for gbf-core
+title: "[feat]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature for **gbf-core**.
+
+        - Search existing issues and Discussions before opening a new one.
+        - Keep the scope focused: one feature per request.
+        - Security-related changes belong in security@ginkgobackup.com, not here.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What problem does this feature solve? Who is it for?
+      placeholder: |
+        The current CDC chunker uses a fixed polynomial seed, so backups
+        of identical files across different repositories produce identical
+        chunk boundaries. This leaks metadata to anyone who can observe
+        both repositories.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you like gbf-core to do? Be specific about the API, format change, or behavior.
+      placeholder: |
+        Derive the CDC polynomial from the repository's master key using
+        HKDF, so chunk boundaries differ per repository while remaining
+        stable within one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches have you thought about? Why are they worse?
+      placeholder: |
+        - Random per-run seed: breaks dedup across incremental backups.
+        - Per-file salt: works, but requires a format change to the blob
+          store, which is more invasive than the HKDF approach.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Screenshots, mock-ups, related upstream work, links to specs, etc.
+    validations:
+      required: false

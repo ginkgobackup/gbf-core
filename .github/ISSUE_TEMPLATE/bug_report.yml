@@ -1,0 +1,75 @@
+name: Bug report
+description: Report something that is not working as expected in gbf-core
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report for **gbf-core**.
+
+        - Search existing issues before opening a new one to avoid duplicates.
+        - **Do not report security vulnerabilities here.** Email
+          security@ginkgobackup.com instead. See [SECURITY.md](../SECURITY.md).
+        - General questions belong in GitHub Discussions, not the bug tracker.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug description
+      description: A clear and concise description of what the bug is.
+      placeholder: |
+        When I run the demo with the default GEK1 format, the restore step
+        fails with "manifest checksum mismatch" after a second incremental
+        backup pass.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Steps to reproduce the behavior, as small and self-contained as possible.
+      placeholder: |
+        1. `git clone https://github.com/ginkgobackup/gbf-core`
+        2. `cd gbf-core && go run ./cmd/demo/`
+        3. Run `go test ./simple/ -run TestRestoreRoundTrip -count=2`
+        4. Observe the error below.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: gbf-core version
+      description: Tag, commit hash, or module version you are using.
+      placeholder: "v0.1.0 or commit abc1234"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: OS and architecture where you reproduced the issue.
+      placeholder: "Ubuntu 24.04 x86_64, Windows 11, macOS 14, ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and output
+      description: Relevant command output, panic stack traces, or error messages. Paste as plain text — no screenshots.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that might help diagnose the issue. Configuration, custom build flags, related upstream changes, etc.
+    validations:
+      required: false

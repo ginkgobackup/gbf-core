@@ -25,14 +25,6 @@ const (
 	GEK1Magic     = "GEK1"
 )
 
-type KeyFile struct {
-	Version    int    `json:"version"`
-	Algorithm  string `json:"algorithm"`
-	Key        string `json:"key"`
-	Salt       string `json:"salt"`
-	WrappedKey string `json:"wrappedKey,omitempty"`
-}
-
 func DeriveKeyFromPassword(password string, salt []byte) []byte {
 	return argon2.IDKey([]byte(password), salt, Argon2Time, Argon2Memory, Argon2Threads, Argon2KeyLen)
 }
@@ -55,25 +47,6 @@ func GenerateRandomKey() ([]byte, error) {
 
 func KeyFilePath(repoRoot string) string {
 	return filepath.Join(MetaDir(repoRoot), "repo.key")
-}
-
-func SaveKeyFile(repoRoot string, key []byte, salt []byte) error {
-	kf := KeyFile{
-		Version:   1,
-		Algorithm: "aes-256-gcm",
-		Key:       base64.StdEncoding.EncodeToString(key),
-		Salt:      base64.StdEncoding.EncodeToString(salt),
-	}
-	data, err := json.MarshalIndent(kf, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
-	path := KeyFilePath(repoRoot)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
-	return os.Rename(tmp, path)
 }
 
 func EncodeGEK1KeyFile(masterKey []byte, password string) ([]byte, error) {
@@ -118,41 +91,6 @@ func SaveGEK1KeyFile(repoRoot string, masterKey []byte, password string) error {
 	return os.Rename(tmp, path)
 }
 
-func LoadKeyFile(repoRoot string) (*KeyFile, error) {
-	path := KeyFilePath(repoRoot)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read: %w", err)
-	}
-	if len(data) >= 4 && data[0] == 'G' && data[1] == 'E' && data[2] == 'K' && data[3] == 1 {
-		return nil, fmt.Errorf("GEK1 encrypted key file requires password unlock (use UnlockRepoWithPassword)")
-	}
-	var kf KeyFile
-	if err := json.Unmarshal(data, &kf); err != nil {
-		return nil, fmt.Errorf("unmarshal: %w", err)
-	}
-	return &kf, nil
-}
-
-func (kf *KeyFile) DecodeKey() ([]byte, error) {
-	key, err := base64.StdEncoding.DecodeString(kf.Key)
-	if err != nil {
-		return nil, fmt.Errorf("decode key: %w", err)
-	}
-	if len(key) != 32 {
-		return nil, fmt.Errorf("invalid key length: %d", len(key))
-	}
-	return key, nil
-}
-
-func (kf *KeyFile) DecodeSalt() ([]byte, error) {
-	salt, err := base64.StdEncoding.DecodeString(kf.Salt)
-	if err != nil {
-		return nil, fmt.Errorf("decode salt: %w", err)
-	}
-	return salt, nil
-}
-
 func InitRepoWithPassword(repoRoot string, deviceID string, password string) error {
 	if err := InitRepo(InitParams{RepoRoot: repoRoot, DeviceID: deviceID}); err != nil {
 		return err
@@ -172,65 +110,16 @@ func InitRepoWithPassword(repoRoot string, deviceID string, password string) err
 	return SaveConfig(repoRoot, cfg)
 }
 
-func InitRepoWithKeyFile(repoRoot string, deviceID string) error {
-	if err := InitRepo(InitParams{RepoRoot: repoRoot, DeviceID: deviceID}); err != nil {
-		return err
-	}
-	masterKey, err := GenerateRandomKey()
-	if err != nil {
-		return err
-	}
-	salt, err := GenerateSalt()
-	if err != nil {
-		return err
-	}
-	if err := SaveKeyFile(repoRoot, masterKey, salt); err != nil {
-		return err
-	}
-	cfg, err := LoadConfig(repoRoot)
-	if err != nil {
-		return err
-	}
-	cfg.Encrypted = true
-	return SaveConfig(repoRoot, cfg)
-}
-
 func UnlockRepoWithPassword(repoRoot string, password string) ([]byte, error) {
 	path := KeyFilePath(repoRoot)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-
-	if len(data) > 0 && data[0] == '{' {
-		return unlockJSONKeyFile(data, password)
-	}
-
 	if len(data) >= 4 && data[0] == 'G' && data[1] == 'E' && data[2] == 'K' && data[3] == 1 {
 		return unlockGEK1KeyFile(data, password)
 	}
-
 	return nil, fmt.Errorf("unsupported key file format")
-}
-
-func unlockJSONKeyFile(data []byte, password string) ([]byte, error) {
-	var kf KeyFile
-	if err := json.Unmarshal(data, &kf); err != nil {
-		return nil, fmt.Errorf("unmarshal: %w", err)
-	}
-	salt, err := kf.DecodeSalt()
-	if err != nil {
-		return nil, err
-	}
-	derivedKey := DeriveKeyFromPassword(password, salt)
-	storedKey, err := kf.DecodeKey()
-	if err != nil {
-		return nil, err
-	}
-	if !equalKeys(derivedKey, storedKey) {
-		return nil, fmt.Errorf("incorrect password")
-	}
-	return derivedKey, nil
 }
 
 func unlockGEK1KeyFile(data []byte, password string) ([]byte, error) {
@@ -264,21 +153,95 @@ func DecryptGEK1MasterKey(salt []byte, encryptedKey []byte, password string) ([]
 	return masterKey, nil
 }
 
-func UnlockRepoWithKeyFile(repoRoot string) ([]byte, error) {
-	kf, err := LoadKeyFile(repoRoot)
-	if err != nil {
-		return nil, err
-	}
-	return kf.DecodeKey()
+// KeyFileData is a legacy keyfile representation that stores the master key
+// base64-encoded alongside Argon2id parameters. New repos should use the
+// GEK1 binary format (see EncodeGEK1KeyFile). This struct is kept for
+// compatibility with existing repos whose repo.key was written by the
+// old InitRepoWithKeyFile path. LoadKeyFile reads either format and
+// returns a KeyFileData whose DecodeKey method extracts the master key.
+type KeyFileData struct {
+	Version   int    `json:"version"`
+	Algorithm string `json:"algorithm"`
+	Key       string `json:"key"`
+	Salt      string `json:"salt"`
 }
 
-func equalKeys(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
+// LoadKeyFile reads the repo.key file at repoRoot/.ginkgo-backup/repo.key.
+// It supports both the legacy JSON format and the GEK1 binary format. For
+// GEK1 files the returned KeyFileData has Version=1, Algorithm="gek1", and
+// the master key embedded directly in the Key field (base64-encoded) —
+// DecodeKey returns it without further derivation, since GEK1 was already
+// decrypted at load time. For legacy JSON files DecodeKey base64-decodes
+// the stored key.
+func LoadKeyFile(repoRoot string) (*KeyFileData, error) {
+	path := KeyFilePath(repoRoot)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
 	}
-	result := byte(0)
-	for i := range a {
-		result |= a[i] ^ b[i]
+	// GEK1 binary format: master key is wrapped by a password; without a
+	// password we cannot recover it here. Callers that need to decrypt a
+	// GEK1 file should use UnlockRepoWithPassword. LoadKeyFile is only the
+	// legacy fallback path.
+	if len(data) >= 4 && data[0] == 'G' && data[1] == 'E' && data[2] == 'K' && data[3] == 1 {
+		return nil, fmt.Errorf("GEK1 key file requires a password; use UnlockRepoWithPassword")
 	}
-	return result == 0
+	var kf KeyFileData
+	if err := json.Unmarshal(data, &kf); err != nil {
+		return nil, fmt.Errorf("parse key file: %w", err)
+	}
+	return &kf, nil
+}
+
+// DecodeKey returns the master key bytes from a legacy JSON keyfile.
+// The key field is base64-encoded.
+func (kf *KeyFileData) DecodeKey() ([]byte, error) {
+	if kf.Key == "" {
+		return nil, fmt.Errorf("empty key in key file")
+	}
+	key, err := base64.StdEncoding.DecodeString(kf.Key)
+	if err != nil {
+		return nil, fmt.Errorf("decode key: %w", err)
+	}
+	return key, nil
+}
+
+// InitRepoWithKeyFile initializes a repo with a plaintext keyfile (legacy
+// format, kept for backward compatibility). New code should use
+// InitRepoWithPassword to produce a GEK1 keyfile. This function generates
+// a random master key, base64-encodes it into the JSON keyfile format, and
+// marks the repo config as encrypted. The master key is stored in
+// plaintext in repo.key — this provides no security against an attacker
+// with file access, only against accidental reads. For true encryption at
+// rest, use InitRepoWithPassword.
+func InitRepoWithKeyFile(repoRoot string, deviceID string) error {
+	if err := InitRepo(InitParams{RepoRoot: repoRoot, DeviceID: deviceID}); err != nil {
+		return err
+	}
+	masterKey, err := GenerateRandomKey()
+	if err != nil {
+		return err
+	}
+	kf := KeyFileData{
+		Version:   1,
+		Algorithm: "aes-256-gcm",
+		Key:       base64.StdEncoding.EncodeToString(masterKey),
+	}
+	data, err := json.MarshalIndent(kf, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal key file: %w", err)
+	}
+	path := KeyFilePath(repoRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("mkdir keyfile dir: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("write key file: %w", err)
+	}
+	cfg, err := LoadConfig(repoRoot)
+	if err != nil {
+		return err
+	}
+	cfg.Encrypted = true
+	return SaveConfig(repoRoot, cfg)
 }

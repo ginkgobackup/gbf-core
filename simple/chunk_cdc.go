@@ -5,12 +5,13 @@ package simple
 
 import (
 	"context"
+	crypto_rand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
+	"sync"
 
 	"github.com/restic/chunker"
 )
@@ -21,14 +22,54 @@ const (
 	cdcMaxSize     = 16 * 1024 * 1024 // 16 MiB
 )
 
-var cdcPolynomial chunker.Pol
+var (
+	cdcPolynomialMu sync.RWMutex
+	cdcPolynomial   chunker.Pol
+)
 
-func init() {
-	pol, err := chunker.DerivePolynomial(rand.New(rand.NewSource(0x123456789ABCDEF)))
+// SetCDCPolynomial sets the CDC polynomial used for content-defined chunking.
+// This must be called before any backup operation to ensure consistent
+// chunk boundaries across incremental backups. The polynomial should be
+// stored in the repo config and loaded at startup.
+func SetCDCPolynomial(pol uint64) {
+	cdcPolynomialMu.Lock()
+	cdcPolynomial = chunker.Pol(pol)
+	cdcPolynomialMu.Unlock()
+}
+
+// LoadCDCPolynomialFromConfig reads the persisted CDC polynomial from the
+// repo config and registers it globally via SetCDCPolynomial. Call this
+// before running the backup pipeline against a repo so chunk boundaries
+// match the polynomial the repo was initialized with. Repos without a
+// persisted polynomial (legacy v0.1) fall back to a freshly derived one.
+func LoadCDCPolynomialFromConfig(repoRoot string) error {
+	cfg, err := LoadConfig(repoRoot)
 	if err != nil {
-		panic(fmt.Sprintf("derive cdc polynomial: %v", err))
+		return fmt.Errorf("load config for cdc polynomial: %w", err)
 	}
-	cdcPolynomial = pol
+	if cfg.CDCPolynomial == 0 {
+		pol, err := GenerateCDCPolynomial()
+		if err != nil {
+			return fmt.Errorf("derive fallback cdc polynomial: %w", err)
+		}
+		cfg.CDCPolynomial = pol
+		if err := SaveConfig(repoRoot, cfg); err != nil {
+			return fmt.Errorf("persist fallback cdc polynomial: %w", err)
+		}
+	}
+	SetCDCPolynomial(cfg.CDCPolynomial)
+	return nil
+}
+
+// GenerateCDCPolynomial derives a random CDC polynomial from crypto/rand.
+// Each repository should generate its own polynomial during initialization
+// and persist it in the repo config to ensure stable chunk boundaries.
+func GenerateCDCPolynomial() (uint64, error) {
+	pol, err := chunker.DerivePolynomial(crypto_rand.Reader)
+	if err != nil {
+		return 0, fmt.Errorf("derive cdc polynomial: %w", err)
+	}
+	return uint64(pol), nil
 }
 
 func (p *SimplePipeline) cdcEnabled() bool {
@@ -48,7 +89,10 @@ func (p *SimplePipeline) hashFileWithCDC(ctx context.Context, filePath string, s
 	}
 	defer f.Close()
 
-	c := chunker.NewWithBoundaries(f, cdcPolynomial, cdcMinSize, cdcMaxSize)
+	cdcPolynomialMu.RLock()
+	pol := cdcPolynomial
+	cdcPolynomialMu.RUnlock()
+	c := chunker.NewWithBoundaries(f, pol, cdcMinSize, cdcMaxSize)
 	c.SetAverageBits(cdcAverageBits)
 
 	h := sha256.New()

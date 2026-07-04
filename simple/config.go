@@ -23,8 +23,12 @@ type RepoConfig struct {
 	CipherAlgorithm string `json:"cipherAlgorithm"`
 	ChunkSize       int    `json:"chunkSize"`
 	DisableCDC      bool   `json:"disable_cdc,omitempty"`
-	Created         string `json:"created"`
-	DeviceID        string `json:"deviceId"`
+	// CDCPolynomial is the content-defined chunking polynomial persisted
+	// at repo init. Each repo derives its own polynomial so chunk boundaries
+	// are stable for that repo but not shared across all installations.
+	CDCPolynomial uint64 `json:"cdcPolynomial,omitempty"`
+	Created       string `json:"created"`
+	DeviceID      string `json:"deviceId"`
 }
 
 const (
@@ -65,7 +69,7 @@ func SaveConfig(repoRoot string, cfg *RepoConfig) error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	if err := fsutil.WriteFileAtomic(path, data, 0644); err != nil {
+	if err := fsutil.WriteFileAtomic(path, data, 0600); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil

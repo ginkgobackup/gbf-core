@@ -16,6 +16,7 @@ type Limiter struct {
 	mu             sync.Mutex
 	ticker         *time.Ticker
 	stopCh         chan struct{}
+	stopOnce       sync.Once
 }
 
 func NewLimiter(bytesPerSecond int64) *Limiter {
@@ -105,10 +106,12 @@ func (l *Limiter) SetRate(bytesPerSecond int64) {
 }
 
 func (l *Limiter) Stop() {
-	if l.ticker != nil {
-		l.ticker.Stop()
-		close(l.stopCh)
-	}
+	l.stopOnce.Do(func() {
+		if l.ticker != nil {
+			l.ticker.Stop()
+			close(l.stopCh)
+		}
+	})
 }
 
 type Reader struct {
