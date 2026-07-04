@@ -49,15 +49,14 @@ gbf-core/
 
 Four magic byte prefixes identify the blob kinds produced by this engine. They are not version-compatible with each other and a given file always carries exactly one:
 
-| Magic    | Kind                            | Source                          | Layout                                                                                                                          |
-|----------|---------------------------------|---------------------------------|---------------------------------------------------------------------------------------------------------------------------------|
-| `GB1\0`  | Small blob                      | `Encryptor.Encrypt` (small)     | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (single AEAD block)                                                                   |
-| `GB1\0`  | Large blob, no compression      | `Encryptor.Encrypt` (large)     | `magic` ‖ `chunkCount` ‖ for each chunk: `nonce` ‖ `ciphertext` ‖ `tag` (chunked AEAD, distinguished from small form by a valid chunkCount prefix) |
-| `GB2\0`  | Large blob, per-chunk compression | `encryptFileToWriter` (stream)  | `magic` ‖ `chunkCount` ‖ for each chunk: `size` ‖ `flags` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (each chunk carries its own size header and a compression flag) |
-| `GKM1`   | Encrypted manifest              | `EncryptManifest`               | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (manifest key derived via HKDF from the master key)                                   |
-| `GEK1`   | Encrypted keyfile               | `simple/keys.go`                | `magic` ‖ `salt` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (master key wrapped by Argon2id-derived key; Argon2id parameters are compile-time constants, see `simple/keys.go`) |
+| Magic    | Kind                | Source                  | Layout                                                                                                                |
+|----------|---------------------|-------------------------|-----------------------------------------------------------------------------------------------------------------------|
+| `GB1\0`  | Single-block blob   | Backup pipeline (default) | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (one AEAD block). Used for every chunk the pipeline writes: small files are stored as one GB1 blob, large files are split into chunks (CDC or fixed-size) and each chunk is stored as its own GB1 blob. |
+| `GB2\0`  | Streaming blob with per-chunk compression | `encryptFileToWriter` (stream helper) | `magic` ‖ `chunkCount` ‖ for each chunk: `size` ‖ `flags` ‖ `nonce` ‖ `ciphertext` ‖ `tag`. Variant emitted only by the streaming helper when a compressor is supplied; the main pipeline does not currently take this path. |
+| `GKM1`   | Encrypted manifest  | `EncryptManifest`       | `magic` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (manifest key derived via HKDF from the master key)                          |
+| `GEK1`   | Encrypted keyfile   | `simple/keys.go`        | `magic` ‖ `salt` ‖ `nonce` ‖ `ciphertext` ‖ `tag` (master key wrapped by Argon2id-derived key; Argon2id parameters are compile-time constants, see `simple/keys.go`) |
 
-`GB1\0` covers two layouts distinguished by a valid `chunkCount` prefix: small blobs (no chunk header, single AEAD block) and large blobs (chunk header followed by per-chunk `nonce‖ciphertext‖tag` without per-chunk size). `GB2\0` is the streaming variant that adds a per-chunk size header and compression flag, allowing each chunk to be compressed independently before encryption. The decryptor inspects the magic byte and layout to handle all forms transparently.
+The decryptor inspects the magic byte and handles GB1, GB2, and GKM1 transparently. In the current pipeline, every encrypted blob written to the store is GB1: files below the chunk size are stored whole, files at or above the chunk size are split into chunks (CDC by default, fixed-size otherwise) and each chunk is uploaded as an independent GB1 blob. GB2 is supported by the decryptor and the streaming helper for future use, but the pipeline currently stores each chunk separately as GB1 rather than packaging them into a single GB2 blob.
 
 ## Content-Defined Chunking (CDC)
 
