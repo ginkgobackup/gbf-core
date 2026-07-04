@@ -5,6 +5,7 @@ package compress
 
 import (
 	"bytes"
+	"io"
 
 	"github.com/klauspost/compress/s2"
 )
@@ -42,11 +43,16 @@ func (c *S2Compressor) Compress(data []byte) ([]byte, error) {
 
 func (c *S2Compressor) Decompress(data []byte) ([]byte, error) {
 	r := s2.NewReader(bytes.NewReader(data))
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
+	// Cap output to prevent compression bombs.
+	lr := io.LimitReader(r, MaxDecompressedSize+1)
+	decompressed, err := io.ReadAll(lr)
+	if err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	if len(decompressed) > MaxDecompressedSize {
+		return nil, ErrDecompressedTooLarge
+	}
+	return decompressed, nil
 }
 
 // s2 stream magic bytes (two variants supported by the reader).

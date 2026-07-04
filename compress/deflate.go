@@ -41,10 +41,17 @@ func (c *DeflateCompressor) Decompress(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	decompressed, err := io.ReadAll(r)
-	r.Close()
+	defer r.Close()
+	// Cap output to prevent compression bombs. io.LimitReader returns
+	// MaxDecompressedSize+1 bytes when the stream exceeds the cap, which
+	// we detect and reject.
+	lr := io.LimitReader(r, MaxDecompressedSize+1)
+	decompressed, err := io.ReadAll(lr)
 	if err != nil {
 		return nil, err
+	}
+	if len(decompressed) > MaxDecompressedSize {
+		return nil, ErrDecompressedTooLarge
 	}
 	return decompressed, nil
 }

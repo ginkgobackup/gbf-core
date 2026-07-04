@@ -103,7 +103,12 @@ func (s *LocalBlobStore) lockPut(hash string) func() {
 	return mu.Unlock
 }
 
-func (s *LocalBlobStore) Put(ctx context.Context, hash string, data []byte) error {
+// putBlob is the shared implementation of Put and PutStream. writeBlob is
+// responsible for writing the blob content to f; on error it should return
+// a wrapped error and leave f open (putBlob closes f and removes the temp
+// file on cleanup). The rest of the atomic-rename + fsync + exists-cache
+// dance lives here so the two public methods don't drift out of sync.
+func (s *LocalBlobStore) putBlob(ctx context.Context, hash string, writeBlob func(f *os.File) error) error {
 	if !validateHash(hash) {
 		return ErrInvalidHash
 	}
@@ -129,50 +134,33 @@ func (s *LocalBlobStore) Put(ctx context.Context, hash string, data []byte) erro
 	if err := s.ensureDir(dir); err != nil {
 		return err
 	}
+
 	tmp := path + "." + uuid.New().String() + ".tmp"
-	if s.writeLimiter != nil {
-		f, err := os.Create(tmp)
-		if err != nil {
-			os.Remove(tmp)
-			return fmt.Errorf("create tmp blob: %w", err)
-		}
-		w := ratelimit.NewWriter(f, s.writeLimiter)
-		if _, err := w.Write(data); err != nil {
-			f.Close()
-			os.Remove(tmp)
-			return fmt.Errorf("write tmp blob: %w", err)
-		}
-		if err := f.Sync(); err != nil {
-			f.Close()
-			os.Remove(tmp)
-			return fmt.Errorf("sync tmp blob: %w", err)
-		}
-		if err := f.Close(); err != nil {
-			os.Remove(tmp)
-			return fmt.Errorf("close tmp blob: %w", err)
-		}
-	} else {
-		if err := os.WriteFile(tmp, data, 0600); err != nil {
-			os.Remove(tmp)
-			return fmt.Errorf("write tmp blob: %w", err)
-		}
-		f, err := os.OpenFile(tmp, os.O_WRONLY, 0600)
-		if err != nil {
-			os.Remove(tmp)
-			return fmt.Errorf("open tmp blob for sync: %w", err)
-		}
-		if err := f.Sync(); err != nil {
-			f.Close()
-			os.Remove(tmp)
-			return fmt.Errorf("sync tmp blob: %w", err)
-		}
-		if err := f.Close(); err != nil {
-			os.Remove(tmp)
-			return fmt.Errorf("close tmp blob: %w", err)
-		}
+	f, err := os.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("create tmp blob: %w", err)
 	}
+
+	if err := writeBlob(f); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("sync tmp blob: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("close tmp blob: %w", err)
+	}
+
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
+		// A concurrent put for the same hash may have completed first.
+		// Treat "target already exists" as success rather than a race failure.
 		if _, statErr := os.Stat(path); statErr == nil {
 			s.existsMu.Lock()
 			s.existsSet[hash] = true
@@ -190,6 +178,22 @@ func (s *LocalBlobStore) Put(ctx context.Context, hash string, data []byte) erro
 	return nil
 }
 
+func (s *LocalBlobStore) Put(ctx context.Context, hash string, data []byte) error {
+	return s.putBlob(ctx, hash, func(f *os.File) error {
+		if s.writeLimiter != nil {
+			w := ratelimit.NewWriter(f, s.writeLimiter)
+			if _, err := w.WriteContext(ctx, data); err != nil {
+				return fmt.Errorf("write tmp blob: %w", err)
+			}
+			return nil
+		}
+		if _, err := f.Write(data); err != nil {
+			return fmt.Errorf("write tmp blob: %w", err)
+		}
+		return nil
+	})
+}
+
 func (s *LocalBlobStore) Get(ctx context.Context, hash string) ([]byte, error) {
 	if !validateHash(hash) {
 		return nil, ErrInvalidHash
@@ -198,76 +202,36 @@ func (s *LocalBlobStore) Get(ctx context.Context, hash string) ([]byte, error) {
 }
 
 func (s *LocalBlobStore) PutStream(ctx context.Context, hash string, r io.Reader, size int64) error {
-	if !validateHash(hash) {
-		return ErrInvalidHash
-	}
-	unlock := s.lockPut(hash)
-	defer unlock()
-
-	s.existsMu.RLock()
-	if s.existsSet[hash] {
-		s.existsMu.RUnlock()
-		return nil
-	}
-	s.existsMu.RUnlock()
-
-	path := s.blobPath(hash)
-	if _, err := os.Stat(path); err == nil {
-		s.existsMu.Lock()
-		s.existsSet[hash] = true
-		s.existsMu.Unlock()
-		return nil
-	}
-
-	dir := filepath.Dir(path)
-	if err := s.ensureDir(dir); err != nil {
-		return err
-	}
-	tmp := path + "." + uuid.New().String() + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if s.writeLimiter != nil {
-		w := ratelimit.NewWriter(f, s.writeLimiter)
-		if _, err := io.Copy(w, r); err != nil {
-			f.Close()
-			os.Remove(tmp)
-			return fmt.Errorf("write tmp blob stream: %w", err)
+	return s.putBlob(ctx, hash, func(f *os.File) error {
+		if s.writeLimiter != nil {
+			w := ratelimit.NewWriter(f, s.writeLimiter)
+			// Honor ctx cancellation during the copy: io.Copy would block on
+			// WriteContext's WaitN with context.Background(), defeating ctx
+			// propagation. A manual loop lets us pass ctx through WriteContext.
+			buf := make([]byte, 32*1024)
+			for {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				n, rerr := r.Read(buf)
+				if n > 0 {
+					if _, werr := w.WriteContext(ctx, buf[:n]); werr != nil {
+						return fmt.Errorf("write tmp blob stream: %w", werr)
+					}
+				}
+				if rerr == io.EOF {
+					return nil
+				}
+				if rerr != nil {
+					return fmt.Errorf("write tmp blob stream: %w", rerr)
+				}
+			}
 		}
-	} else {
 		if _, err := io.Copy(f, r); err != nil {
-			f.Close()
-			os.Remove(tmp)
 			return fmt.Errorf("write tmp blob stream: %w", err)
 		}
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("sync tmp blob stream: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("close tmp blob stream: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		if _, statErr := os.Stat(path); statErr == nil {
-			s.existsMu.Lock()
-			s.existsSet[hash] = true
-			s.existsMu.Unlock()
-			return nil
-		}
-		return fmt.Errorf("rename tmp blob stream: %w", err)
-	}
-	if err := fsutil.SyncParent(dir); err != nil {
-		return fmt.Errorf("sync parent dir: %w", err)
-	}
-	s.existsMu.Lock()
-	s.existsSet[hash] = true
-	s.existsMu.Unlock()
-	return nil
+		return nil
+	})
 }
 
 func (s *LocalBlobStore) GetStream(ctx context.Context, hash string) (io.ReadCloser, error) {

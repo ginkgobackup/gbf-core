@@ -4,6 +4,7 @@
 package compress
 
 import (
+	"fmt"
 	"runtime"
 
 	"github.com/klauspost/compress/zstd"
@@ -17,6 +18,17 @@ const (
 	CompressS2      CompressorType = "s2"
 	CompressDeflate CompressorType = "deflate"
 )
+
+// MaxDecompressedSize caps the output of every Decompress call. Backed-up
+// chunks are bounded by DefaultChunkSize, so legitimate payloads decompress
+// to at most ~DefaultChunkSize. A crafted blob (compression bomb) could
+// otherwise expand to gigabytes and OOM the process. The cap is generous
+// (4 MiB) to allow for manifest payloads and future chunk-size changes.
+const MaxDecompressedSize = 4 * 1024 * 1024
+
+// ErrDecompressedTooLarge is returned when a Decompress call would produce
+// more than MaxDecompressedSize bytes.
+var ErrDecompressedTooLarge = fmt.Errorf("decompressed output exceeds %d bytes", MaxDecompressedSize)
 
 type Compressor interface {
 	Type() CompressorType
@@ -45,8 +57,16 @@ func NewZstdCompressor(level int) *ZstdCompressor {
 	encs := make(chan *zstd.Encoder, n)
 	decs := make(chan *zstd.Decoder, n)
 	for i := 0; i < n; i++ {
-		enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)))
-		dec, _ := zstd.NewReader(nil)
+		enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)), zstd.WithEncoderCRC(true))
+		if err != nil {
+			panic(fmt.Sprintf("compress: create zstd encoder: %v", err))
+		}
+		// WithDecoderMaxMemory caps the memory a crafted zstd stream is
+		// allowed to allocate during decoding, blocking compression bombs.
+		dec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(uint64(MaxDecompressedSize)))
+		if err != nil {
+			panic(fmt.Sprintf("compress: create zstd decoder: %v", err))
+		}
 		encs <- enc
 		decs <- dec
 	}
@@ -70,7 +90,15 @@ func (c *ZstdCompressor) Decompress(data []byte) ([]byte, error) {
 	dec := <-c.decs
 	defer func() { c.decs <- dec }()
 	decompressed, err := dec.DecodeAll(data, nil)
-	return decompressed, err
+	if err != nil {
+		// zstd returns a generic "decompression failed" when the
+		// WithDecoderMaxOutputSize cap is hit; normalize to our sentinel.
+		if decompressed == nil && len(data) > 0 {
+			return nil, ErrDecompressedTooLarge
+		}
+		return nil, err
+	}
+	return decompressed, nil
 }
 
 var zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}

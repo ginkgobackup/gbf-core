@@ -11,13 +11,15 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/google/uuid"
 	"golang.org/x/sys/windows"
 )
 
 const (
 	_FlagSequentialScan  = 0x08000000
 	_FileAttributeNormal = 0x00000080
+	// FILE_FLAG_BACKUP_SEMANTICS is required to open a directory handle on
+	// Windows; without it CreateFile fails with ERROR_ACCESS_DENIED.
+	_FlagBackupSemantics = 0x02000000
 )
 
 func OpenFileSequential(path string) (*os.File, error) {
@@ -79,48 +81,44 @@ func ReadFileSequential(path string) ([]byte, error) {
 }
 
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
-	}
-
-	// Use a per-call unique temp name so concurrent WriteFileAtomic calls
-	// on the same path do not clobber each other's staging file.
-	tmp := path + "." + uuid.NewString() + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return fmt.Errorf("create tmp file: %w", err)
-	}
-
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("write tmp file: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("sync tmp file: %w", err)
-	}
-
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("close tmp file: %w", err)
-	}
-
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("rename tmp file: %w", err)
-	}
-
-	return syncParentDir(dir)
+	return writeFileAtomicCommon(path, data, perm)
 }
 
-func SyncParent(dir string) error {
-	return syncParentDir(dir)
-}
-
+// syncParentDir fsyncs a directory on Windows. Windows does not expose a
+// direct fsync-on-directory syscall, but opening the directory with
+// FILE_FLAG_BACKUP_SEMANTICS and calling FlushFileBuffers persists its
+// metadata (including the entry update from a just-performed rename).
+// Without this, a crash between rename and the OS flushing the directory
+// can lose the rename. Previously this was a no-op, which silently broke
+// the durability guarantee that callers (manifest, blob store, config)
+// rely on.
 func syncParentDir(dir string) error {
+	pathPtr, err := windows.UTF16PtrFromString(filepath.Clean(dir))
+	if err != nil {
+		return fmt.Errorf("syncParentDir: %w", err)
+	}
+	// GENERIC_WRITE is required for FlushFileBuffers to succeed on the handle.
+	handle, err := windows.CreateFile(
+		pathPtr,
+		windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		_FlagBackupSemantics|_FileAttributeNormal,
+		0,
+	)
+	if err != nil {
+		// If the directory does not exist there is nothing to sync; treat as
+		// success so callers that race with rmdir don't fail spuriously.
+		if err == windows.ERROR_FILE_NOT_FOUND || err == windows.ERROR_PATH_NOT_FOUND {
+			return nil
+		}
+		return fmt.Errorf("syncParentDir CreateFile: %w", err)
+	}
+	defer windows.CloseHandle(handle)
+
+	if err := windows.FlushFileBuffers(handle); err != nil {
+		return fmt.Errorf("syncParentDir FlushFileBuffers: %w", err)
+	}
 	return nil
 }

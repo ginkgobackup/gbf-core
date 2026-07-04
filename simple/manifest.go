@@ -22,7 +22,6 @@ import (
 
 	"github.com/ginkgobackup/gbf-core/compress"
 	"github.com/ginkgobackup/gbf-core/fsutil"
-	"github.com/google/uuid"
 )
 
 var ErrManifestNotFound = errors.New("manifest not found")
@@ -279,8 +278,18 @@ func (m *Manifest) BuildFileMap() map[string]FileEntry {
 }
 
 func (m *Manifest) FindFile(filePath string) (FileEntry, bool) {
-	dirPath, fileName := filepath.Split(filePath)
-	dirPath = strings.TrimRight(dirPath, "/")
+	// Manifest keys always use "/" as the separator (see normalizeManifestPath
+	// and BuildFileMap). On Windows, filepath.Split splits on "\" and would
+	// mis-segment a "/"-delimited input. Split on "/" explicitly so behavior
+	// is consistent across platforms and matches the manifest's own layout.
+	filePath = filepath.ToSlash(filePath)
+	var dirPath, fileName string
+	if idx := strings.LastIndex(filePath, "/"); idx >= 0 {
+		dirPath = filePath[:idx]
+		fileName = filePath[idx+1:]
+	} else {
+		fileName = filePath
+	}
 	d, ok := m.Dirs[dirPath]
 	if !ok {
 		return FileEntry{}, false
@@ -367,6 +376,34 @@ func ManifestDir(metaDir string, cloudID string) string {
 	return filepath.Join(metaDir, "manifests", cloudID)
 }
 
+// ErrInvalidCloudID is returned when a cloudID or deviceID contains path
+// components that could escape the manifest directory (e.g. ".." segments,
+// absolute paths, or Windows drive letters). cloudID may legitimately
+// contain "/" (the layout is "deviceID/sourceID"), but it must never resolve
+// to a path above the manifest root.
+var ErrInvalidCloudID = errors.New("invalid cloudID: path escapes manifest root")
+
+func validateCloudID(cloudID string) error {
+	if cloudID == "" {
+		return fmt.Errorf("cloudID is empty: %w", ErrInvalidCloudID)
+	}
+	// Reject absolute paths (Unix or Windows).
+	if strings.HasPrefix(cloudID, "/") || strings.HasPrefix(cloudID, "\\") {
+		return fmt.Errorf("cloudID is absolute: %q: %w", cloudID, ErrInvalidCloudID)
+	}
+	if len(cloudID) >= 2 && cloudID[1] == ':' && ((cloudID[0] >= 'A' && cloudID[0] <= 'Z') || (cloudID[0] >= 'a' && cloudID[0] <= 'z')) {
+		return fmt.Errorf("cloudID is absolute (Windows drive): %q: %w", cloudID, ErrInvalidCloudID)
+	}
+	// Reject any path segment equal to ".." — these would escape upward.
+	for _, seg := range strings.Split(cloudID, "/") {
+		seg = strings.TrimSpace(seg)
+		if seg == ".." {
+			return fmt.Errorf("cloudID contains parent reference: %q: %w", cloudID, ErrInvalidCloudID)
+		}
+	}
+	return nil
+}
+
 // ManifestPathKey returns the relative manifest directory key for a source.
 // The global manifest layout is manifests/{device-fingerprint}/{sourceID}.
 func ManifestPathKey(fingerprint, sourceID string) string {
@@ -409,6 +446,12 @@ func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) error {
 	cloudID := m.CloudID
 	if cloudID == "" {
 		cloudID = ManifestPathKey(m.DeviceID, fmt.Sprintf("%d", m.SourceID))
+	}
+	if err := validateCloudID(cloudID); err != nil {
+		return err
+	}
+	if err := validateCloudID(m.DeviceID); err != nil {
+		return fmt.Errorf("deviceID: %w", err)
 	}
 	path := ManifestFilePath(metaDir, cloudID, ts, m.DeviceID)
 	dir := filepath.Dir(path)
@@ -909,6 +952,9 @@ func DeleteAllSourceManifests(metaDir string, cloudID string) (int, error) {
 }
 
 func DeleteSourceRegistry(metaDir string, cloudID string) error {
+	if err := validateCloudID(cloudID); err != nil {
+		return err
+	}
 	srcPath := filepath.Join(sourceRegistriesDir(metaDir), cloudID+".json.zst")
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
 		return nil
@@ -917,6 +963,9 @@ func DeleteSourceRegistry(metaDir string, cloudID string) error {
 }
 
 func LoadTrashSourceRegistry(metaDir string, cloudID string) (*SourceRegistry, error) {
+	if err := validateCloudID(cloudID); err != nil {
+		return nil, err
+	}
 	dir := filepath.Join(metaDir, "trash", "_sources")
 	path := filepath.Join(dir, cloudID+".json.zst")
 	data, err := os.ReadFile(path)
@@ -1253,6 +1302,9 @@ func sourceRegistriesDir(metaDir string) string {
 }
 
 func SaveSourceRegistry(metaDir string, reg *SourceRegistry) error {
+	if err := validateCloudID(reg.CloudID); err != nil {
+		return fmt.Errorf("source registry cloudID: %w", err)
+	}
 	dir := sourceRegistriesDir(metaDir)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("mkdir sources registry: %w", err)
@@ -1272,14 +1324,18 @@ func SaveSourceRegistry(metaDir string, reg *SourceRegistry) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("mkdir source registry parent: %w", err)
 	}
-	tmp := path + "." + uuid.New().String() + ".tmp"
-	if err := os.WriteFile(tmp, compressed, 0600); err != nil {
+	// Use WriteFileAtomic for fsync + atomic rename + parent dir sync,
+	// consistent with SaveManifestWithKey and SaveGEK1KeyFile.
+	if err := fsutil.WriteFileAtomic(path, compressed, 0600); err != nil {
 		return fmt.Errorf("write source registry: %w", err)
 	}
-	return os.Rename(tmp, path)
+	return nil
 }
 
 func LoadSourceRegistry(metaDir string, cloudID string) (*SourceRegistry, error) {
+	if err := validateCloudID(cloudID); err != nil {
+		return nil, err
+	}
 	dir := sourceRegistriesDir(metaDir)
 	path := filepath.Join(dir, cloudID+".json.zst")
 	data, err := os.ReadFile(path)

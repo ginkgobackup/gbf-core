@@ -128,9 +128,23 @@ func NewReader(r interface {
 }
 
 func (r *Reader) Read(p []byte) (n int, err error) {
+	// io.Reader has no context parameter. Use ReadContext when you need
+	// cancellation propagation.
 	n, err = r.r.Read(p)
 	if n > 0 && r.limiter != nil {
 		if waitErr := r.limiter.WaitN(context.Background(), n); waitErr != nil {
+			return n, waitErr
+		}
+	}
+	return n, err
+}
+
+// ReadContext reads through the limiter, honoring ctx cancellation while
+// waiting for tokens. Callers holding a ctx should prefer this over Read.
+func (r *Reader) ReadContext(ctx context.Context, p []byte) (n int, err error) {
+	n, err = r.r.Read(p)
+	if n > 0 && r.limiter != nil {
+		if waitErr := r.limiter.WaitN(ctx, n); waitErr != nil {
 			return n, waitErr
 		}
 	}
@@ -151,8 +165,18 @@ func NewWriter(w interface {
 }
 
 func (w *Writer) Write(p []byte) (n int, err error) {
+	// io.Writer has no context parameter. Use WriteContext when you need
+	// cancellation propagation (e.g. backing up under a deadline).
+	return w.WriteContext(context.Background(), p)
+}
+
+// WriteContext writes p through the limiter, honoring ctx cancellation
+// while waiting for tokens. Callers that already hold a ctx (e.g. a backup
+// pipeline) should prefer this over Write so a cancelled backup does not
+// block waiting for the rate limiter to refill.
+func (w *Writer) WriteContext(ctx context.Context, p []byte) (n int, err error) {
 	if w.limiter != nil {
-		if waitErr := w.limiter.WaitN(context.Background(), len(p)); waitErr != nil {
+		if waitErr := w.limiter.WaitN(ctx, len(p)); waitErr != nil {
 			return 0, waitErr
 		}
 	}

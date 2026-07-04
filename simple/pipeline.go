@@ -9,7 +9,6 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -25,7 +24,7 @@ import (
 
 	"github.com/ginkgobackup/gbf-core/compress"
 	"github.com/ginkgobackup/gbf-core/fsutil"
-	"github.com/google/uuid"
+	"github.com/restic/chunker"
 )
 
 type PipelineConfig struct {
@@ -82,17 +81,34 @@ type SimplePipeline struct {
 	posExcludes []string
 	negExcludes []string
 	sizeFilters []fsutil.SizeFilter
+	// cdcPolynomial is the per-instance CDC polynomial, loaded from the repo
+	// config in NewSimplePipeline. Storing it on the struct (rather than
+	// relying solely on the package-level global) lets multiple pipelines
+	// targeting different repos coexist in the same process without
+	// clobbering each other's polynomial.
+	cdcPolynomial chunker.Pol
 }
 
 func NewSimplePipeline(cfg PipelineConfig, store SimpleBlobStore) *SimplePipeline {
 	chunkSize := DefaultChunkSize
-	return &SimplePipeline{
+	p := &SimplePipeline{
 		cfg:        cfg,
 		store:      store,
 		enc:        NewEncryptor(cfg.Key, chunkSize),
 		dec:        NewDecryptor(cfg.Key, chunkSize),
 		compressor: compress.NewZstdCompressor(1),
 	}
+	// Bind the CDC polynomial to this pipeline instance rather than relying
+	// solely on the package global. LoadCDCPolynomialFromConfig also sets
+	// the global for backward compat, but reading p.cdcPolynomial in
+	// hashFileWithCDC means concurrent pipelines with different repos no
+	// longer clobber each other.
+	if err := LoadCDCPolynomialFromConfig(cfg.RepoRoot); err == nil {
+		cdcPolynomialMu.RLock()
+		p.cdcPolynomial = cdcPolynomial
+		cdcPolynomialMu.RUnlock()
+	}
+	return p
 }
 
 func (p *SimplePipeline) getGCM() (cipher.AEAD, error) {
@@ -575,29 +591,45 @@ func openFileWithRetry(ctx context.Context, path string) (*os.File, error) {
 	return nil, lastErr
 }
 
+// tryUnchangedEntry returns an "unchanged" FileEntry for fe if every blob
+// referenced by prevFile is still present in the store. Any Exists() error
+// is treated as "blob missing" so we fall back to re-uploading rather than
+// failing the whole backup — the same defensive behavior the inline loops
+// used before this helper extracted them.
+//
+// Shared by the mtime/size fast path in processFile and the content-hash
+// fast path in processFileStreaming so the existence-check loop can't drift
+// between the two callers.
+func (p *SimplePipeline) tryUnchangedEntry(ctx context.Context, fe scanEntry, prevFile FileEntry, contentHash string) (*FileEntry, bool) {
+	allExist := true
+	if len(prevFile.Chunks) > 0 {
+		for _, c := range prevFile.Chunks {
+			exists, eErr := p.store.Exists(ctx, c.Hash)
+			if eErr != nil || !exists {
+				allExist = false
+				break
+			}
+		}
+	} else {
+		exists, eErr := p.store.Exists(ctx, contentHash)
+		if eErr != nil || !exists {
+			allExist = false
+		}
+	}
+	if !allExist {
+		return nil, false
+	}
+	entry := makeFileEntry(fe, contentHash, "unchanged")
+	if len(prevFile.Chunks) > 0 {
+		entry.Chunks = prevFile.Chunks
+	}
+	return entry, true
+}
+
 func (p *SimplePipeline) processFile(ctx context.Context, fe scanEntry, prevFiles map[string]FileEntry) (_ *FileEntry, _ int64, _ bool, _ bool, ferr error) {
 	prevFile, hasPrev := prevFiles[fe.relPath]
 	if hasPrev && string(prevFile.Mtime) == fe.mtime && prevFile.Size == fe.size && len(prevFile.ContentHash) >= 2 {
-		allBlobsExist := true
-		if len(prevFile.Chunks) > 0 {
-			for _, c := range prevFile.Chunks {
-				exists, eErr := p.store.Exists(ctx, c.Hash)
-				if eErr != nil || !exists {
-					allBlobsExist = false
-					break
-				}
-			}
-		} else {
-			blobExists, blobErr := p.store.Exists(ctx, prevFile.ContentHash)
-			if blobErr != nil || !blobExists {
-				allBlobsExist = false
-			}
-		}
-		if allBlobsExist {
-			entry := makeFileEntry(fe, prevFile.ContentHash, "unchanged")
-			if len(prevFile.Chunks) > 0 {
-				entry.Chunks = prevFile.Chunks
-			}
+		if entry, ok := p.tryUnchangedEntry(ctx, fe, prevFile, prevFile.ContentHash); ok {
 			return entry, 0, false, false, nil
 		}
 		hashLog := prevFile.ContentHash
@@ -624,7 +656,7 @@ func (p *SimplePipeline) processFile(ctx context.Context, fe scanEntry, prevFile
 	if hasPrev {
 		prevChunks = prevFile.Chunks
 	}
-	return p.checkAndUploadBlob(ctx, fe, hasPrev, prevFile.ContentHash, contentHash, ciphertext, nil, prevChunks)
+	return p.checkAndUploadBlob(ctx, fe, hasPrev, prevFile.ContentHash, contentHash, ciphertext, prevChunks)
 }
 
 func (p *SimplePipeline) processFileStreaming(ctx context.Context, fe scanEntry, prevFiles map[string]FileEntry) (_ *FileEntry, _ int64, _ bool, _ bool, ferr error) {
@@ -644,26 +676,7 @@ func (p *SimplePipeline) processFileStreaming(ctx context.Context, fe scanEntry,
 	}
 
 	if hasPrev && prevFile.ContentHash == contentHash {
-		allExist := true
-		if len(prevFile.Chunks) > 0 {
-			for _, c := range prevFile.Chunks {
-				exists, eErr := p.store.Exists(ctx, c.Hash)
-				if eErr != nil || !exists {
-					allExist = false
-					break
-				}
-			}
-		} else {
-			exists, eErr := p.store.Exists(ctx, contentHash)
-			if eErr != nil || !exists {
-				allExist = false
-			}
-		}
-		if allExist {
-			entry := makeFileEntry(fe, contentHash, "unchanged")
-			if len(prevFile.Chunks) > 0 {
-				entry.Chunks = prevFile.Chunks
-			}
+		if entry, ok := p.tryUnchangedEntry(ctx, fe, prevFile, contentHash); ok {
 			return entry, 0, false, false, nil
 		}
 	}
@@ -686,12 +699,7 @@ func (p *SimplePipeline) processFileStreaming(ctx context.Context, fe scanEntry,
 	return entry, uploaded, isChanged, isNew, nil
 }
 
-type streamUploadInfo struct {
-	tmpPath string
-	encSize int64
-}
-
-func (p *SimplePipeline) checkAndUploadBlob(ctx context.Context, fe scanEntry, hasPrev bool, prevHash string, contentHash string, ciphertext []byte, stream *streamUploadInfo, prevChunks []ChunkRef) (_ *FileEntry, _ int64, _ bool, _ bool, ferr error) {
+func (p *SimplePipeline) checkAndUploadBlob(ctx context.Context, fe scanEntry, hasPrev bool, prevHash string, contentHash string, ciphertext []byte, prevChunks []ChunkRef) (_ *FileEntry, _ int64, _ bool, _ bool, ferr error) {
 	if hasPrev && prevHash == contentHash {
 		blobExists, blobErr := p.store.Exists(ctx, contentHash)
 		if blobErr == nil && blobExists {
@@ -719,23 +727,9 @@ func (p *SimplePipeline) checkAndUploadBlob(ctx context.Context, fe scanEntry, h
 		return makeFileEntry(fe, contentHash, status), 0, isChanged, isNew, nil
 	}
 
-	if stream != nil {
-		tmpF, openErr := os.Open(stream.tmpPath)
-		if openErr != nil {
-			slog.Warn("GBF failed to open encrypted temp file", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "file", fe.relPath, "error", openErr, "session_id", p.cfg.SessionID)
-			return nil, 0, false, false, fmt.Errorf("open temp %s: %w", fe.relPath, openErr)
-		}
-		defer tmpF.Close()
-
-		if err := p.store.PutStream(ctx, contentHash, tmpF, stream.encSize); err != nil {
-			slog.Warn("GBF store.PutStream failed", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "file", fe.relPath, "hash", contentHash[:16], "error", err, "session_id", p.cfg.SessionID)
-			return nil, 0, false, false, fmt.Errorf("store.PutStream %s: %w", fe.relPath, err)
-		}
-	} else {
-		if err := p.store.Put(ctx, contentHash, ciphertext); err != nil {
-			slog.Warn("GBF store.Put failed", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "file", fe.relPath, "hash", contentHash[:16], "error", err, "session_id", p.cfg.SessionID)
-			return nil, 0, false, false, fmt.Errorf("store.Put %s: %w", fe.relPath, err)
-		}
+	if err := p.store.Put(ctx, contentHash, ciphertext); err != nil {
+		slog.Warn("GBF store.Put failed", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "file", fe.relPath, "hash", contentHash[:16], "error", err, "session_id", p.cfg.SessionID)
+		return nil, 0, false, false, fmt.Errorf("store.Put %s: %w", fe.relPath, err)
 	}
 
 	return makeFileEntry(fe, contentHash, status), fe.size, isChanged, isNew, nil
@@ -809,124 +803,6 @@ func (p *SimplePipeline) hashOnlyFile(ctx context.Context, path string, size int
 		return contentHash, data, nil
 	}
 	return contentHash, nil, fmt.Errorf("large unencrypted file (%d bytes) must use streaming path", size)
-}
-
-func (p *SimplePipeline) hashAndEncryptToTempFile(ctx context.Context, filePath string, size int64) (string, string, int64, error) {
-	f, err := openFileWithRetry(ctx, filePath)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("open: %w", err)
-	}
-	defer f.Close()
-
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return "", "", 0, fmt.Errorf("seek: %w", err)
-	}
-
-	h := sha256.New()
-	buf := make([]byte, p.enc.chunkSize)
-
-	gcm, gcmErr := p.getGCM()
-	if gcmErr != nil {
-		return "", "", 0, fmt.Errorf("gcm: %w", gcmErr)
-	}
-
-	tmpPath := filepath.Join(os.TempDir(), "gbf-tmp-"+uuid.New().String()+".tmp")
-	tmpF, err := os.Create(tmpPath)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("create tmp: %w", err)
-	}
-
-	if gcm == nil {
-		for {
-			if ctx.Err() != nil {
-				tmpF.Close()
-				os.Remove(tmpPath)
-				return "", "", 0, ctx.Err()
-			}
-			n, readErr := io.ReadFull(f, buf)
-			if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
-				tmpF.Close()
-				os.Remove(tmpPath)
-				return "", "", 0, fmt.Errorf("read: %w", readErr)
-			}
-			if n == 0 {
-				break
-			}
-			h.Write(buf[:n])
-			if _, err := tmpF.Write(buf[:n]); err != nil {
-				tmpF.Close()
-				os.Remove(tmpPath)
-				return "", "", 0, fmt.Errorf("write: %w", err)
-			}
-		}
-	} else {
-		if _, err := tmpF.Write([]byte(MagicGB1)); err != nil {
-			tmpF.Close()
-			os.Remove(tmpPath)
-			return "", "", 0, fmt.Errorf("write magic: %w", err)
-		}
-		chunkCount := uint32((size + int64(p.enc.chunkSize) - 1) / int64(p.enc.chunkSize))
-		countBuf := make([]byte, ChunkCountSize)
-		binary.BigEndian.PutUint32(countBuf, chunkCount)
-		if _, err := tmpF.Write(countBuf); err != nil {
-			tmpF.Close()
-			os.Remove(tmpPath)
-			return "", "", 0, fmt.Errorf("write count: %w", err)
-		}
-
-		ivBuf := make([]byte, IVSize)
-		for i := uint32(0); i < chunkCount; i++ {
-			if ctx.Err() != nil {
-				tmpF.Close()
-				os.Remove(tmpPath)
-				return "", "", 0, ctx.Err()
-			}
-			n, readErr := io.ReadFull(f, buf)
-			if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
-				tmpF.Close()
-				os.Remove(tmpPath)
-				return "", "", 0, fmt.Errorf("read chunk %d: %w", i, readErr)
-			}
-			if n == 0 {
-				break
-			}
-			chunk := buf[:n]
-			h.Write(chunk)
-
-			if _, err := rand.Read(ivBuf); err != nil {
-				tmpF.Close()
-				os.Remove(tmpPath)
-				return "", "", 0, fmt.Errorf("iv chunk %d: %w", i, err)
-			}
-			encrypted := gcm.Seal(nil, ivBuf, chunk, nil)
-			if _, err := tmpF.Write(ivBuf); err != nil {
-				tmpF.Close()
-				os.Remove(tmpPath)
-				return "", "", 0, fmt.Errorf("write iv %d: %w", i, err)
-			}
-			if _, err := tmpF.Write(encrypted); err != nil {
-				tmpF.Close()
-				os.Remove(tmpPath)
-				return "", "", 0, fmt.Errorf("write chunk %d: %w", i, err)
-			}
-		}
-	}
-
-	if err := tmpF.Sync(); err != nil {
-		tmpF.Close()
-		os.Remove(tmpPath)
-		return "", "", 0, fmt.Errorf("sync: %w", err)
-	}
-
-	fi, fiErr := tmpF.Stat()
-	var encSize int64
-	if fiErr == nil {
-		encSize = fi.Size()
-	}
-	tmpF.Close()
-
-	contentHash := hex.EncodeToString(h.Sum(nil))
-	return contentHash, tmpPath, encSize, nil
 }
 
 func (p *SimplePipeline) isExcluded(relPath string) bool {
@@ -1050,6 +926,16 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 		}
 
 		chunkData := buf[:n]
+		// Verify the chunk content still matches the hash computed earlier
+		// (during hashFileWithCDC/hashFileWithChunks). If the file was
+		// modified in place between the hash pass and this read, storing
+		// the new content under the old hash would corrupt the content-
+		// addressed blob store. Treat as a fatal error so the caller can
+		// re-process the file.
+		actualHash := fmt.Sprintf("%x", sha256.Sum256(chunkData))
+		if actualHash != c.Hash {
+			return uploaded, fmt.Errorf("chunk %d content changed since hash (expected %s, got %s): file modified during backup", chunkIdx, c.Hash[:12], actualHash[:12])
+		}
 		toStore := chunkData
 		if tryCompress && len(chunkData) >= 65536 {
 			if compressed, cerr := p.compressor.Compress(chunkData); cerr == nil && len(compressed) < len(chunkData) {

@@ -22,6 +22,13 @@ import (
 
 var defaultStreamDecompressor = compress.NewZstdCompressor(1)
 
+// defaultStreamCompressor is the package-level shared compressor for the
+// streaming upload path. Reusing a single compressor avoids creating a fresh
+// encoder/decoder pool (one goroutine per CPU, capped at 8) on every call to
+// UploadBlobFromPath — which would leak goroutines and grow memory pressure
+// during large backups of many small files.
+var defaultStreamCompressor = compress.NewZstdCompressor(1)
+
 func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encryptor, filePath string, knownHash string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -56,7 +63,7 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 		return "", fmt.Errorf("stat: %w", err)
 	}
 
-	compressor := compress.NewZstdCompressor(1)
+	compressor := defaultStreamCompressor
 
 	if info.Size() < int64(enc.chunkSize) {
 		data, err := io.ReadAll(f)
@@ -83,7 +90,7 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 
 	var streamCompressor *compress.ZstdCompressor
 	if !isLikelyIncompressible(filePath) {
-		streamCompressor = compress.NewZstdCompressor(1)
+		streamCompressor = defaultStreamCompressor
 	}
 	if err := encryptFileToWriter(enc, f, tmpF, streamCompressor); err != nil {
 		return "", fmt.Errorf("stream encrypt: %w", err)
@@ -127,6 +134,9 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 		return fmt.Errorf("stat: %w", err)
 	}
 	chunkCount := uint32((info.Size() + int64(enc.chunkSize) - 1) / int64(enc.chunkSize))
+	if chunkCount >= MaxChunkCount {
+		return fmt.Errorf("encryptFileToWriter: chunk count %d exceeds MaxChunkCount %d (file too large for chunk size %d; increase chunk size)", chunkCount, MaxChunkCount, enc.chunkSize)
+	}
 
 	tryCompress := compressor != nil
 	magic := MagicGB1
@@ -322,7 +332,7 @@ func decryptGB2StreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error 
 		return fmt.Errorf("read chunk count: %w", err)
 	}
 	chunkCount := binary.BigEndian.Uint32(countBuf)
-	if chunkCount == 0 || chunkCount >= 100000 {
+	if chunkCount == 0 || chunkCount >= MaxChunkCount {
 		return fmt.Errorf("invalid chunk count: %d", chunkCount)
 	}
 
@@ -379,12 +389,28 @@ func decryptGB2StreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error 
 	return nil
 }
 
-func decryptSmallStream(dec *Decryptor, initialData []byte, src io.Reader, dst io.Writer) error {
-	rest, err := io.ReadAll(src)
+// readBoundedSmall reads the remainder of a GB1 small blob from src into a
+// single buffer prefixed by initialData. The total is capped at MaxBlobSize:
+// a crafted blob could otherwise be arbitrarily large and exhaust memory
+// via io.ReadAll.
+func readBoundedSmall(initialData []byte, src io.Reader) ([]byte, error) {
+	lr := io.LimitReader(src, MaxBlobSize+1-int64(len(initialData)))
+	rest, err := io.ReadAll(lr)
 	if err != nil {
-		return fmt.Errorf("read: %w", err)
+		return nil, fmt.Errorf("read: %w", err)
 	}
 	all := append(initialData, rest...)
+	if len(all) > MaxBlobSize {
+		return nil, fmt.Errorf("blob exceeds MaxBlobSize %d", MaxBlobSize)
+	}
+	return all, nil
+}
+
+func decryptSmallStream(dec *Decryptor, initialData []byte, src io.Reader, dst io.Writer) error {
+	all, err := readBoundedSmall(initialData, src)
+	if err != nil {
+		return err
+	}
 	plaintext, err := dec.decryptSmall(all)
 	if err != nil {
 		return err
@@ -394,11 +420,10 @@ func decryptSmallStream(dec *Decryptor, initialData []byte, src io.Reader, dst i
 }
 
 func decryptSmallStreamFromIV(dec *Decryptor, ivData []byte, src io.Reader, dst io.Writer) error {
-	rest, err := io.ReadAll(src)
+	all, err := readBoundedSmall(ivData, src)
 	if err != nil {
-		return fmt.Errorf("read: %w", err)
+		return err
 	}
-	all := append(ivData, rest...)
 	plaintext, err := dec.decryptSmall(all)
 	if err != nil {
 		return err

@@ -35,6 +35,12 @@ const (
 	// TagSize plus a 1 KiB margin to accommodate compression expansion
 	// in pathological cases.
 	MaxStoredSize = DefaultChunkSize + TagSize + 1024
+	// MaxBlobSize bounds the total input read by DecryptStream and the
+	// decryptSmall* streaming helpers. A crafted/corrupt blob could
+	// otherwise be arbitrarily large and exhaust memory via io.ReadAll.
+	// The legit small-blob path produces at most chunkSize + IVSize +
+	// TagSize bytes; we add 1 MiB of headroom for safety.
+	MaxBlobSize = DefaultChunkSize + IVSize + TagSize + 1<<20
 )
 
 // Encryptor is the on-disk format encryptor: a stateful AEAD wrapper bound
@@ -161,7 +167,7 @@ func isChunkCount(buf []byte) bool {
 		return false
 	}
 	v := binary.BigEndian.Uint32(buf)
-	return v > 0 && v < 100000
+	return v > 0 && v < MaxChunkCount
 }
 
 func (d *Decryptor) decryptSmall(data []byte) ([]byte, error) {
@@ -224,7 +230,7 @@ func (d *Decryptor) decryptLargeV2(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("gb2 data too short: %d bytes", len(data))
 	}
 	chunkCount := binary.BigEndian.Uint32(data[:ChunkCountSize])
-	if chunkCount == 0 || chunkCount >= 100000 {
+	if chunkCount == 0 || chunkCount >= MaxChunkCount {
 		return nil, fmt.Errorf("gb2 invalid chunk count: %d", chunkCount)
 	}
 	data = data[ChunkCountSize:]
@@ -284,9 +290,15 @@ func (d *Decryptor) decryptLargeV2(data []byte) ([]byte, error) {
 }
 
 func (d *Decryptor) DecryptStream(r io.Reader) ([]byte, error) {
-	data, err := io.ReadAll(r)
+	// Cap input to prevent a malicious/corrupt blob from exhausting memory
+	// via an unbounded io.ReadAll.
+	lr := io.LimitReader(r, MaxBlobSize+1)
+	data, err := io.ReadAll(lr)
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
+	}
+	if len(data) > MaxBlobSize {
+		return nil, fmt.Errorf("blob exceeds MaxBlobSize %d", MaxBlobSize)
 	}
 	return d.Decrypt(data)
 }

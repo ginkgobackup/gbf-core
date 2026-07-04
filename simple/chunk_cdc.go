@@ -89,9 +89,17 @@ func (p *SimplePipeline) hashFileWithCDC(ctx context.Context, filePath string, s
 	}
 	defer f.Close()
 
-	cdcPolynomialMu.RLock()
-	pol := cdcPolynomial
-	cdcPolynomialMu.RUnlock()
+	// Prefer the per-instance polynomial (set in NewSimplePipeline) so that
+	// concurrent pipelines targeting different repos don't clobber each
+	// other. Fall back to the global if the instance wasn't initialized
+	// (e.g. tests constructing SimplePipeline directly without going
+	// through NewSimplePipeline).
+	pol := p.cdcPolynomial
+	if pol == 0 {
+		cdcPolynomialMu.RLock()
+		pol = cdcPolynomial
+		cdcPolynomialMu.RUnlock()
+	}
 	c := chunker.NewWithBoundaries(f, pol, cdcMinSize, cdcMaxSize)
 	c.SetAverageBits(cdcAverageBits)
 
