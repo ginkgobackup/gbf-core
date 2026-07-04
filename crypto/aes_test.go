@@ -13,7 +13,9 @@ import (
 func TestAES_RoundTrip(t *testing.T) {
 	e := NewAESEncryptor()
 	key := make([]byte, 32)
-	rand.Read(key)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
 
 	plaintext := []byte("hello AES-GCM encryption test")
 	ciphertext, err := e.Encrypt(plaintext, key)
@@ -37,8 +39,12 @@ func TestAES_WrongKey(t *testing.T) {
 	e := NewAESEncryptor()
 	key1 := make([]byte, 32)
 	key2 := make([]byte, 32)
-	rand.Read(key1)
-	rand.Read(key2)
+	if _, err := rand.Read(key1); err != nil {
+		t.Fatalf("rand.Read key1: %v", err)
+	}
+	if _, err := rand.Read(key2); err != nil {
+		t.Fatalf("rand.Read key2: %v", err)
+	}
 
 	plaintext := []byte("secret data")
 	ciphertext, _ := e.Encrypt(plaintext, key1)
@@ -52,7 +58,9 @@ func TestAES_WrongKey(t *testing.T) {
 func TestDeriveKey(t *testing.T) {
 	e := NewAESEncryptor()
 	masterKey := make([]byte, 32)
-	rand.Read(masterKey)
+	if _, err := rand.Read(masterKey); err != nil {
+		t.Fatalf("rand.Read masterKey: %v", err)
+	}
 
 	key1, err := e.DeriveKey(masterKey, "config-v1")
 	if err != nil {
