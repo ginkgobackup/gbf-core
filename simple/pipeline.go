@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -82,10 +81,11 @@ type SimplePipeline struct {
 	negExcludes []string
 	sizeFilters []fsutil.SizeFilter
 	// cdcPolynomial is the per-instance CDC polynomial, loaded from the repo
-	// config in NewSimplePipeline. Storing it on the struct (rather than
-	// relying solely on the package-level global) lets multiple pipelines
-	// targeting different repos coexist in the same process without
-	// clobbering each other's polynomial.
+	// config in NewSimplePipeline (and re-loaded in Run if the constructor
+	// could not read it). Storing it on the struct — returned directly by
+	// LoadCDCPolynomial without a detour through the package-level global —
+	// lets multiple pipelines targeting different repos coexist in the same
+	// process without racing through the global's write/read window.
 	cdcPolynomial chunker.Pol
 }
 
@@ -98,15 +98,14 @@ func NewSimplePipeline(cfg PipelineConfig, store SimpleBlobStore) *SimplePipelin
 		dec:        NewDecryptor(cfg.Key, chunkSize),
 		compressor: compress.NewZstdCompressor(1),
 	}
-	// Bind the CDC polynomial to this pipeline instance rather than relying
-	// solely on the package global. LoadCDCPolynomialFromConfig also sets
-	// the global for backward compat, but reading p.cdcPolynomial in
-	// hashFileWithCDC means concurrent pipelines with different repos no
-	// longer clobber each other.
-	if err := LoadCDCPolynomialFromConfig(cfg.RepoRoot); err == nil {
-		cdcPolynomialMu.RLock()
-		p.cdcPolynomial = cdcPolynomial
-		cdcPolynomialMu.RUnlock()
+	// Bind the CDC polynomial to this pipeline instance. LoadCDCPolynomial
+	// returns the repo's polynomial directly without touching the package
+	// global, so concurrent pipelines with different repos never read each
+	// other's polynomial. Repos without a readable config (e.g. unit tests
+	// with an empty RepoRoot) leave cdcPolynomial zero; hashFileWithCDC
+	// then falls back to the global for backward compatibility.
+	if pol, err := LoadCDCPolynomial(cfg.RepoRoot); err == nil {
+		p.cdcPolynomial = pol
 	}
 	return p
 }
@@ -152,9 +151,15 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	// Load the per-repo CDC polynomial so chunk boundaries match what was
 	// persisted at init time. Without this, incremental backups would compute
 	// different chunk hashes against a different polynomial and re-upload
-	// everything.
-	if err := LoadCDCPolynomialFromConfig(p.cfg.RepoRoot); err != nil {
+	// everything. The polynomial is bound to this pipeline instance (set
+	// before any worker goroutine starts) — never via the package global,
+	// which races when pipelines for different repos run concurrently.
+	pol, err := LoadCDCPolynomial(p.cfg.RepoRoot)
+	if err != nil {
 		return nil, fmt.Errorf("load cdc polynomial: %w", err)
+	}
+	if p.cdcPolynomial == 0 {
+		p.cdcPolynomial = pol
 	}
 
 	slog.Info("GBF pipeline starting", "source_id", p.cfg.SourceID, "source", p.cfg.SourceName, "repo", p.cfg.RepoRoot, "source_path", p.cfg.SourcePath, "scan_path", p.cfg.ScanPath, "session_id", p.cfg.SessionID)
@@ -770,9 +775,9 @@ func (p *SimplePipeline) hashAndEncryptFile(ctx context.Context, path string, si
 		if err != nil {
 			return "", nil, fmt.Errorf("gcm: %w", err)
 		}
-		iv := make([]byte, IVSize)
-		if _, err := rand.Read(iv); err != nil {
-			return "", nil, fmt.Errorf("iv: %w", err)
+		iv, err := newSmallBlobIV()
+		if err != nil {
+			return "", nil, err
 		}
 		ciphertext := gcm.Seal(nil, iv, encryptData, nil)
 		result := make([]byte, 0, MagicSize+IVSize+len(ciphertext))
@@ -948,8 +953,8 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 		if gcm == nil {
 			blobData = toStore
 		} else {
-			iv := make([]byte, IVSize)
-			if _, err := rand.Read(iv); err != nil {
+			iv, err := newSmallBlobIV()
+			if err != nil {
 				return uploaded, fmt.Errorf("iv chunk %d: %w", chunkIdx, err)
 			}
 			encrypted := gcm.Seal(nil, iv, toStore, nil)

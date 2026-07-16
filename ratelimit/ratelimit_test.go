@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"sync"
 	"testing"
 	"time"
 )
@@ -69,6 +70,73 @@ func TestLimiterStopIsIdempotent(t *testing.T) {
 	l.Stop()
 	// Stopping twice must not panic on close(stopCh).
 	l.Stop()
+}
+
+// SetRate(0) means "no limit": a waiter blocked on an empty bucket with a
+// Background context must be released, and subsequent calls must not block.
+func TestLimiterSetRateZeroWakesWaiters(t *testing.T) {
+	l := NewLimiter(1) // 1 byte/s
+	defer l.Stop()
+	// Drain the initial bucket so the next WaitN blocks.
+	if err := l.WaitN(context.Background(), 1); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- l.WaitN(context.Background(), 100)
+	}()
+	// Give the waiter time to actually block on the empty bucket.
+	select {
+	case err := <-done:
+		t.Fatalf("WaitN returned before SetRate(0): %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	l.SetRate(0)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitN after SetRate(0): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitN still blocked after SetRate(0)")
+	}
+	// New calls at zero rate must not block either.
+	if err := l.WaitN(context.Background(), 1<<20); err != nil {
+		t.Fatalf("WaitN with zero rate: %v", err)
+	}
+}
+
+// Exercises the WaitN/SetRate race surface: waiters read the rate while
+// other goroutines flap it. Run with -race to catch regressions of the
+// unsynchronized bytesPerSecond access.
+func TestLimiterConcurrentSetRateAndWait(t *testing.T) {
+	l := NewLimiter(1024)
+	defer l.Stop()
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				l.SetRate(int64(1024 * (i + 1)))
+				l.SetRate(0)
+			}
+		}(i)
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			for j := 0; j < 50; j++ {
+				if err := l.WaitN(ctx, 10); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestLimiterStopOnZeroRate(t *testing.T) {

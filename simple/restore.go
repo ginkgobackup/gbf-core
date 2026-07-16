@@ -138,6 +138,20 @@ func (r *SimpleRestore) Run(ctx context.Context) (*RestoreResult, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		// Files that were locked or failed during backup are written to
+		// the manifest with Status "locked"/"error" and an empty
+		// ContentHash — no blob was ever uploaded for them (see
+		// pipeline.go). Skip these entries instead of letting store.Get("")
+		// abort the whole restore.
+		if file.Status == "locked" || file.Status == "error" || file.ContentHash == "" {
+			result.SkippedFiles++
+			slog.Warn("GBF restore: skipping file that was not backed up",
+				"file", file.Name, "status", file.Status, "size", file.Size)
+			if r.progress != nil {
+				r.progress.FileProcessed(file.Name, file.Size, false, false)
+			}
+			continue
+		}
 		targetPath, err := safeRestorePath(r.cfg.TargetDir, file.Name)
 		if err != nil {
 			return nil, fmt.Errorf("restore %s: %w", file.Name, err)

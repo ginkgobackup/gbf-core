@@ -58,6 +58,8 @@ Four magic byte prefixes identify the blob kinds produced by this engine. They a
 
 The decryptor inspects the magic byte and handles GB1, GB2, and GKM1 transparently. In the current pipeline, every encrypted blob written to the store is GB1: files below the chunk size are stored whole, files at or above the chunk size are split into chunks (CDC by default, fixed-size otherwise) and each chunk is uploaded as an independent GB1 blob. GB2 is supported by the decryptor and the streaming helper for future use, but the pipeline currently stores each chunk separately as GB1 rather than packaging them into a single GB2 blob.
 
+The chunk size is fixed at `DefaultChunkSize` (4 MiB). The GB1 large-blob layout carries no chunk-size metadata — chunk boundaries are implicit, so writer and reader must agree on the value a priori. The `chunkSize` field in `config.json` is therefore deprecated and ignored; it is retained only for backward compatibility of existing config files.
+
 ## Content-Defined Chunking (CDC)
 
 CDC is **enabled by default** for files larger than the chunk size. It uses a Galois-field polynomial persisted per-repo in `config.json` (`cdcPolynomial`) so chunk boundaries are stable for a given repository but not shared across all installations. This means two installations backing up the same file produce different chunk boundaries, which is the intended property — it prevents cross-repo deduplication attacks while preserving intra-repo dedup.

@@ -21,6 +21,14 @@ type RepoConfig struct {
 	Encrypted       bool   `json:"encrypted"`
 	HashAlgorithm   string `json:"hashAlgorithm"`
 	CipherAlgorithm string `json:"cipherAlgorithm"`
+	// ChunkSize is deprecated and never read: the engine always operates at
+	// DefaultChunkSize (4 MiB). The GB1 large-blob wire format stores no
+	// chunk-size metadata — chunk boundaries are implicit, so encryptor and
+	// decryptor must agree on the chunk size a priori — which makes a
+	// per-repo configurable chunk size unsafe to honor for reading existing
+	// blobs. The field is kept only so config files written by older
+	// versions still parse; DefaultConfig keeps writing DefaultChunkSize.
+	// Deprecated: do not use; the effective chunk size is DefaultChunkSize.
 	ChunkSize       int    `json:"chunkSize"`
 	DisableCDC      bool   `json:"disable_cdc,omitempty"`
 	// CDCPolynomial is the content-defined chunking polynomial persisted

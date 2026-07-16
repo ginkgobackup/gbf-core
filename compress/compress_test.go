@@ -5,6 +5,7 @@ package compress
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -91,6 +92,44 @@ func TestZstdDecompressGarbageReturnsError(t *testing.T) {
 	_, err := c.Decompress([]byte("not zstd data at all"))
 	if err == nil {
 		t.Fatal("expected error decompressing non-zstd data")
+	}
+	if errors.Is(err, ErrDecompressedTooLarge) {
+		t.Fatal("garbage input must not be misreported as exceeding the size limit")
+	}
+}
+
+// A corrupted-but-validly-framed zstd payload is a decode failure, not a
+// compression bomb: it must not surface as ErrDecompressedTooLarge.
+func TestZstdDecompressCorruptedDataNotReportedAsTooLarge(t *testing.T) {
+	c := NewZstdCompressor(1)
+	data := []byte(strings.Repeat("compressible payload for corruption test. ", 500))
+	compressed, err := c.Compress(data)
+	if err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	corrupted := bytes.Clone(compressed)
+	corrupted[len(corrupted)/2] ^= 0xFF
+	corrupted[len(corrupted)-2] ^= 0xFF
+	_, err = c.Decompress(corrupted)
+	if err == nil {
+		t.Fatal("expected error decompressing corrupted data")
+	}
+	if errors.Is(err, ErrDecompressedTooLarge) {
+		t.Fatalf("corrupted data must surface as a decode error, got size-limit sentinel: %v", err)
+	}
+}
+
+// A payload whose decompressed size genuinely exceeds the configured cap
+// must still map to the too-large sentinel.
+func TestZstdDecompressOverLimitReturnsSentinel(t *testing.T) {
+	c := NewZstdCompressorWithLimit(1, 1024, ErrDecompressedTooLarge)
+	compressed, err := c.Compress(make([]byte, 64*1024))
+	if err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	_, err = c.Decompress(compressed)
+	if !errors.Is(err, ErrDecompressedTooLarge) {
+		t.Fatalf("expected ErrDecompressedTooLarge, got %v", err)
 	}
 }
 

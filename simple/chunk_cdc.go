@@ -37,27 +37,45 @@ func SetCDCPolynomial(pol uint64) {
 	cdcPolynomialMu.Unlock()
 }
 
-// LoadCDCPolynomialFromConfig reads the persisted CDC polynomial from the
-// repo config and registers it globally via SetCDCPolynomial. Call this
-// before running the backup pipeline against a repo so chunk boundaries
-// match the polynomial the repo was initialized with. Repos without a
-// persisted polynomial (legacy v0.1) fall back to a freshly derived one.
-func LoadCDCPolynomialFromConfig(repoRoot string) error {
+// LoadCDCPolynomial reads the persisted CDC polynomial from the repo config
+// and returns it. Repos without a persisted polynomial (legacy v0.1) get a
+// freshly derived one, which is persisted back to the config so subsequent
+// runs stay consistent. The polynomial is returned to the caller rather
+// than registered globally: pipelines must carry their own copy so two
+// concurrent pipelines targeting different repos can never read each
+// other's polynomial out of the package global.
+func LoadCDCPolynomial(repoRoot string) (chunker.Pol, error) {
 	cfg, err := LoadConfig(repoRoot)
 	if err != nil {
-		return fmt.Errorf("load config for cdc polynomial: %w", err)
+		return 0, fmt.Errorf("load config for cdc polynomial: %w", err)
 	}
 	if cfg.CDCPolynomial == 0 {
 		pol, err := GenerateCDCPolynomial()
 		if err != nil {
-			return fmt.Errorf("derive fallback cdc polynomial: %w", err)
+			return 0, fmt.Errorf("derive fallback cdc polynomial: %w", err)
 		}
 		cfg.CDCPolynomial = pol
 		if err := SaveConfig(repoRoot, cfg); err != nil {
-			return fmt.Errorf("persist fallback cdc polynomial: %w", err)
+			return 0, fmt.Errorf("persist fallback cdc polynomial: %w", err)
 		}
 	}
-	SetCDCPolynomial(cfg.CDCPolynomial)
+	return chunker.Pol(cfg.CDCPolynomial), nil
+}
+
+// LoadCDCPolynomialFromConfig reads the persisted CDC polynomial from the
+// repo config and registers it globally via SetCDCPolynomial. Call this
+// before running the backup pipeline against a repo so chunk boundaries
+// match the polynomial the repo was initialized with.
+//
+// Kept for backward compatibility; new code should prefer LoadCDCPolynomial
+// and hold the result per-instance — the global write/read pair races when
+// two pipelines targeting different repos run concurrently.
+func LoadCDCPolynomialFromConfig(repoRoot string) error {
+	pol, err := LoadCDCPolynomial(repoRoot)
+	if err != nil {
+		return err
+	}
+	SetCDCPolynomial(uint64(pol))
 	return nil
 }
 

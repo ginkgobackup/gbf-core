@@ -4,6 +4,7 @@
 package compress
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 
@@ -19,16 +20,32 @@ const (
 	CompressDeflate CompressorType = "deflate"
 )
 
-// MaxDecompressedSize caps the output of every Decompress call. Backed-up
-// chunks are bounded by DefaultChunkSize, so legitimate payloads decompress
-// to at most ~DefaultChunkSize. A crafted blob (compression bomb) could
-// otherwise expand to gigabytes and OOM the process. The cap is generous
-// (4 MiB) to allow for manifest payloads and future chunk-size changes.
-const MaxDecompressedSize = 4 * 1024 * 1024
+// MaxDecompressedSize caps the output of every chunk Decompress call.
+// CDC chunks are bounded by cdcMaxSize (16 MiB), but small files (< 50 MiB
+// streaming threshold) may be stored as a single blob without chunking, so
+// we need a larger cap. 128 MiB safely handles legitimate files while still
+// blocking extreme compression bombs. Manifests use MaxManifestDecompressedSize.
+const MaxDecompressedSize = 128 * 1024 * 1024
 
-// ErrDecompressedTooLarge is returned when a Decompress call would produce
-// more than MaxDecompressedSize bytes.
+// MaxManifestDecompressedSize caps the output of manifest (and manifest-like
+// metadata such as alive indexes and source registries) decompression.
+// Manifests are written by the application itself — checksum-verified and
+// optionally encrypted — so the compression-bomb threat that justifies the
+// tight chunk cap does not apply here. A source with millions of files
+// produces a manifest well beyond 4 MiB (e.g. ~200k files ≈ 60 MiB), so we
+// allow up to 256 MiB: comfortably above any realistic single-source
+// manifest while still bounding peak memory.
+const MaxManifestDecompressedSize = 256 * 1024 * 1024
+
+// ErrDecompressedTooLarge is returned when a chunk Decompress call would
+// produce more than MaxDecompressedSize bytes.
 var ErrDecompressedTooLarge = fmt.Errorf("decompressed output exceeds %d bytes", MaxDecompressedSize)
+
+// ErrManifestDecompressedTooLarge is returned when a manifest decompress
+// call would produce more than MaxManifestDecompressedSize bytes. The
+// distinct sentinel and message make manifest-size problems easy to
+// distinguish from chunk compression-bomb defense.
+var ErrManifestDecompressedTooLarge = fmt.Errorf("manifest exceeds decompression limit %d bytes", MaxManifestDecompressedSize)
 
 type Compressor interface {
 	Type() CompressorType
@@ -38,14 +55,33 @@ type Compressor interface {
 }
 
 type ZstdCompressor struct {
-	level int
-	encs  chan *zstd.Encoder
-	decs  chan *zstd.Decoder
+	level       int
+	maxOutput   int64
+	tooLargeErr error
+	encs        chan *zstd.Encoder
+	decs        chan *zstd.Decoder
 }
 
 func NewZstdCompressor(level int) *ZstdCompressor {
+	return NewZstdCompressorWithLimit(level, MaxDecompressedSize, ErrDecompressedTooLarge)
+}
+
+// NewZstdCompressorWithLimit creates a zstd compressor whose Decompress
+// allows up to maxOutput bytes of decompressed data and returns tooLargeErr
+// when that limit is exceeded. Use this for application-written payloads
+// (manifests, alive indexes, source registries) that legitimately exceed
+// the chunk cap — pass MaxManifestDecompressedSize and
+// ErrManifestDecompressedTooLarge. For chunk/blob decompression, prefer
+// NewZstdCompressor which uses the compression-bomb-defense default.
+func NewZstdCompressorWithLimit(level int, maxOutput int64, tooLargeErr error) *ZstdCompressor {
 	if level < 1 || level > 22 {
 		level = 1
+	}
+	if maxOutput <= 0 {
+		maxOutput = MaxDecompressedSize
+	}
+	if tooLargeErr == nil {
+		tooLargeErr = ErrDecompressedTooLarge
 	}
 	n := runtime.NumCPU()
 	if n < 2 {
@@ -63,14 +99,16 @@ func NewZstdCompressor(level int) *ZstdCompressor {
 		}
 		// WithDecoderMaxMemory caps the memory a crafted zstd stream is
 		// allowed to allocate during decoding, blocking compression bombs.
-		dec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(uint64(MaxDecompressedSize)))
+		// For manifest compressors the cap is raised to maxOutput so large
+		// sources (hundreds of thousands of files) can still be loaded.
+		dec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(uint64(maxOutput)))
 		if err != nil {
 			panic(fmt.Sprintf("compress: create zstd decoder: %v", err))
 		}
 		encs <- enc
 		decs <- dec
 	}
-	return &ZstdCompressor{level: level, encs: encs, decs: decs}
+	return &ZstdCompressor{level: level, maxOutput: maxOutput, tooLargeErr: tooLargeErr, encs: encs, decs: decs}
 }
 
 func (c *ZstdCompressor) Type() CompressorType { return CompressZstd }
@@ -91,10 +129,15 @@ func (c *ZstdCompressor) Decompress(data []byte) ([]byte, error) {
 	defer func() { c.decs <- dec }()
 	decompressed, err := dec.DecodeAll(data, nil)
 	if err != nil {
-		// zstd returns a generic "decompression failed" when the
-		// WithDecoderMaxOutputSize cap is hit; normalize to our sentinel.
-		if decompressed == nil && len(data) > 0 {
-			return nil, ErrDecompressedTooLarge
+		// Only resource-limit failures map to the too-large sentinel:
+		// ErrDecoderSizeExceeded is the WithDecoderMaxMemory cap, and
+		// ErrWindowSizeExceeded is the derived max-window cap (the window
+		// memory a stream would force us to allocate). Everything else is
+		// an ordinary decode failure (corruption, truncated input, bad
+		// magic) and must surface as-is — previously any failure with
+		// non-empty input was misreported as a compression bomb.
+		if errors.Is(err, zstd.ErrDecoderSizeExceeded) || errors.Is(err, zstd.ErrWindowSizeExceeded) {
+			return nil, c.tooLargeErr
 		}
 		return nil, err
 	}

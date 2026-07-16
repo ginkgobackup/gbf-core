@@ -341,6 +341,58 @@ func TestFileProcessed_ETAAndThroughput(t *testing.T) {
 	}
 }
 
+// Regression test for the held-lock callback deadlock: previously emit() ran
+// the callback while holding t.mu, so a callback calling GetProgress (or any
+// other tracker method) self-deadlocked. The callback now runs after mu is
+// released; this test would hang forever on the old implementation.
+func TestCallback_CallingGetProgressDoesNotDeadlock(t *testing.T) {
+	done := make(chan struct{})
+	var tracker *ProgressTracker
+	tracker = NewProgressTracker(1, "src", func(p Progress) {
+		// Re-entering the tracker from inside the callback must not block:
+		// mu is no longer held while the callback runs.
+		inner := tracker.GetProgress()
+		if inner.SourceID != 1 {
+			t.Errorf("inner GetProgress SourceID = %d, want 1", inner.SourceID)
+		}
+		close(done)
+	})
+
+	go tracker.SetPhase(PhaseUploading)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock: callback calling GetProgress never returned")
+	}
+}
+
+// A slow callback must not stall workers updating state or concurrent
+// GetProgress readers: both only need mu, which is released before the
+// callback runs. On the old implementation every update and read queued
+// behind the callback's full duration.
+func TestCallback_SlowCallbackDoesNotBlockUpdates(t *testing.T) {
+	tracker := NewProgressTracker(1, "src", func(p Progress) {
+		time.Sleep(200 * time.Millisecond)
+	})
+
+	start := time.Now()
+	go tracker.SetPhase(PhaseUploading)
+
+	// Readers and writers must proceed while the first callback is sleeping.
+	deadline := time.Now().Add(2 * time.Second)
+	for i := 0; i < 5; i++ {
+		tracker.SetTotal(i, int64(i))
+		_ = tracker.GetProgress()
+		if time.Now().After(deadline) {
+			t.Fatal("updates blocked behind slow callback")
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("updates took %v, slow callback appears to hold the state lock", elapsed)
+	}
+}
+
 func TestFileProcessed_ZeroElapsedNoDivisionByZero(t *testing.T) {
 	tracker := NewProgressTracker(1, "src", func(p Progress) {})
 	tracker.SetTotal(100, 10000)

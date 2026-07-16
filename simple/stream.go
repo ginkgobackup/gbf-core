@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -76,7 +77,22 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 				data = compressed
 			}
 		}
-		return UploadBlob(ctx, store, enc, data)
+		// Content addressing convention: the blob name is always the hash
+		// of the raw, uncompressed content (contentHash computed above).
+		// Compression is a storage-layer detail only — DownloadBlob
+		// decompresses after decrypt and verifies against the original
+		// content hash. UploadBlob cannot be used here: it derives the
+		// blob name from the (possibly compressed) bytes it is given,
+		// which would break both the download-side hash check and dedup
+		// against the pipeline path (see hashAndEncryptFile).
+		ciphertext, err := enc.Encrypt(data)
+		if err != nil {
+			return "", fmt.Errorf("encrypt: %w", err)
+		}
+		if err := store.Put(ctx, contentHash, ciphertext); err != nil {
+			return "", fmt.Errorf("put: %w", err)
+		}
+		return contentHash, nil
 	}
 
 	tmpPath := filepath.Join(os.TempDir(), "gbf-tmp-"+uuid.New().String()+".tmp")
@@ -319,13 +335,33 @@ func decryptStreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error {
 			return fmt.Errorf("read iv chunk %d: %w", i, err)
 		}
 		encryptedBuf := make([]byte, dec.chunkSize+TagSize)
-		n, err := io.ReadFull(src, encryptedBuf)
-		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-			return fmt.Errorf("read chunk %d: %w", i, err)
+		n, readErr := io.ReadFull(src, encryptedBuf)
+		if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
+			return fmt.Errorf("read chunk %d: %w", i, readErr)
 		}
 		encrypted := encryptedBuf[:n]
 		decrypted, err := gcm.Open(nil, iv, encrypted, nil)
 		if err != nil {
+			// A legacy small blob whose random IV's first 4 bytes look like
+			// a chunk count lands here: chunk 0 fails AEAD because the data
+			// was never chunked. If the stream also ended within the first
+			// chunk read (a genuine multi-chunk blob fills the buffer), the
+			// whole blob fits in what we've read — reinterpret it as a small
+			// blob. AEAD only authenticates for the correct interpretation,
+			// so trying both is sound, and nothing has hit dst yet. New
+			// small blobs avoid this path entirely (see newSmallBlobIV).
+			if i == 0 && (errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF)) {
+				smallData := make([]byte, 0, ChunkCountSize+IVSize+len(encrypted))
+				smallData = append(smallData, countBuf...)
+				smallData = append(smallData, iv...)
+				smallData = append(smallData, encrypted...)
+				if plaintext, serr := dec.decryptSmall(smallData); serr == nil {
+					if _, werr := dst.Write(plaintext); werr != nil {
+						return fmt.Errorf("write small blob: %w", werr)
+					}
+					return nil
+				}
+			}
 			return fmt.Errorf("decrypt chunk %d: %w", i, err)
 		}
 		if _, err := dst.Write(decrypted); err != nil {

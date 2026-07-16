@@ -5,6 +5,7 @@ package simple
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1040,5 +1041,40 @@ func TestManifestExistsByTimestampNoDir(t *testing.T) {
 	dir := t.TempDir()
 	if ManifestExistsByTimestamp(dir, "nonexistent", 12345) {
 		t.Fatal("should return false for nonexistent dir")
+	}
+}
+
+func TestValidateCloudID(t *testing.T) {
+	valid := []string{
+		"dev1/42",
+		"42",
+		"device-fingerprint/123",
+		"a/b/c",
+	}
+	for _, id := range valid {
+		if err := validateCloudID(id); err != nil {
+			t.Errorf("validateCloudID(%q) should pass, got %v", id, err)
+		}
+	}
+
+	invalid := []string{
+		"",                       // empty
+		"/etc/passwd",            // Unix absolute
+		`\windows\system32`,      // Windows absolute (UNC-style prefix)
+		`C:\evil`,                // Windows drive
+		"C:/evil",                // Windows drive with slash
+		"../../evil",             // Unix-style escape
+		`..\..\evil`,             // Windows-style escape (backslash separators)
+		`dev1\..\..\evil`,        // mixed separators
+		"..",                     // bare parent
+		"a/../../../b",           // embedded escape
+		`a\..\b`,                 // backslash-separated parent segment
+	}
+	for _, id := range invalid {
+		if err := validateCloudID(id); err == nil {
+			t.Errorf("validateCloudID(%q) should fail", id)
+		} else if !errors.Is(err, ErrInvalidCloudID) {
+			t.Errorf("validateCloudID(%q) error should wrap ErrInvalidCloudID, got %v", id, err)
+		}
 	}
 }

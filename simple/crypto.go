@@ -24,10 +24,12 @@ const (
 	// MaxChunkCount is the upper bound on chunk counts accepted by the
 	// decryptor (see isChunkCount). It must match the threshold used to
 	// disambiguate GB1 small vs large blobs. encryptLarge refuses to write
-	// blobs with chunkCount >= MaxChunkCount so the decryptor's heuristic
-	// never mis-classifies a legitimately produced blob. With the default
-	// 4 MiB chunk size, 100000 chunks ≈ 390 GiB; files larger than that
-	// must use a larger chunk size.
+	// blobs with chunkCount >= MaxChunkCount so a legit large blob is never
+	// misread as small; the reverse ambiguity (a small blob whose random IV
+	// looks like a chunk count) is avoided for new blobs by newSmallBlobIV
+	// and tolerated for legacy blobs by the AEAD fallback in Decrypt. With
+	// the default 4 MiB chunk size, 100000 chunks ≈ 390 GiB; files larger
+	// than that must use a larger chunk size.
 	MaxChunkCount = 100000
 	// MaxStoredSize is the upper bound on the per-chunk storedSize header
 	// in GB2 blobs. It bounds the size of any single make() in the
@@ -70,6 +72,25 @@ func (e *Encryptor) Encrypt(plaintext []byte) ([]byte, error) {
 	return e.encryptLarge(plaintext)
 }
 
+// newSmallBlobIV returns a random GCM IV whose first 4 bytes never fall in
+// the chunk-count range (1..MaxChunkCount-1) used to distinguish GB1 large
+// blobs from small ones. Rejection sampling keeps newly written small blobs
+// unambiguous on the wire; the collision probability is ~1/43000 per IV, so
+// the expected number of retries is negligible. Small blobs written before
+// this scheme may still be ambiguous — the decryptor handles those by trying
+// the other interpretation when AEAD authentication fails (see Decrypt).
+func newSmallBlobIV() ([]byte, error) {
+	iv := make([]byte, IVSize)
+	for {
+		if _, err := rand.Read(iv); err != nil {
+			return nil, fmt.Errorf("iv: %w", err)
+		}
+		if !isChunkCount(iv[:ChunkCountSize]) {
+			return iv, nil
+		}
+	}
+}
+
 func (e *Encryptor) encryptSmall(plaintext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(e.key)
 	if err != nil {
@@ -79,9 +100,9 @@ func (e *Encryptor) encryptSmall(plaintext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gcm: %w", err)
 	}
-	iv := make([]byte, IVSize)
-	if _, err := rand.Read(iv); err != nil {
-		return nil, fmt.Errorf("iv: %w", err)
+	iv, err := newSmallBlobIV()
+	if err != nil {
+		return nil, err
 	}
 	ciphertext := gcm.Seal(nil, iv, plaintext, nil)
 	result := make([]byte, 0, MagicSize+IVSize+len(ciphertext))
@@ -153,10 +174,34 @@ func (d *Decryptor) Decrypt(ciphertext []byte) ([]byte, error) {
 	case MagicGB2:
 		return d.decryptLargeV2(data)
 	case MagicGB1:
+		// The small-vs-large split is a heuristic: large blobs start with a
+		// chunk count in 1..MaxChunkCount-1, small blobs with a random IV.
+		// Legacy small blobs (~1/43000 of them) have an IV whose first 4
+		// bytes look like a chunk count. AEAD authentication only succeeds
+		// for the correct interpretation, so when the primary parse fails we
+		// fall back to the other one — trying both is cryptographically
+		// sound. Newly written small blobs avoid the ambiguity entirely via
+		// IV rejection sampling (see newSmallBlobIV).
 		if len(data) > ChunkCountSize && isChunkCount(data[:ChunkCountSize]) {
-			return d.decryptLarge(data)
+			plaintext, err := d.decryptLarge(data)
+			if err == nil {
+				return plaintext, nil
+			}
+			if plaintext, serr := d.decryptSmall(data); serr == nil {
+				return plaintext, nil
+			}
+			return nil, err
 		}
-		return d.decryptSmall(data)
+		plaintext, err := d.decryptSmall(data)
+		if err == nil {
+			return plaintext, nil
+		}
+		if len(data) > ChunkCountSize {
+			if plaintext, lerr := d.decryptLarge(data); lerr == nil {
+				return plaintext, nil
+			}
+		}
+		return nil, err
 	default:
 		return nil, fmt.Errorf("invalid magic: %q", magic)
 	}
@@ -193,6 +238,13 @@ func (d *Decryptor) decryptSmall(data []byte) ([]byte, error) {
 
 func (d *Decryptor) decryptLarge(data []byte) ([]byte, error) {
 	chunkCount := binary.BigEndian.Uint32(data[:ChunkCountSize])
+	// A legitimately written GB1 large blob always holds at least one chunk
+	// (encryptLarge only runs on plaintext >= chunkSize). Rejecting 0 also
+	// keeps the small-blob fallback in Decrypt from "successfully" parsing
+	// zero-padded garbage as an empty large blob.
+	if chunkCount == 0 || chunkCount >= MaxChunkCount {
+		return nil, fmt.Errorf("gb1 invalid chunk count: %d", chunkCount)
+	}
 	data = data[ChunkCountSize:]
 	block, err := aes.NewCipher(d.key)
 	if err != nil {

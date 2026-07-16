@@ -655,3 +655,162 @@ func TestLocalBlobStore_WarmExistsCache_ConcurrentSafety(t *testing.T) {
 	}
 	<-done
 }
+
+// TestUploadBlobFromPath_CompressibleSmallRoundtrip covers the 64KB..chunkSize
+// interval that was previously broken: UploadBlobFromPath compressed these
+// files and then stored the blob under the hash of the *compressed* bytes,
+// so DownloadBlob (which verifies the hash of the *original* content after
+// decompress) always failed with a hash mismatch. The blob name must be the
+// hash of the raw content; compression is a storage-layer detail only.
+func TestUploadBlobFromPath_CompressibleSmallRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	store := NewLocalBlobStore(dir)
+	key := make([]byte, 32)
+	enc := NewEncryptor(key, DefaultChunkSize)
+	dec := NewDecryptor(key, DefaultChunkSize)
+	ctx := context.Background()
+
+	// ~100KB of highly compressible content — above the 64KB compression
+	// threshold but below chunkSize, i.e. the small-file path in
+	// UploadBlobFromPath. .txt is not on the incompressible list.
+	data := []byte(strings.Repeat("the quick brown fox jumps over the lazy dog. ", 2280))
+	if len(data) < 65536 || len(data) >= DefaultChunkSize {
+		t.Fatalf("test data size %d outside target interval", len(data))
+	}
+	midFile := filepath.Join(dir, "mid.txt")
+	if err := os.WriteFile(midFile, data, 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	hash, err := UploadBlobFromPath(ctx, store, enc, midFile, "")
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	// Content addressing: the returned blob name must be the SHA-256 of the
+	// original (uncompressed) content — matching what the pipeline path
+	// produces for the same file.
+	if want := SHA256Bytes(data); hash != want {
+		t.Fatalf("hash mismatch: got %s, want original-content hash %s", hash, want)
+	}
+
+	// The blob must actually be stored compressed (regression interval:
+	// compression engaged but addressing stayed on raw content).
+	blobPath := filepath.Join(dir, "gb", hash[:2], hash+".gb")
+	stat, err := os.Stat(blobPath)
+	if err != nil {
+		t.Fatalf("stat blob: %v", err)
+	}
+	if stat.Size() >= int64(len(data)) {
+		t.Fatalf("expected compressed blob smaller than original %d, got %d", len(data), stat.Size())
+	}
+
+	got, err := DownloadBlob(ctx, store, dec, hash)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("data mismatch: length got %d, want %d", len(got), len(data))
+	}
+
+	// Re-uploading the same file must dedup to the same blob name.
+	hash2, err := UploadBlobFromPath(ctx, store, enc, midFile, "")
+	if err != nil {
+		t.Fatalf("re-upload: %v", err)
+	}
+	if hash2 != hash {
+		t.Fatalf("dedup hash mismatch: got %q, want %q", hash2, hash)
+	}
+}
+
+// TestRestoreSkipsLockedAndFailedEntries is the regression test for restore
+// aborting on manifest entries written for files that were locked or failed
+// during backup (Status "locked"/"error", empty ContentHash). Restore must
+// skip those entries and still restore the healthy ones.
+func TestRestoreSkipsLockedAndFailedEntries(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := InitRepo(InitParams{RepoRoot: repoDir, DeviceID: "test"}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	key, _ := GenerateRandomKey()
+	ManifestDecryptHook = func(encrypted []byte) ([]byte, error) {
+		return DecryptManifest(encrypted, key)
+	}
+	store := NewLocalBlobStore(repoDir)
+	ctx := context.Background()
+	enc := NewEncryptor(key, DefaultChunkSize)
+
+	goodData := []byte("healthy file content")
+	goodHash, err := UploadBlob(ctx, store, enc, goodData)
+	if err != nil {
+		t.Fatalf("upload good blob: %v", err)
+	}
+
+	m := NewManifest(1, "", "test", "/src", "test")
+	m.AddFile(FileEntry{
+		Name:        "good.txt",
+		ContentHash: goodHash,
+		Size:        int64(len(goodData)),
+		Mtime:       "2026-05-14T10:00:00Z",
+		Mode:        0644,
+		Status:      "new",
+	})
+	// Locked small file: no blob uploaded, empty ContentHash.
+	m.AddFile(FileEntry{
+		Name:   "locked.txt",
+		Size:   128,
+		Mtime:  "2026-05-14T10:00:00Z",
+		Mode:   0644,
+		Status: "locked",
+	})
+	// Failed small file.
+	m.AddFile(FileEntry{
+		Name:   "failed.txt",
+		Size:   256,
+		Mtime:  "2026-05-14T10:00:00Z",
+		Mode:   0644,
+		Status: "error",
+	})
+	// Locked large file (>= chunkSize, no Chunks, empty hash): previously
+	// aborted the restore via the DownloadBlobToFile branch.
+	m.AddFile(FileEntry{
+		Name:   "big-locked.bin",
+		Size:   int64(DefaultChunkSize) + 10,
+		Mtime:  "2026-05-14T10:00:00Z",
+		Mode:   0644,
+		Status: "locked",
+	})
+	if err := SaveManifestWithKey(MetaDir(repoDir), m, key); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+
+	restoreDir := filepath.Join(t.TempDir(), "restore")
+	restore := NewSimpleRestore(RestoreConfig{
+		RepoRoot:  repoDir,
+		TargetDir: restoreDir,
+		SourceID:  1,
+		DeviceID:  "test",
+		Key:       key,
+	}, store)
+	result, err := restore.Run(ctx)
+	if err != nil {
+		t.Fatalf("restore run: %v", err)
+	}
+	if result.RestoredFiles != 1 {
+		t.Fatalf("restored files: got %d, want 1", result.RestoredFiles)
+	}
+	if result.SkippedFiles != 3 {
+		t.Fatalf("skipped files: got %d, want 3", result.SkippedFiles)
+	}
+	got, err := os.ReadFile(filepath.Join(restoreDir, "good.txt"))
+	if err != nil {
+		t.Fatalf("read restored good.txt: %v", err)
+	}
+	if !bytes.Equal(got, goodData) {
+		t.Fatalf("good.txt mismatch: got %q, want %q", got, goodData)
+	}
+	for _, name := range []string{"locked.txt", "failed.txt", "big-locked.bin"} {
+		if _, err := os.Stat(filepath.Join(restoreDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s should not have been restored", name)
+		}
+	}
+}

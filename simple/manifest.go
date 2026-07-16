@@ -395,7 +395,9 @@ func validateCloudID(cloudID string) error {
 		return fmt.Errorf("cloudID is absolute (Windows drive): %q: %w", cloudID, ErrInvalidCloudID)
 	}
 	// Reject any path segment equal to ".." — these would escape upward.
-	for _, seg := range strings.Split(cloudID, "/") {
+	// Split on both '/' and '\\': on Windows a backslash is also a path
+	// separator, so `..\..\evil` must be caught here just like `../../evil`.
+	for _, seg := range strings.FieldsFunc(cloudID, func(r rune) bool { return r == '/' || r == '\\' }) {
 		seg = strings.TrimSpace(seg)
 		if seg == ".." {
 			return fmt.Errorf("cloudID contains parent reference: %q: %w", cloudID, ErrInvalidCloudID)
@@ -420,7 +422,13 @@ func ResolveCloudID(deviceID string, sourceID int64) string {
 	return ManifestPathKey(deviceID, fmt.Sprintf("%d", sourceID))
 }
 
-var localManifestCompressor = compress.NewZstdCompressor(1)
+// localManifestCompressor uses the manifest decompression limit (256 MiB),
+// not the chunk compression-bomb cap (4 MiB). Manifests, alive indexes and
+// source registries are application-written, checksum-verified and (for
+// manifests) optionally encrypted, so they are trusted payloads that
+// legitimately exceed 4 MiB for large sources (e.g. ~200k files ≈ 60 MiB).
+// Chunks still use the 4 MiB default via defaultStreamDecompressor.
+var localManifestCompressor = compress.NewZstdCompressorWithLimit(1, compress.MaxManifestDecompressedSize, compress.ErrManifestDecompressedTooLarge)
 
 var ManifestDecryptHook func(encrypted []byte) ([]byte, error)
 

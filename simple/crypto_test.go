@@ -5,6 +5,8 @@ package simple
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/binary"
 	"testing"
 )
@@ -311,5 +313,103 @@ func TestDecryptStream(t *testing.T) {
 	}
 	if !bytes.Equal(decrypted, plaintext) {
 		t.Fatalf("mismatch: got %q, want %q", decrypted, plaintext)
+	}
+}
+
+// buildSmallBlobWithIV constructs a GB1 small blob with a caller-chosen IV,
+// replicating what pre-rejection-sampling encoders could emit when the
+// random IV's first 4 bytes landed in the chunk-count range (1..99999).
+func buildSmallBlobWithIV(t *testing.T, key, plaintext, iv []byte) []byte {
+	t.Helper()
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	blob := append([]byte(MagicGB1), iv...)
+	blob = append(blob, gcm.Seal(nil, iv, plaintext, nil)...)
+	return blob
+}
+
+// Regression test for the GB1 small/large heuristic ambiguity: a legacy
+// small blob whose random IV looks like a chunk count must still decrypt —
+// the decryptor falls back to the small interpretation when the large one
+// fails AEAD authentication.
+func TestDecryptGB1SmallBlobWithChunkCountIV(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	dec := NewDecryptor(key, DefaultChunkSize)
+	plaintext := []byte("legacy small blob with an IV that looks like a chunk count")
+	for _, count := range []uint32{1, 42, 99999} {
+		iv := make([]byte, IVSize)
+		binary.BigEndian.PutUint32(iv[:ChunkCountSize], count)
+		for i := ChunkCountSize; i < IVSize; i++ {
+			iv[i] = byte(i * 7)
+		}
+		if !isChunkCount(iv[:ChunkCountSize]) {
+			t.Fatalf("test setup: iv %v not in chunk-count range", iv[:4])
+		}
+		blob := buildSmallBlobWithIV(t, key, plaintext, iv)
+		decrypted, err := dec.Decrypt(blob)
+		if err != nil {
+			t.Fatalf("decrypt ambiguous small blob (iv prefix %d): %v", count, err)
+		}
+		if !bytes.Equal(decrypted, plaintext) {
+			t.Fatalf("iv prefix %d: mismatch: got %q, want %q", count, decrypted, plaintext)
+		}
+	}
+}
+
+// Same ambiguity through the streaming decrypt path (decryptStreamToFile):
+// chunk 0 fails AEAD and the stream ends within the first chunk read, so
+// the whole blob is reinterpreted as a small blob.
+func TestDecryptStreamGB1SmallBlobWithChunkCountIV(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(255 - i)
+	}
+	dec := NewDecryptor(key, DefaultChunkSize)
+	plaintext := make([]byte, 100000) // comfortably below chunkSize, non-trivial size
+	for i := range plaintext {
+		plaintext[i] = byte(i % 251)
+	}
+	iv := make([]byte, IVSize)
+	binary.BigEndian.PutUint32(iv[:ChunkCountSize], 1234)
+	for i := ChunkCountSize; i < IVSize; i++ {
+		iv[i] = byte(i * 3)
+	}
+	blob := buildSmallBlobWithIV(t, key, plaintext, iv)
+
+	var out bytes.Buffer
+	if err := decryptStreamToFile(dec, bytes.NewReader(blob), &out); err != nil {
+		t.Fatalf("decryptStreamToFile ambiguous small blob: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), plaintext) {
+		t.Fatalf("mismatch: got %d bytes, want %d", out.Len(), len(plaintext))
+	}
+}
+
+// Newly written small blobs must never be ambiguous: the IV's first 4 bytes
+// are rejection-sampled outside the chunk-count range.
+func TestEncryptSmallBlobIVNeverAmbiguous(t *testing.T) {
+	key := make([]byte, 32)
+	enc := NewEncryptor(key, DefaultChunkSize)
+	plaintext := []byte("small blob iv sampling check")
+	for i := 0; i < 200; i++ {
+		blob, err := enc.Encrypt(plaintext)
+		if err != nil {
+			t.Fatalf("encrypt: %v", err)
+		}
+		if string(blob[:MagicSize]) != MagicGB1 {
+			t.Fatalf("magic mismatch: got %q", blob[:MagicSize])
+		}
+		if isChunkCount(blob[MagicSize : MagicSize+ChunkCountSize]) {
+			t.Fatalf("small blob iv prefix falls in chunk-count range: %v", blob[MagicSize:MagicSize+ChunkCountSize])
+		}
 	}
 }

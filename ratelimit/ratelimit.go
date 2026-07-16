@@ -6,11 +6,16 @@ package ratelimit
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type Limiter struct {
-	bytesPerSecond int64
+	// bytesPerSecond is accessed atomically: WaitN reads it on every
+	// iteration (including from callers that never take mu, e.g. Reader),
+	// while SetRate writes it — a plain int64 was a data race. A value
+	// <= 0 means "no limit" and WaitN never blocks.
+	bytesPerSecond atomic.Int64
 	bucket         int64
 	maxBucket      int64
 	mu             sync.Mutex
@@ -21,15 +26,15 @@ type Limiter struct {
 
 func NewLimiter(bytesPerSecond int64) *Limiter {
 	if bytesPerSecond <= 0 {
-		return &Limiter{bytesPerSecond: 0}
+		return &Limiter{}
 	}
 
 	l := &Limiter{
-		bytesPerSecond: bytesPerSecond,
-		bucket:         bytesPerSecond,
-		maxBucket:      bytesPerSecond * 2,
-		stopCh:         make(chan struct{}),
+		bucket:    bytesPerSecond,
+		maxBucket: bytesPerSecond * 2,
+		stopCh:    make(chan struct{}),
 	}
+	l.bytesPerSecond.Store(bytesPerSecond)
 
 	l.ticker = time.NewTicker(100 * time.Millisecond)
 	go l.refill()
@@ -41,15 +46,14 @@ func (l *Limiter) refill() {
 	for {
 		select {
 		case <-l.ticker.C:
-			l.mu.Lock()
-			if l.bytesPerSecond > 0 {
-				increment := l.bytesPerSecond / 10
-				l.bucket += increment
+			if rate := l.bytesPerSecond.Load(); rate > 0 {
+				l.mu.Lock()
+				l.bucket += rate / 10
 				if l.bucket > l.maxBucket {
 					l.bucket = l.maxBucket
 				}
+				l.mu.Unlock()
 			}
-			l.mu.Unlock()
 		case <-l.stopCh:
 			return
 		}
@@ -57,11 +61,14 @@ func (l *Limiter) refill() {
 }
 
 func (l *Limiter) WaitN(ctx context.Context, n int) error {
-	if l.bytesPerSecond <= 0 {
-		return nil
-	}
-
 	for n > 0 {
+		// Re-check the rate on every iteration: SetRate(0) means "no
+		// limit", so waiters blocked on an empty bucket must observe it
+		// and return instead of sleeping forever when ctx is Background.
+		// The polling below bounds the wakeup latency to ~50ms.
+		if l.bytesPerSecond.Load() <= 0 {
+			return nil
+		}
 		l.mu.Lock()
 		available := int(l.bucket)
 		if available > 0 {
@@ -93,15 +100,14 @@ func (l *Limiter) WaitN(ctx context.Context, n int) error {
 }
 
 func (l *Limiter) SetRate(bytesPerSecond int64) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	l.bytesPerSecond = bytesPerSecond
+	l.bytesPerSecond.Store(bytesPerSecond)
 	if bytesPerSecond > 0 {
+		l.mu.Lock()
 		l.maxBucket = bytesPerSecond * 2
 		if l.bucket > l.maxBucket {
 			l.bucket = l.maxBucket
 		}
+		l.mu.Unlock()
 	}
 }
 
