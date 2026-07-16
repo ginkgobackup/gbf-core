@@ -4,6 +4,7 @@
 package simple
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -36,6 +37,13 @@ type Manifest struct {
 	DeviceID   string          `json:"deviceId"`
 	Dirs       map[string]*Dir `json:"dirs"`
 	Stats      ManifestStats   `json:"stats"`
+
+	// FilePath is the actual on-disk path this manifest was loaded from or
+	// written to. It is set by LoadManifest and SaveManifestWithKey and is
+	// never serialized. Callers must use this instead of reconstructing the
+	// path via ManifestFilePath: a same-second conflict causes the save to
+	// write a suffixed filename that ManifestFilePath cannot predict.
+	FilePath string `json:"-"`
 
 	fileMap     map[string]FileEntry
 	fileMapOnce sync.Once
@@ -442,11 +450,28 @@ func ManifestFilePath(metaDir string, cloudID string, ts time.Time, deviceID str
 	return filepath.Join(dir, name)
 }
 
-func SaveManifest(metaDir string, m *Manifest) error {
+// SaveManifest writes the manifest and returns the actual path written.
+// See SaveManifestWithKey for the same-second conflict behavior.
+func SaveManifest(metaDir string, m *Manifest) (string, error) {
 	return SaveManifestWithKey(metaDir, m, nil)
 }
 
-func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) error {
+// SaveManifestWithKey persists a manifest under
+// metaDir/manifests/{cloudID}/{unix}_{deviceID}.json.zst and returns the
+// actual path written.
+//
+// Same-second conflict: the deterministic filename only has second
+// resolution, so two backups of the same source completing within one second
+// would silently overwrite each other. When the target path already exists,
+// this function writes to "{unix}_{deviceID}_{6hex}.json.zst" instead. The
+// suffixed name remains visible to all readers (prefix scans in
+// LoadManifestByTimestamp/ManifestExistsByTimestamp, content matching in
+// Delete/TrashManifest, isManifestFile listing) and sorts ahead of the
+// unsuffixed file, so LoadLatestManifest picks the newer one. Callers that
+// reconstruct the path via ManifestFilePath only find the FIRST manifest of
+// that second — they must use the returned path when they need the exact
+// file just written.
+func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) (string, error) {
 	ts, err := time.Parse(time.RFC3339, m.Timestamp)
 	if err != nil {
 		ts = time.Now()
@@ -456,43 +481,62 @@ func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) error {
 		cloudID = ManifestPathKey(m.DeviceID, fmt.Sprintf("%d", m.SourceID))
 	}
 	if err := validateCloudID(cloudID); err != nil {
-		return err
+		return "", err
 	}
 	if err := validateCloudID(m.DeviceID); err != nil {
-		return fmt.Errorf("deviceID: %w", err)
+		return "", fmt.Errorf("deviceID: %w", err)
 	}
 	path := ManifestFilePath(metaDir, cloudID, ts, m.DeviceID)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
+		return "", fmt.Errorf("mkdir: %w", err)
 	}
 	data, err := json.Marshal(m)
 	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+		return "", fmt.Errorf("marshal: %w", err)
 	}
 	compressed, err := localManifestCompressor.Compress(data)
 	if err != nil {
-		return fmt.Errorf("compress: %w", err)
+		return "", fmt.Errorf("compress: %w", err)
 	}
 	if len(encryptKey) > 0 {
 		compressed, err = EncryptManifest(compressed, encryptKey)
 		if err != nil {
-			return fmt.Errorf("encrypt manifest: %w", err)
+			return "", fmt.Errorf("encrypt manifest: %w", err)
 		}
 	}
 	sum := sha256.Sum256(compressed)
 	checksumHex := hex.EncodeToString(sum[:])
 
-	if err := fsutil.WriteFileAtomic(path, compressed, 0600); err != nil {
-		return fmt.Errorf("write manifest: %w", err)
+	// Resolve same-second conflicts by suffixing rather than overwriting.
+	// A handful of attempts is plenty: each suffix has 24 bits of entropy.
+	finalPath := path
+	for attempt := 0; attempt < 4; attempt++ {
+		if _, statErr := os.Stat(finalPath); os.IsNotExist(statErr) {
+			break
+		}
+		var b [3]byte
+		if _, randErr := rand.Read(b[:]); randErr != nil {
+			return "", fmt.Errorf("generate conflict suffix: %w", randErr)
+		}
+		finalPath = strings.TrimSuffix(path, ".json.zst") + "_" + hex.EncodeToString(b[:]) + ".json.zst"
+	}
+	if finalPath != path {
+		slog.Warn("GBF manifest same-second conflict, writing with suffix",
+			"component", "manifest", "cloud_id", cloudID, "path", filepath.Base(finalPath))
 	}
 
-	checksumPath := manifestChecksumPath(path)
+	if err := fsutil.WriteFileAtomic(finalPath, compressed, 0600); err != nil {
+		return "", fmt.Errorf("write manifest: %w", err)
+	}
+
+	checksumPath := manifestChecksumPath(finalPath)
 	if err := fsutil.WriteFileAtomic(checksumPath, []byte(checksumHex), 0600); err != nil {
-		return fmt.Errorf("write manifest checksum: %w", err)
+		return "", fmt.Errorf("write manifest checksum: %w", err)
 	}
 
-	return nil
+	m.FilePath = finalPath
+	return finalPath, nil
 }
 
 func manifestChecksumPath(manifestPath string) string {
@@ -528,7 +572,12 @@ func LoadManifest(path string) (*Manifest, error) {
 	if err := verifyManifestChecksum(path, data); err != nil {
 		return nil, err
 	}
-	return LoadManifestFromData(data)
+	m, err := LoadManifestFromData(data)
+	if err != nil {
+		return nil, err
+	}
+	m.FilePath = path
+	return m, nil
 }
 
 func LoadManifestFromData(data []byte) (*Manifest, error) {

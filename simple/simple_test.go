@@ -174,7 +174,7 @@ func TestManifestSaveLoad(t *testing.T) {
 		Mtime:       "2026-05-14T10:00:00Z",
 		Mode:        0644,
 	})
-	if err := SaveManifest(dir, m); err != nil {
+	if _, err := SaveManifest(dir, m); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	loaded, err := LoadLatestManifest(dir, ManifestPathKey("device-1", "1"))
@@ -779,7 +779,7 @@ func TestRestoreSkipsLockedAndFailedEntries(t *testing.T) {
 		Mode:   0644,
 		Status: "locked",
 	})
-	if err := SaveManifestWithKey(MetaDir(repoDir), m, key); err != nil {
+	if _, err := SaveManifestWithKey(MetaDir(repoDir), m, key); err != nil {
 		t.Fatalf("save manifest: %v", err)
 	}
 
@@ -812,5 +812,64 @@ func TestRestoreSkipsLockedAndFailedEntries(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(restoreDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("%s should not have been restored", name)
 		}
+	}
+}
+
+func TestRestoreCreatesEmptyDirectories(t *testing.T) {
+	repoDir := t.TempDir()
+	sourceDir := filepath.Join(t.TempDir(), "source")
+	// One real file plus a nested chain of empty directories.
+	if err := os.MkdirAll(filepath.Join(sourceDir, "empty", "nested"), 0755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "file.txt"), []byte("data"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	if err := InitRepo(InitParams{RepoRoot: repoDir, DeviceID: "test"}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	key, _ := GenerateRandomKey()
+	ManifestDecryptHook = func(encrypted []byte) ([]byte, error) {
+		return DecryptManifest(encrypted, key)
+	}
+	store := NewLocalBlobStore(repoDir)
+	ctx := context.Background()
+
+	pipeline := NewSimplePipeline(PipelineConfig{
+		RepoRoot:   repoDir,
+		SourceID:   1,
+		SourceName: "test",
+		SourcePath: sourceDir,
+		DeviceID:   "test",
+		Key:        key,
+	}, store)
+	if _, err := pipeline.Run(ctx); err != nil {
+		t.Fatalf("pipeline run: %v", err)
+	}
+
+	restoreDir := filepath.Join(t.TempDir(), "restore")
+	restore := NewSimpleRestore(RestoreConfig{
+		RepoRoot:  repoDir,
+		TargetDir: restoreDir,
+		SourceID:  1,
+		DeviceID:  "test",
+		Key:       key,
+	}, store)
+	if _, err := restore.Run(ctx); err != nil {
+		t.Fatalf("restore run: %v", err)
+	}
+
+	// The empty directory chain must exist in the restore — previously only
+	// directories containing files were recreated, so empty dirs were lost.
+	info, err := os.Stat(filepath.Join(restoreDir, "empty", "nested"))
+	if err != nil {
+		t.Fatalf("empty/nested not restored: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("empty/nested should be a directory")
+	}
+	if _, err := os.Stat(filepath.Join(restoreDir, "file.txt")); err != nil {
+		t.Fatalf("file.txt not restored: %v", err)
 	}
 }

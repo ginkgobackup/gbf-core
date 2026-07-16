@@ -455,7 +455,10 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 			"locked", lockedFiles, "sample_paths", samplePaths, "session_id", p.cfg.SessionID)
 	}
 
-	if err := SaveManifestWithKey(metaDir, newManifest, p.cfg.Key); err != nil {
+	// SaveManifestWithKey sets newManifest.FilePath to the actual path
+	// written (same-second conflicts get a suffixed name), which downstream
+	// consumers (snapshot target records, cloud upload) rely on.
+	if _, err := SaveManifestWithKey(metaDir, newManifest, p.cfg.Key); err != nil {
 		return nil, fmt.Errorf("save manifest: %w", err)
 	}
 

@@ -116,9 +116,11 @@ func (r *SimpleRestore) Run(ctx context.Context) (*RestoreResult, error) {
 		cloudID = ResolveCloudID(r.cfg.DeviceID, r.cfg.SourceID)
 	}
 	if r.cfg.Timestamp != "" {
-		ts, _ := time.Parse(time.RFC3339, r.cfg.Timestamp)
-		path := ManifestFilePath(metaDir, cloudID, ts, r.cfg.DeviceID)
-		m, err = LoadManifest(path)
+		// LoadManifestByTimestamp prefix-scans the manifest dir, so it also
+		// finds manifests written with a same-second conflict suffix (see
+		// SaveManifestWithKey) — a reconstructed ManifestFilePath would miss
+		// those.
+		m, err = LoadManifestByTimestamp(metaDir, cloudID, r.cfg.Timestamp)
 		if err != nil {
 			return nil, fmt.Errorf("load manifest: %w", err)
 		}
@@ -132,6 +134,26 @@ func (r *SimpleRestore) Run(ctx context.Context) (*RestoreResult, error) {
 	if r.progress != nil {
 		r.progress.SetPhase(PhaseUploading)
 		r.progress.SetTotal(m.Stats.FileCount, m.Stats.TotalSize)
+	}
+
+	// Recreate the directory skeleton before restoring files. Manifest v2
+	// records every directory in Dirs — both dirs containing files and
+	// explicitly recorded empty dirs — so iterating the keys rebuilds the
+	// full tree. Without this, empty directories (no files inside) would be
+	// missing from the restore. The root entry "" maps to TargetDir itself;
+	// skip it (safeRestorePath rejects empty paths, and file restore creates
+	// parent dirs on demand anyway).
+	for dirPath := range m.Dirs {
+		if dirPath == "" {
+			continue
+		}
+		targetPath, err := safeRestorePath(r.cfg.TargetDir, dirPath)
+		if err != nil {
+			return nil, fmt.Errorf("restore directory %s: %w", dirPath, err)
+		}
+		if err := os.MkdirAll(targetPath, 0755); err != nil {
+			return nil, fmt.Errorf("mkdir %s: %w", targetPath, err)
+		}
 	}
 
 	for _, file := range m.AllFiles() {

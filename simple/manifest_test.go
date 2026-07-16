@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -80,7 +81,7 @@ func TestManifestChecksumSidecar(t *testing.T) {
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	m.AddFile(FileEntry{Name: "a.txt", Size: 10})
-	if err := SaveManifest(dir, m); err != nil {
+	if _, err := SaveManifest(dir, m); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -123,7 +124,7 @@ func TestManifestChecksumSidecarMissingIsRejected(t *testing.T) {
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	m.AddFile(FileEntry{Name: "a.txt", Size: 10})
-	if err := SaveManifest(dir, m); err != nil {
+	if _, err := SaveManifest(dir, m); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -278,7 +279,7 @@ func TestSaveManifestWithKey(t *testing.T) {
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.AddFile(FileEntry{Name: "secret.txt", ContentHash: "abc123", Size: 42, Mtime: "2026-05-19T10:00:00Z", Mode: 0644})
 
-	if err := SaveManifestWithKey(dir, m, key); err != nil {
+	if _, err := SaveManifestWithKey(dir, m, key); err != nil {
 		t.Fatalf("save with key: %v", err)
 	}
 
@@ -483,21 +484,21 @@ func TestLoadLatestManifest(t *testing.T) {
 		m1 := NewManifest(1, "", "src", "/data", "dev1")
 		m1.Timestamp = "2026-05-19T10:00:00Z"
 		m1.AddFile(FileEntry{Name: "old.txt", Size: 10})
-		if err := SaveManifest(dir, m1); err != nil {
+		if _, err := SaveManifest(dir, m1); err != nil {
 			t.Fatalf("save m1: %v", err)
 		}
 
 		m2 := NewManifest(1, "", "src", "/data", "dev1")
 		m2.Timestamp = "2026-05-19T12:00:00Z"
 		m2.AddFile(FileEntry{Name: "new.txt", Size: 20})
-		if err := SaveManifest(dir, m2); err != nil {
+		if _, err := SaveManifest(dir, m2); err != nil {
 			t.Fatalf("save m2: %v", err)
 		}
 
 		m3 := NewManifest(1, "", "src", "/data", "dev1")
 		m3.Timestamp = "2026-05-19T11:00:00Z"
 		m3.AddFile(FileEntry{Name: "mid.txt", Size: 15})
-		if err := SaveManifest(dir, m3); err != nil {
+		if _, err := SaveManifest(dir, m3); err != nil {
 			t.Fatalf("save m3: %v", err)
 		}
 
@@ -533,13 +534,13 @@ func TestListManifests(t *testing.T) {
 
 		m1 := NewManifest(1, "", "src", "/data", "dev1")
 		m1.Timestamp = "2026-05-19T10:00:00Z"
-		if err := SaveManifest(dir, m1); err != nil {
+		if _, err := SaveManifest(dir, m1); err != nil {
 			t.Fatalf("save m1: %v", err)
 		}
 
 		m2 := NewManifest(1, "", "src", "/data", "dev1")
 		m2.Timestamp = "2026-05-19T12:00:00Z"
-		if err := SaveManifest(dir, m2); err != nil {
+		if _, err := SaveManifest(dir, m2); err != nil {
 			t.Fatalf("save m2: %v", err)
 		}
 
@@ -581,7 +582,7 @@ func TestListManifests(t *testing.T) {
 
 		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.Timestamp = "2026-05-19T10:00:00Z"
-		if err := SaveManifest(dir, m); err != nil {
+		if _, err := SaveManifest(dir, m); err != nil {
 			t.Fatalf("save: %v", err)
 		}
 
@@ -609,7 +610,7 @@ func TestDeleteManifest(t *testing.T) {
 
 		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.Timestamp = "2026-05-19T10:00:00Z"
-		if err := SaveManifest(dir, m); err != nil {
+		if _, err := SaveManifest(dir, m); err != nil {
 			t.Fatalf("save: %v", err)
 		}
 
@@ -638,7 +639,7 @@ func TestTrashManifest(t *testing.T) {
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	m.AddFile(FileEntry{Name: "a.txt", Size: 10})
-	if err := SaveManifest(dir, m); err != nil {
+	if _, err := SaveManifest(dir, m); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -681,7 +682,7 @@ func TestCleanTrashManifests(t *testing.T) {
 
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
-	if err := SaveManifest(dir, m); err != nil {
+	if _, err := SaveManifest(dir, m); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -718,7 +719,7 @@ func TestCleanTrashManifestsRecentFilesKept(t *testing.T) {
 
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
-	if err := SaveManifest(dir, m); err != nil {
+	if _, err := SaveManifest(dir, m); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -758,7 +759,7 @@ func TestManifestExistsByTimestamp(t *testing.T) {
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	ts := "2026-05-19T10:00:00Z"
 	m.Timestamp = ts
-	if err := SaveManifest(dir, m); err != nil {
+	if _, err := SaveManifest(dir, m); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -784,7 +785,7 @@ func TestLoadManifestByTimestamp(t *testing.T) {
 		m := NewManifest(1, "", "src", "/data", "dev1")
 		m.Timestamp = "2026-05-19T10:00:00Z"
 		m.AddFile(FileEntry{Name: "found.txt", Size: 10})
-		if err := SaveManifest(dir, m); err != nil {
+		if _, err := SaveManifest(dir, m); err != nil {
 			t.Fatalf("save: %v", err)
 		}
 
@@ -958,7 +959,7 @@ func TestSaveManifestWithKeyFallsBackToDevicePathKey(t *testing.T) {
 	// "dev1/42/".
 	m := NewManifest(42, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
-	if err := SaveManifestWithKey(dir, m, key); err != nil {
+	if _, err := SaveManifestWithKey(dir, m, key); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -985,7 +986,7 @@ func TestSaveManifestInvalidTimestamp(t *testing.T) {
 	m.Timestamp = "invalid-timestamp"
 	m.AddFile(FileEntry{Name: "a.txt", Size: 10})
 
-	if err := SaveManifest(dir, m); err != nil {
+	if _, err := SaveManifest(dir, m); err != nil {
 		t.Fatalf("save with invalid timestamp should use time.Now fallback: %v", err)
 	}
 
@@ -1003,13 +1004,13 @@ func TestDeleteManifestPreservesOtherManifests(t *testing.T) {
 
 	m1 := NewManifest(1, "", "src", "/data", "dev1")
 	m1.Timestamp = "2026-05-19T10:00:00Z"
-	if err := SaveManifest(dir, m1); err != nil {
+	if _, err := SaveManifest(dir, m1); err != nil {
 		t.Fatalf("save m1: %v", err)
 	}
 
 	m2 := NewManifest(1, "", "src", "/data", "dev1")
 	m2.Timestamp = "2026-05-19T12:00:00Z"
-	if err := SaveManifest(dir, m2); err != nil {
+	if _, err := SaveManifest(dir, m2); err != nil {
 		t.Fatalf("save m2: %v", err)
 	}
 
@@ -1076,5 +1077,78 @@ func TestValidateCloudID(t *testing.T) {
 		} else if !errors.Is(err, ErrInvalidCloudID) {
 			t.Errorf("validateCloudID(%q) error should wrap ErrInvalidCloudID, got %v", id, err)
 		}
+	}
+}
+
+func TestSaveManifestSameSecondConflict(t *testing.T) {
+	dir := t.TempDir()
+	cloudID := ManifestPathKey("dev1", "1")
+
+	m1 := NewManifest(1, "", "first", "/data", "dev1")
+	m1.Timestamp = "2026-05-19T10:00:00Z"
+	m1.AddFile(FileEntry{Name: "a.txt", Size: 10})
+	path1, err := SaveManifest(dir, m1)
+	if err != nil {
+		t.Fatalf("save m1: %v", err)
+	}
+	if m1.FilePath != path1 {
+		t.Fatalf("m1.FilePath = %q, want %q", m1.FilePath, path1)
+	}
+
+	// Same source, same second, same device: the deterministic filename
+	// collides and the second save must NOT overwrite the first — it
+	// writes a suffixed name instead.
+	m2 := NewManifest(1, "", "second", "/data", "dev1")
+	m2.Timestamp = "2026-05-19T10:00:00Z"
+	m2.AddFile(FileEntry{Name: "b.txt", Size: 20})
+	path2, err := SaveManifest(dir, m2)
+	if err != nil {
+		t.Fatalf("save m2: %v", err)
+	}
+	if path2 == path1 {
+		t.Fatal("same-second save overwrote the first manifest")
+	}
+	if m2.FilePath != path2 {
+		t.Fatalf("m2.FilePath = %q, want %q", m2.FilePath, path2)
+	}
+	base1, base2 := filepath.Base(path1), filepath.Base(path2)
+	if !strings.HasPrefix(base2, strings.TrimSuffix(base1, ".json.zst")+"_") {
+		t.Fatalf("suffixed name %q should extend %q", base2, base1)
+	}
+
+	// Both manifests survive on disk and round-trip (checksum sidecar
+	// included), with FilePath recording where each was loaded from.
+	loaded1, err := LoadManifest(path1)
+	if err != nil {
+		t.Fatalf("load m1: %v", err)
+	}
+	if loaded1.SourceName != "first" || loaded1.FilePath != path1 {
+		t.Fatalf("loaded1 = %q @ %q, want first @ %q", loaded1.SourceName, loaded1.FilePath, path1)
+	}
+	loaded2, err := LoadManifest(path2)
+	if err != nil {
+		t.Fatalf("load m2: %v", err)
+	}
+	if loaded2.SourceName != "second" || loaded2.FilePath != path2 {
+		t.Fatalf("loaded2 = %q @ %q, want second @ %q", loaded2.SourceName, loaded2.FilePath, path2)
+	}
+
+	// The suffixed name sorts after the deterministic one, so the latest
+	// manifest is the second save.
+	latest, err := LoadLatestManifest(dir, cloudID)
+	if err != nil {
+		t.Fatalf("load latest: %v", err)
+	}
+	if latest.SourceName != "second" {
+		t.Fatalf("latest = %q, want %q", latest.SourceName, "second")
+	}
+
+	// Timestamp-based readers still find a manifest for that second.
+	unixSec := time.Date(2026, 5, 19, 10, 0, 0, 0, time.UTC).Unix()
+	if !ManifestExistsByTimestamp(dir, cloudID, unixSec) {
+		t.Fatal("ManifestExistsByTimestamp should see the conflicted second")
+	}
+	if _, err := LoadManifestByTimestamp(dir, cloudID, "2026-05-19T10:00:00Z"); err != nil {
+		t.Fatalf("LoadManifestByTimestamp: %v", err)
 	}
 }
