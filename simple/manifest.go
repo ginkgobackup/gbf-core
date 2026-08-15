@@ -514,11 +514,12 @@ func SaveManifest(metaDir string, m *Manifest) (string, error) {
 // this function writes to "{unix}_{deviceID}_{6hex}.json.zst" instead. The
 // suffixed name remains visible to all readers (prefix scans in
 // LoadManifestByTimestamp/ManifestExistsByTimestamp, content matching in
-// Delete/TrashManifest, isManifestFile listing) and sorts ahead of the
-// unsuffixed file, so LoadLatestManifest picks the newer one. Callers that
-// reconstruct the path via ManifestFilePath only find the FIRST manifest of
-// that second — they must use the returned path when they need the exact
-// file just written.
+// Delete/TrashManifest, isManifestFile listing). Lexicographically it sorts
+// BEHIND the unsuffixed file ('.' = 0x2E < '_' = 0x5F), so LoadLatestManifest
+// tie-breaks same-second candidates on file modification time rather than
+// filename order to pick the newer one. Callers that reconstruct the path
+// via ManifestFilePath only find the FIRST manifest of that second — they
+// must use the returned path when they need the exact file just written.
 func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) (string, error) {
 	ts, err := time.Parse(time.RFC3339, m.Timestamp)
 	if err != nil {
@@ -941,6 +942,27 @@ func TrashManifest(metaDir string, cloudID string, timestamp, deviceID string) e
 	return deleteOrTrashManifest(metaDir, cloudID, timestamp, deviceID, true)
 }
 
+// moveOrDeleteOneManifest moves the manifest file at srcPath into dstDir
+// (trash mode) or deletes it in place, in both cases handling its .sha256
+// sidecar the same way so the two files never get separated. dstDir is only
+// used when trash is true and must already exist.
+func moveOrDeleteOneManifest(srcPath, dstDir string, trash bool) error {
+	if trash {
+		dstPath := filepath.Join(dstDir, filepath.Base(srcPath))
+		if err := renameWithFallback(srcPath, dstPath); err != nil {
+			return err
+		}
+		srcChecksumPath := manifestChecksumPath(srcPath)
+		dstChecksumPath := manifestChecksumPath(dstPath)
+		if _, statErr := os.Stat(srcChecksumPath); statErr == nil {
+			_ = renameWithFallback(srcChecksumPath, dstChecksumPath)
+		}
+		return nil
+	}
+	_ = os.Remove(manifestChecksumPath(srcPath))
+	return os.Remove(srcPath)
+}
+
 // deleteOrTrashManifest finds the manifest matching timestamp+deviceID and
 // either deletes it (together with its checksum sidecar) or moves it to the
 // source's trash directory. The two operations share every step except the
@@ -966,19 +988,9 @@ func deleteOrTrashManifest(metaDir string, cloudID string, timestamp, deviceID s
 			if err := os.MkdirAll(dstDir, 0755); err != nil {
 				return fmt.Errorf("create trash dir: %w", err)
 			}
-			dstPath := filepath.Join(dstDir, matched)
-			if err := renameWithFallback(srcPath, dstPath); err != nil {
-				return err
-			}
-			srcChecksumPath := manifestChecksumPath(srcPath)
-			dstChecksumPath := manifestChecksumPath(dstPath)
-			if _, statErr := os.Stat(srcChecksumPath); statErr == nil {
-				_ = renameWithFallback(srcChecksumPath, dstChecksumPath)
-			}
-			return nil
+			return moveOrDeleteOneManifest(srcPath, dstDir, true)
 		}
-		_ = os.Remove(manifestChecksumPath(srcPath))
-		return os.Remove(srcPath)
+		return moveOrDeleteOneManifest(srcPath, "", false)
 	}
 	if len(loadErrors) > 0 {
 		action := "DeleteManifest"
@@ -1073,7 +1085,8 @@ func DeleteAllSourceManifests(metaDir string, cloudID string) (int, error) {
 }
 
 // deleteOrTrashAllManifests moves (trash) or deletes every manifest of a
-// source, then removes the now-empty source directory.
+// source — checksum sidecars included — then removes the now-empty source
+// directory.
 func deleteOrTrashAllManifests(metaDir string, cloudID string, trash bool) (int, error) {
 	srcDir := ManifestDir(metaDir, cloudID)
 	entries, err := readManifestFiles(srcDir)
@@ -1093,12 +1106,7 @@ func deleteOrTrashAllManifests(metaDir string, cloudID string, trash bool) (int,
 	count := 0
 	for _, e := range entries {
 		srcPath := filepath.Join(srcDir, e.Name())
-		var opErr error
-		if trash {
-			opErr = renameWithFallback(srcPath, filepath.Join(dstDir, e.Name()))
-		} else {
-			opErr = os.Remove(srcPath)
-		}
+		opErr := moveOrDeleteOneManifest(srcPath, dstDir, trash)
 		if opErr != nil {
 			if trash {
 				slog.Warn("trash manifest move failed", "component", "manifest", "file", e.Name(), "error", opErr)

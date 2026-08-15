@@ -699,6 +699,79 @@ func TestTrashManifest(t *testing.T) {
 	}
 }
 
+func TestTrashAllSourceManifestsKeepsSidecarsLoadable(t *testing.T) {
+	dir := t.TempDir()
+	cloudID := ManifestPathKey("dev1", "1")
+
+	timestamps := []string{"2026-05-19T10:00:00Z", "2026-05-19T11:00:00Z"}
+	for i, ts := range timestamps {
+		m := NewManifest(1, "", "src", "/data", "dev1")
+		m.Timestamp = ts
+		m.AddFile(FileEntry{Name: fmt.Sprintf("f%d.txt", i), Size: int64(10 + i)})
+		if _, err := SaveManifest(dir, m); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+	}
+
+	count, err := TrashAllSourceManifests(dir, cloudID)
+	if err != nil {
+		t.Fatalf("trash all: %v", err)
+	}
+	if count != len(timestamps) {
+		t.Fatalf("trashed count: got %d, want %d", count, len(timestamps))
+	}
+
+	trashed, loadErrors, err := ListTrashManifests(dir, cloudID)
+	if err != nil {
+		t.Fatalf("list trash: %v", err)
+	}
+	if len(loadErrors) != 0 {
+		t.Fatalf("trash load errors (sidecar missing?): %v", loadErrors)
+	}
+	if len(trashed) != len(timestamps) {
+		t.Fatalf("trashed manifests: got %d, want %d", len(trashed), len(timestamps))
+	}
+
+	if _, statErr := os.Stat(ManifestDir(dir, cloudID)); !os.IsNotExist(statErr) {
+		t.Errorf("source dir should be removed after trashing all manifests")
+	}
+}
+
+func TestDeleteAllSourceManifestsRemovesSidecars(t *testing.T) {
+	dir := t.TempDir()
+	cloudID := ManifestPathKey("dev1", "1")
+
+	timestamps := []string{"2026-05-20T10:00:00Z", "2026-05-20T11:00:00Z"}
+	for i, ts := range timestamps {
+		m := NewManifest(1, "", "src", "/data", "dev1")
+		m.Timestamp = ts
+		m.AddFile(FileEntry{Name: fmt.Sprintf("f%d.txt", i), Size: int64(10 + i)})
+		if _, err := SaveManifest(dir, m); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+	}
+
+	count, err := DeleteAllSourceManifests(dir, cloudID)
+	if err != nil {
+		t.Fatalf("delete all: %v", err)
+	}
+	if count != len(timestamps) {
+		t.Fatalf("deleted count: got %d, want %d", count, len(timestamps))
+	}
+
+	srcDir := ManifestDir(dir, cloudID)
+	remaining, readErr := os.ReadDir(srcDir)
+	if readErr != nil {
+		if !os.IsNotExist(readErr) {
+			t.Fatalf("read source dir: %v", readErr)
+		}
+		return // dir fully removed, no orphan sidecars possible
+	}
+	for _, e := range remaining {
+		t.Errorf("leftover file after DeleteAllSourceManifests: %s", e.Name())
+	}
+}
+
 func TestCleanTrashManifests(t *testing.T) {
 	dir := t.TempDir()
 
