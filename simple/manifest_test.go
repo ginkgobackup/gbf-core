@@ -15,6 +15,27 @@ import (
 	"time"
 )
 
+// TestFlexTimeUnmarshalNanos pins the >1e18 branch: present-day epoch
+// nanoseconds (~1.7e18) must decode as nanoseconds, not be misread as
+// microseconds (which would land ~1000× in the future).
+func TestFlexTimeUnmarshalNanos(t *testing.T) {
+	ns := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC).UnixNano()
+	if ns <= microsVsNanosThreshold {
+		t.Fatalf("test premise: %d ns should exceed the 1e18 threshold", ns)
+	}
+	var f FileEntry
+	if err := json.Unmarshal([]byte(fmt.Sprintf(`{"mtime":%d}`, ns)), &f); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got, err := time.Parse(time.RFC3339, string(f.Mtime))
+	if err != nil {
+		t.Fatalf("parse mtime %q: %v", f.Mtime, err)
+	}
+	if got.UnixNano() != ns {
+		t.Fatalf("value decoded as %v (UnixNano %d), want UnixNano %d: >1e18 must be read as nanoseconds", got, got.UnixNano(), ns)
+	}
+}
+
 func TestFileEntryMtimeMicro(t *testing.T) {
 	t.Run("valid_rfc3339", func(t *testing.T) {
 		f := FileEntry{Mtime: "2026-05-19T10:30:00Z"}

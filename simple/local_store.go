@@ -71,14 +71,6 @@ func (s *LocalBlobStore) BlobPath(hash string) string {
 	return filepath.Join(s.baseDir, "gb", hash[:2], hash+".gb")
 }
 
-func (s *LocalBlobStore) blobPath(hash string) string {
-	return s.BlobPath(hash)
-}
-
-func (s *LocalBlobStore) resolveBlobPath(hash string) string {
-	return s.blobPath(hash)
-}
-
 func (s *LocalBlobStore) ensureDir(dir string) error {
 	s.dirCacheMu.Lock()
 	if s.dirCache[dir] {
@@ -123,7 +115,7 @@ func (s *LocalBlobStore) putBlob(ctx context.Context, hash string, writeBlob fun
 	}
 	s.existsMu.RUnlock()
 
-	path := s.blobPath(hash)
+	path := s.BlobPath(hash)
 	if _, err := os.Stat(path); err == nil {
 		s.existsMu.Lock()
 		s.existsSet[hash] = true
@@ -199,7 +191,7 @@ func (s *LocalBlobStore) Get(ctx context.Context, hash string) ([]byte, error) {
 	if !validateHash(hash) {
 		return nil, ErrInvalidHash
 	}
-	return os.ReadFile(s.resolveBlobPath(hash))
+	return os.ReadFile(s.BlobPath(hash))
 }
 
 func (s *LocalBlobStore) PutStream(ctx context.Context, hash string, r io.Reader, size int64) error {
@@ -239,7 +231,7 @@ func (s *LocalBlobStore) GetStream(ctx context.Context, hash string) (io.ReadClo
 	if !validateHash(hash) {
 		return nil, ErrInvalidHash
 	}
-	return os.Open(s.resolveBlobPath(hash))
+	return os.Open(s.BlobPath(hash))
 }
 
 // Exists reports whether the blob identified by hash is present in the
@@ -257,7 +249,7 @@ func (s *LocalBlobStore) Exists(ctx context.Context, hash string) (bool, error) 
 	}
 	s.existsMu.RUnlock()
 
-	_, err := os.Stat(s.blobPath(hash))
+	_, err := os.Stat(s.BlobPath(hash))
 	if err == nil {
 		s.existsMu.Lock()
 		s.existsSet[hash] = true
@@ -297,7 +289,7 @@ func (s *LocalBlobStore) ExistsBatch(ctx context.Context, hashes []string) (map[
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if _, err := os.Stat(s.blobPath(h)); err == nil {
+		if _, err := os.Stat(s.BlobPath(h)); err == nil {
 			result[h] = true
 			found = append(found, h)
 		} else if !os.IsNotExist(err) {
@@ -437,7 +429,7 @@ func (s *LocalBlobStore) Delete(ctx context.Context, hash string) error {
 	if !validateHash(hash) {
 		return ErrInvalidHash
 	}
-	p := s.blobPath(hash)
+	p := s.BlobPath(hash)
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return err
 	}

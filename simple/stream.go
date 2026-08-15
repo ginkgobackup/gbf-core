@@ -70,10 +70,19 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 
 	if info.Size() < int64(enc.chunkSize) {
 		// Single read: hash exactly the bytes that get encrypted, so the
-		// blob key can never diverge from the stored content.
-		data, err := io.ReadAll(f)
+		// blob key can never diverge from the stored content. The read is
+		// capped at MaxBlobSize minus the small-blob framing overhead —
+		// the same ceiling readBoundedSmall/DecryptStream enforce on the
+		// ciphertext — so a file that grew past chunkSize after the scan
+		// fails loudly here instead of producing a small blob that no
+		// restore path can decrypt back.
+		const smallLimit = MaxBlobSize - (MagicSize + IVSize + TagSize)
+		data, err := io.ReadAll(io.LimitReader(f, smallLimit+1))
 		if err != nil {
 			return "", fmt.Errorf("read: %w", err)
+		}
+		if len(data) > smallLimit {
+			return "", fmt.Errorf("file grew past chunk size since scan: read %d bytes, exceeds small-blob limit %d", len(data), smallLimit)
 		}
 		contentHash := SHA256Bytes(data)
 		if knownHash != "" && knownHash != contentHash {

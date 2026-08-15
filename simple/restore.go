@@ -379,7 +379,11 @@ func (r *SimpleRestore) restoreChunkedFile(ctx context.Context, file FileEntry, 
 			return ctx.Err()
 		}
 		if err := r.restoreChunkStream(ctx, chunk.Hash, tmpF, &ctBuf, &ptBuf); err != nil {
-			return fmt.Errorf("download chunk %s: %w", chunk.Hash[:12], err)
+			hashLog := chunk.Hash
+			if len(hashLog) > 12 {
+				hashLog = hashLog[:12]
+			}
+			return fmt.Errorf("download chunk %s: %w", hashLog, err)
 		}
 	}
 	ctBuf, ptBuf = nil, nil // drop the scratch buffers before the fsync

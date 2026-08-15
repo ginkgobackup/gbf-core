@@ -94,13 +94,15 @@ type FileEntry struct {
 type FlexTime string
 
 // Timestamp unit detection thresholds for FlexTime.UnmarshalJSON. Values
-// above millisVsMicrosThreshold are treated as microseconds; values above
+// above microsVsNanosThreshold are treated as nanoseconds; values above
+// millisVsMicrosThreshold (and below that) as microseconds; values above
 // secVsMillisThreshold (and below that) as milliseconds; anything else as
-// seconds. Both constants are exact integers, so comparisons against them
+// seconds. All constants are exact integers, so comparisons against them
 // are pure int64 arithmetic.
 const (
-	secVsMillisThreshold    int64 = 100_000_000_000     // 1e11: today's epoch millis start with ~1.7
-	millisVsMicrosThreshold int64 = 100_000_000_000_000 // 1e14: today's epoch micros start with ~1.7
+	secVsMillisThreshold    int64 = 100_000_000_000           // 1e11: today's epoch millis start with ~1.7
+	millisVsMicrosThreshold int64 = 100_000_000_000_000       // 1e14: today's epoch micros start with ~1.7
+	microsVsNanosThreshold  int64 = 1_000_000_000_000_000_000 // 1e18: today's epoch nanos start with ~1.7
 )
 
 func (f *FlexTime) UnmarshalJSON(data []byte) error {
@@ -119,16 +121,23 @@ func (f *FlexTime) UnmarshalJSON(data []byte) error {
 	s := n.String()
 	if iv, err := n.Int64(); err == nil {
 		// Heuristic unit detection based on magnitude. Thresholds are chosen
-		// so that any plausible present-day timestamp (seconds, millis, or
-		// micros) is decoded with the unit that yields a sane date:
+		// so that any plausible present-day timestamp (seconds, millis,
+		// micros, or nanos) is decoded with the unit that yields a sane date:
 		//   - seconds   today: ~1.7e9
 		//   - millis    today: ~1.7e12
 		//   - micros    today: ~1.7e15
-		// Above millisVsMicrosThreshold we must be looking at microseconds
-		// (a 2024 millis value ~1.7e12 would otherwise be misread as µs and
-		// land in 1970). Above secVsMillisThreshold (and <= 1e14) we must be
-		// looking at millis.
-		if iv > millisVsMicrosThreshold {
+		//   - nanos     today: ~1.7e18
+		// Above microsVsNanosThreshold we must be looking at nanoseconds
+		// (epoch micros do not reach 1e18 until year ~33658, so anything
+		// larger can only be ns; without this branch a 2026 nanos value
+		// ~1.78e18 would be misread as µs and land in year ~58000).
+		// Above millisVsMicrosThreshold (and <= 1e18) we must be looking
+		// at microseconds (a 2024 millis value ~1.7e12 would otherwise be
+		// misread as µs and land in 1970). Above secVsMillisThreshold
+		// (and <= 1e14) we must be looking at millis.
+		if iv > microsVsNanosThreshold {
+			s = time.Unix(0, iv).UTC().Format(time.RFC3339Nano)
+		} else if iv > millisVsMicrosThreshold {
 			s = time.UnixMicro(iv).UTC().Format(time.RFC3339Nano)
 		} else if iv > secVsMillisThreshold {
 			s = time.UnixMilli(iv).UTC().Format(time.RFC3339Nano)
@@ -784,7 +793,7 @@ func LoadManifestByTimestamp(metaDir string, cloudID string, timestamp string) (
 		return nil, fmt.Errorf("parse timestamp %q: %w", timestamp, err)
 	}
 	dir := ManifestDir(metaDir, cloudID)
-	entries, err := readManifestDirEntries(dir)
+	entries, err := readManifestFiles(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrManifestNotFound

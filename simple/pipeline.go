@@ -31,8 +31,9 @@ import (
 // and store the exact bytes that were hashed (no second read, no second
 // hash). Larger files keep the two-pass streaming behavior. Memory upper
 // bound: workerCount × threshold (default 8 workers × 32 MiB = 256 MiB
-// worst case, and only when all workers simultaneously process large
-// files); the retained slices are released as soon as the upload finishes.
+// retained + CDC pool 8 × 16 MiB = 128 MiB ≈ 384 MiB worst case, and only
+// when all workers simultaneously process large files); the retained
+// slices are released as soon as the upload finishes.
 const inMemoryChunkThreshold = 32 << 20
 
 // Two size classes cover every buffer the streaming paths allocate:
@@ -1116,7 +1117,6 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 		}
 	}
 
-	skipped := 0
 	needRead := false
 	for _, c := range chunks {
 		if !prevChunkMap[c.Hash] {
@@ -1171,7 +1171,6 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 			// No file is being read, so an already-present chunk can be
 			// skipped without touching anything.
 			if prevChunkMap[c.Hash] {
-				skipped++
 				chunkIdx++
 				continue
 			}
@@ -1201,7 +1200,6 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 				break
 			}
 			if prevChunkMap[c.Hash] {
-				skipped++
 				chunkIdx++
 				continue
 			}

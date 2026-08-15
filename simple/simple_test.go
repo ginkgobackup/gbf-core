@@ -477,6 +477,66 @@ func TestUploadBlobFromPath_StaleKnownHashRejected(t *testing.T) {
 	}
 }
 
+// TestUploadBlobFromPath_SmallPathOverLimitFails pins the small-path read
+// cap: a file whose stat size routes it down the small (< chunkSize) path
+// but whose content exceeds the small-blob restore ceiling must fail loudly
+// instead of producing a blob no restore path can decrypt back. The cap is
+// exercised deterministically with a custom large chunkSize — the same
+// defense covers a file that grew between the scan and the read.
+func TestUploadBlobFromPath_SmallPathOverLimitFails(t *testing.T) {
+	dir := t.TempDir()
+	store := NewLocalBlobStore(dir)
+	key := make([]byte, 32)
+	// chunkSize 32 MiB: a ~5 MiB file takes the small path even though it
+	// is over the DefaultChunkSize-based small-blob limit.
+	enc := NewEncryptor(key, 32*1024*1024)
+	dec := NewDecryptor(key, 32*1024*1024)
+	ctx := context.Background()
+
+	const smallLimit = MaxBlobSize - (MagicSize + IVSize + TagSize)
+
+	// At exactly the limit the small path must keep working.
+	boundary := bytes.Repeat([]byte("x"), smallLimit)
+	boundaryFile := filepath.Join(dir, "boundary.bin")
+	if err := os.WriteFile(boundaryFile, boundary, 0644); err != nil {
+		t.Fatalf("write boundary: %v", err)
+	}
+	boundaryHash, err := UploadBlobFromPath(ctx, store, enc, boundaryFile, "")
+	if err != nil {
+		t.Fatalf("upload at limit should succeed: %v", err)
+	}
+	got, err := DownloadBlob(ctx, store, dec, boundaryHash)
+	if err != nil {
+		t.Fatalf("download at limit: %v", err)
+	}
+	if !bytes.Equal(got, boundary) {
+		t.Fatalf("boundary roundtrip mismatch: got %d bytes, want %d", len(got), len(boundary))
+	}
+
+	// One byte over the limit must fail without storing anything.
+	over := bytes.Repeat([]byte("x"), smallLimit+1)
+	overFile := filepath.Join(dir, "over.bin")
+	if err := os.WriteFile(overFile, over, 0644); err != nil {
+		t.Fatalf("write over: %v", err)
+	}
+	_, err = UploadBlobFromPath(ctx, store, enc, overFile, "")
+	if err == nil {
+		t.Fatal("expected error for small-path file over the restore limit")
+	}
+	if !strings.Contains(err.Error(), "small-blob limit") {
+		t.Errorf("error should mention the limit, got: %v", err)
+	}
+	blobs, err := store.List(ctx, "")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, h := range blobs {
+		if h == SHA256Bytes(over) {
+			t.Fatal("over-limit content was stored as a blob despite the error")
+		}
+	}
+}
+
 func TestPipelineBackupRestore(t *testing.T) {
 	repoDir := t.TempDir()
 	sourceDir := filepath.Join(t.TempDir(), "source")
