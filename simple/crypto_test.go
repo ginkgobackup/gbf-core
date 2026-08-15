@@ -5,9 +5,12 @@ package simple
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -411,5 +414,85 @@ func TestEncryptSmallBlobIVNeverAmbiguous(t *testing.T) {
 		if isChunkCount(blob[MagicSize : MagicSize+ChunkCountSize]) {
 			t.Fatalf("small blob iv prefix falls in chunk-count range: %v", blob[MagicSize:MagicSize+ChunkCountSize])
 		}
+	}
+}
+
+// TestGB2StreamRoundtrip covers the GB2 streaming wire format end to end:
+// UploadBlobFromPath on a compressible multi-chunk file produces a MagicGB2
+// blob via encryptFileToWriter (tryCompress=true); the blob is then restored
+// through both the whole-buffer Decryptor (DownloadBlob) and the streaming
+// decryptGB2StreamToFile path (DownloadBlobToFile). It also pins down the
+// wire layout itself: GB2 magic, a chunk count > 1, per-chunk storedSize and
+// compressed flags, and effective compression.
+func TestGB2StreamRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	store := NewLocalBlobStore(dir)
+	key := make([]byte, 32)
+	enc := NewEncryptor(key, DefaultChunkSize)
+	dec := NewDecryptor(key, DefaultChunkSize)
+	ctx := context.Background()
+
+	// Highly compressible content spanning multiple chunks.
+	block := bytes.Repeat([]byte("gbf gb2 wire format roundtrip "), 4096) // ~116 KiB
+	data := bytes.Repeat(block, (2*DefaultChunkSize/len(block))+2)
+	src := filepath.Join(dir, "gb2-roundtrip.txt")
+	if err := os.WriteFile(src, data, 0644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	hash, err := UploadBlobFromPath(ctx, store, enc, src, "")
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if want := SHA256Bytes(data); hash != want {
+		t.Fatalf("hash = %q, want %q", hash, want)
+	}
+
+	blob, err := store.Get(ctx, hash)
+	if err != nil {
+		t.Fatalf("get blob: %v", err)
+	}
+	if got := string(blob[:MagicSize]); got != MagicGB2 {
+		t.Fatalf("magic = %q, want %q", got, MagicGB2)
+	}
+	chunkCount := binary.BigEndian.Uint32(blob[MagicSize : MagicSize+ChunkCountSize])
+	if chunkCount < 2 {
+		t.Fatalf("chunkCount = %d, want >= 2 (content spans multiple chunks)", chunkCount)
+	}
+	// Wire layout per chunk: storedSize (4 bytes) + flags (1 byte) + IV +
+	// ciphertext. The content is highly compressible, so the first chunk
+	// must carry the compressed flag and a storedSize below chunkSize.
+	firstStored := binary.BigEndian.Uint32(blob[MagicSize+ChunkCountSize : MagicSize+2*ChunkCountSize])
+	if int64(firstStored) >= int64(DefaultChunkSize) {
+		t.Fatalf("first chunk storedSize = %d, want < %d for a compressed chunk", firstStored, DefaultChunkSize)
+	}
+	firstFlags := blob[MagicSize+2*ChunkCountSize]
+	if firstFlags != 1 {
+		t.Fatalf("first chunk flags = %d, want 1 (compressed)", firstFlags)
+	}
+	if len(blob) >= len(data) {
+		t.Fatalf("expected compressed blob smaller than plaintext: blob %d bytes, plaintext %d bytes", len(blob), len(data))
+	}
+
+	// Whole-blob decrypt (Decryptor.decryptLargeV2).
+	got, err := DownloadBlob(ctx, store, dec, hash)
+	if err != nil {
+		t.Fatalf("download blob: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("whole-blob decrypt mismatch: got %d bytes, want %d", len(got), len(data))
+	}
+
+	// Streaming decrypt (decryptGB2StreamToFile via DownloadBlobToFile).
+	target := filepath.Join(dir, "restored.txt")
+	if err := DownloadBlobToFile(ctx, store, dec, hash, target, 0644); err != nil {
+		t.Fatalf("download to file: %v", err)
+	}
+	restored, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read restored: %v", err)
+	}
+	if !bytes.Equal(restored, data) {
+		t.Fatalf("stream decrypt mismatch: got %d bytes, want %d", len(restored), len(data))
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log/slog"
 	"os"
@@ -31,34 +32,34 @@ var defaultStreamDecompressor = compress.NewZstdCompressor(1)
 // during large backups of many small files.
 var defaultStreamCompressor = compress.NewZstdCompressor(1)
 
+// UploadBlobFromPath encrypts the file at filePath and stores it under its
+// content hash. The hash is computed in the same pass that reads the file
+// for encryption (single-pass), so the blob key always matches the bytes
+// actually stored even if the source file is modified concurrently.
+//
+// When knownHash is non-empty it is trusted as the expected content hash:
+// the upload short-circuits if the blob already exists, and otherwise the
+// hash computed during the encryption pass is verified against it — a
+// mismatch (file changed since the caller hashed it) fails the upload
+// instead of silently storing content under a stale key.
 func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encryptor, filePath string, knownHash string) (string, error) {
+	// Fast path: the caller already knows the hash, so dedup can be decided
+	// without touching the file at all.
+	if knownHash != "" {
+		exists, err := store.Exists(ctx, knownHash)
+		if err != nil {
+			return "", fmt.Errorf("exists check: %w", err)
+		}
+		if exists {
+			return knownHash, nil
+		}
+	}
+
 	f, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("open: %w", err)
 	}
 	defer func() { _ = f.Close() }()
-
-	var contentHash string
-	if knownHash != "" {
-		contentHash = knownHash
-	} else {
-		h := sha256.New()
-		if _, err := io.Copy(h, f); err != nil {
-			return "", fmt.Errorf("hash: %w", err)
-		}
-		contentHash = hex.EncodeToString(h.Sum(nil))
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return "", fmt.Errorf("seek: %w", err)
-		}
-	}
-
-	exists, err := store.Exists(ctx, contentHash)
-	if err != nil {
-		return "", fmt.Errorf("exists check: %w", err)
-	}
-	if exists {
-		return contentHash, nil
-	}
 
 	info, err := f.Stat()
 	if err != nil {
@@ -68,9 +69,22 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 	compressor := defaultStreamCompressor
 
 	if info.Size() < int64(enc.chunkSize) {
+		// Single read: hash exactly the bytes that get encrypted, so the
+		// blob key can never diverge from the stored content.
 		data, err := io.ReadAll(f)
 		if err != nil {
 			return "", fmt.Errorf("read: %w", err)
+		}
+		contentHash := SHA256Bytes(data)
+		if knownHash != "" && knownHash != contentHash {
+			return "", fmt.Errorf("content changed since hash was computed: expected %s, got %s", knownHash, contentHash)
+		}
+		exists, err := store.Exists(ctx, contentHash)
+		if err != nil {
+			return "", fmt.Errorf("exists check: %w", err)
+		}
+		if exists {
+			return contentHash, nil
 		}
 		if len(data) >= 65536 && !isLikelyIncompressible(filePath) {
 			if compressed, cerr := compressor.Compress(data); cerr == nil && len(compressed) < len(data) {
@@ -95,6 +109,8 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 		return contentHash, nil
 	}
 
+	// Large path: hash the plaintext in the same pass that encrypts it,
+	// writing the ciphertext to a tmp file first.
 	tmpPath := filepath.Join(os.TempDir(), "gbf-tmp-"+uuid.New().String()+".tmp")
 	tmpF, err := os.Create(tmpPath)
 	if err != nil {
@@ -109,8 +125,13 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 	if !isLikelyIncompressible(filePath) {
 		streamCompressor = defaultStreamCompressor
 	}
-	if err := encryptFileToWriter(enc, f, tmpF, streamCompressor); err != nil {
+	h := sha256.New()
+	if err := encryptFileToWriter(enc, f, tmpF, streamCompressor, h); err != nil {
 		return "", fmt.Errorf("stream encrypt: %w", err)
+	}
+	contentHash := hex.EncodeToString(h.Sum(nil))
+	if knownHash != "" && knownHash != contentHash {
+		return "", fmt.Errorf("content changed since hash was computed: expected %s, got %s", knownHash, contentHash)
 	}
 
 	if err := tmpF.Sync(); err != nil {
@@ -131,6 +152,16 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 		return "", fmt.Errorf("stat tmp: %w", err)
 	}
 
+	// Dedup check after the fact: for an unknown hash the only way to know
+	// it is to read the file, which we just did as part of encrypting.
+	exists, err := store.Exists(ctx, contentHash)
+	if err != nil {
+		return "", fmt.Errorf("exists check: %w", err)
+	}
+	if exists {
+		return contentHash, nil
+	}
+
 	if err := store.PutStream(ctx, contentHash, tmpF2, tmpInfo.Size()); err != nil {
 		return "", fmt.Errorf("put stream: %w", err)
 	}
@@ -138,7 +169,11 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 	return contentHash, nil
 }
 
-func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor *compress.ZstdCompressor) error {
+// encryptFileToWriter streams src through the chunked encryptor into dst.
+// If plainHash is non-nil it is fed the plaintext of every chunk exactly as
+// read from src, letting the caller compute the content hash in the same
+// pass as the encryption (no second read of the source).
+func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor *compress.ZstdCompressor, plainHash hash.Hash) error {
 	block, err := aes.NewCipher(enc.key)
 	if err != nil {
 		return fmt.Errorf("aes cipher: %w", err)
@@ -172,7 +207,9 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 		return fmt.Errorf("write count: %w", err)
 	}
 
-	buf := make([]byte, enc.chunkSize)
+	bp := getChunkBuf(enc.chunkSize)
+	defer putChunkBuf(bp)
+	buf := (*bp)[:enc.chunkSize]
 	for i := uint32(0); i < chunkCount; i++ {
 		n, err := io.ReadFull(src, buf)
 		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
@@ -182,6 +219,9 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 			break
 		}
 		chunk := buf[:n]
+		if plainHash != nil {
+			plainHash.Write(chunk)
+		}
 
 		toStore := chunk
 		compressed := false

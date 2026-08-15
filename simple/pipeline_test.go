@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -740,7 +741,7 @@ func TestProcessFileStreaming_CompressesLargeChunks(t *testing.T) {
 		mode:    0644,
 	}
 
-	entry, uploaded, _, _, err := p.processFileStreaming(context.Background(), fe, nil)
+	entry, uploaded, _, _, err := p.processFileStreaming(context.Background(), fe, nil, false)
 	if err != nil {
 		t.Fatalf("processFileStreaming: %v", err)
 	}
@@ -804,7 +805,7 @@ func TestProcessFileStreaming_SkipsCompressionForIncompressible(t *testing.T) {
 		mode:    0644,
 	}
 
-	entry, uploaded, _, _, err := p.processFileStreaming(context.Background(), fe, nil)
+	entry, uploaded, _, _, err := p.processFileStreaming(context.Background(), fe, nil, false)
 	if err != nil {
 		t.Fatalf("processFileStreaming: %v", err)
 	}
@@ -860,7 +861,7 @@ func TestHashFileWithCDC_Basic(t *testing.T) {
 
 	cfg := PipelineConfig{SourceID: 1, SourceName: "test", SourcePath: dir, DeviceID: "dev", Key: make([]byte, 32)}
 	p := NewSimplePipeline(cfg, newMockBlobStore())
-	contentHash, chunks, err := p.hashFileWithCDC(context.Background(), fp, size)
+	contentHash, chunks, _, err := p.hashFileWithCDC(context.Background(), fp, size, false)
 	if err != nil {
 		t.Fatalf("hashFileWithCDC: %v", err)
 	}
@@ -912,7 +913,7 @@ func TestProcessFileStreaming_CDC_DedupsShiftedData(t *testing.T) {
 		mode:    0644,
 	}
 
-	entry1, _, _, _, err := p.processFileStreaming(context.Background(), fe, nil)
+	entry1, _, _, _, err := p.processFileStreaming(context.Background(), fe, nil, false)
 	if err != nil {
 		t.Fatalf("first processFileStreaming: %v", err)
 	}
@@ -936,7 +937,7 @@ func TestProcessFileStreaming_CDC_DedupsShiftedData(t *testing.T) {
 		"file.bin": *entry1,
 	}
 
-	_, uploaded2, _, _, err := p.processFileStreaming(context.Background(), fe2, prevFiles)
+	_, uploaded2, _, _, err := p.processFileStreaming(context.Background(), fe2, prevFiles, false)
 	if err != nil {
 		t.Fatalf("second processFileStreaming: %v", err)
 	}
@@ -974,4 +975,383 @@ func TestCDCEnabled_EnvOverrideEnable(t *testing.T) {
 	if !p.cdcEnabled() {
 		t.Error("expected GINKGO_CDC=1 to enable CDC even when config disables")
 	}
+}
+
+// TestCDCPolynomialGlobalFallbackConcurrent verifies that concurrent
+// SetCDCPolynomial writes and hashFileWithCDC global-fallback reads are
+// race-free (the global is stored atomically). Under -race this test fails
+// against an unsynchronized package-variable implementation.
+func TestCDCPolynomialGlobalFallbackConcurrent(t *testing.T) {
+	t.Setenv("GINKGO_CDC", "1")
+	pol, err := GenerateCDCPolynomial()
+	if err != nil {
+		t.Fatalf("derive polynomial: %v", err)
+	}
+	SetCDCPolynomial(pol)
+
+	dir := t.TempDir()
+	data := make([]byte, 2*1024*1024)
+	rand.New(rand.NewSource(1)).Read(data)
+	fp := filepath.Join(dir, "data.bin")
+	if err := os.WriteFile(fp, data, 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Instance without a per-instance polynomial reads the global fallback.
+	p := &SimplePipeline{}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 25; j++ {
+				SetCDCPolynomial(pol)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				if _, _, _, err := p.hashFileWithCDC(context.Background(), fp, int64(len(data)), false); err != nil {
+					t.Errorf("hashFileWithCDC: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// existsCountingStore wraps mockBlobStore without adding ExistsBatch, so
+// the pipeline must resolve presence through per-hash Exists calls (the
+// fallback path). Counts how many times Exists is invoked.
+type existsCountingStore struct {
+	*mockBlobStore
+	existsCalls int
+}
+
+func (e *existsCountingStore) Exists(ctx context.Context, hash string) (bool, error) {
+	e.existsCalls++
+	return e.mockBlobStore.Exists(ctx, hash)
+}
+
+// batchCountingStore wraps mockBlobStore with an ExistsBatch
+// implementation, counting batch and per-hash calls and recording the last
+// batch it received. batchErr forces the batch call to fail so the
+// fallback path can be exercised through the batch-capable store too.
+type batchCountingStore struct {
+	*mockBlobStore
+	existsCalls int
+	batchCalls  int
+	lastBatch   []string
+	batchErr    error
+}
+
+func (b *batchCountingStore) Exists(ctx context.Context, hash string) (bool, error) {
+	b.existsCalls++
+	return b.mockBlobStore.Exists(ctx, hash)
+}
+
+func (b *batchCountingStore) ExistsBatch(_ context.Context, hashes []string) (map[string]bool, error) {
+	b.batchCalls++
+	b.lastBatch = hashes
+	if b.batchErr != nil {
+		return nil, b.batchErr
+	}
+	result := make(map[string]bool, len(hashes))
+	for _, h := range hashes {
+		_, ok := b.blobs[h]
+		result[h] = ok
+	}
+	return result, nil
+}
+
+func newBatchTestPipeline(t *testing.T, store SimpleBlobStore) *SimplePipeline {
+	t.Helper()
+	return NewSimplePipeline(PipelineConfig{
+		SourceID:   1,
+		SourceName: "test",
+		SourcePath: t.TempDir(),
+		DeviceID:   "dev",
+	}, store)
+}
+
+// TestBlobsExist_BatchPathUsed verifies that a BatchExistencer store
+// answers the whole lookup with a single batch call (no per-hash Exists),
+// that duplicate hashes are collapsed before the call, and that the
+// returned presence map matches the store contents.
+func TestBlobsExist_BatchPathUsed(t *testing.T) {
+	store := &batchCountingStore{mockBlobStore: newMockBlobStore()}
+	h1 := SHA256Bytes([]byte("batch-blob-1"))
+	h2 := SHA256Bytes([]byte("batch-blob-2"))
+	h3 := SHA256Bytes([]byte("batch-blob-3"))
+	store.blobs[h1] = []byte("batch-blob-1")
+	store.blobs[h2] = []byte("batch-blob-2")
+
+	p := newBatchTestPipeline(t, store)
+	got := p.blobsExist(context.Background(), []string{h1, h2, h3, h1})
+
+	if len(got) != 3 {
+		t.Fatalf("result size = %d, want 3 (deduplicated)", len(got))
+	}
+	if !got[h1] || !got[h2] {
+		t.Errorf("present hashes reported missing: h1=%v h2=%v", got[h1], got[h2])
+	}
+	if got[h3] {
+		t.Error("absent hash h3 reported present")
+	}
+	if store.batchCalls != 1 {
+		t.Errorf("batchCalls = %d, want 1", store.batchCalls)
+	}
+	if store.existsCalls != 0 {
+		t.Errorf("existsCalls = %d, want 0 when the batch path succeeds", store.existsCalls)
+	}
+	if len(store.lastBatch) != 3 {
+		t.Errorf("batch received %d hashes, want 3 (duplicates deduplicated)", len(store.lastBatch))
+	}
+}
+
+// TestBlobsExist_FallbackWithoutBatch verifies the per-hash fallback: a
+// store without ExistsBatch gets exactly one Exists call per unique hash
+// and produces the same presence map as the batch path.
+func TestBlobsExist_FallbackWithoutBatch(t *testing.T) {
+	store := &existsCountingStore{mockBlobStore: newMockBlobStore()}
+	h1 := SHA256Bytes([]byte("batch-blob-1"))
+	h2 := SHA256Bytes([]byte("batch-blob-2"))
+	h3 := SHA256Bytes([]byte("batch-blob-3"))
+	store.blobs[h1] = []byte("batch-blob-1")
+	store.blobs[h2] = []byte("batch-blob-2")
+
+	p := newBatchTestPipeline(t, store)
+	got := p.blobsExist(context.Background(), []string{h1, h2, h3, h1})
+
+	if !got[h1] || !got[h2] || got[h3] {
+		t.Fatalf("fallback presence mismatch: h1=%v h2=%v h3=%v", got[h1], got[h2], got[h3])
+	}
+	if store.existsCalls != 3 {
+		t.Errorf("existsCalls = %d, want 3 (one per unique hash)", store.existsCalls)
+	}
+}
+
+// TestBlobsExist_FallbackOnBatchError verifies that a failing batch call
+// degrades to per-hash Exists with identical results instead of failing
+// the backup.
+func TestBlobsExist_FallbackOnBatchError(t *testing.T) {
+	store := &batchCountingStore{mockBlobStore: newMockBlobStore()}
+	store.batchErr = fmt.Errorf("batch rpc failed")
+	h1 := SHA256Bytes([]byte("batch-blob-1"))
+	h3 := SHA256Bytes([]byte("batch-blob-3"))
+	store.blobs[h1] = []byte("batch-blob-1")
+
+	p := newBatchTestPipeline(t, store)
+	got := p.blobsExist(context.Background(), []string{h1, h3})
+
+	if !got[h1] || got[h3] {
+		t.Fatalf("fallback-after-error presence mismatch: h1=%v h3=%v", got[h1], got[h3])
+	}
+	if store.batchCalls != 1 {
+		t.Errorf("batchCalls = %d, want 1", store.batchCalls)
+	}
+	if store.existsCalls != 2 {
+		t.Errorf("existsCalls = %d, want 2 after batch error", store.existsCalls)
+	}
+}
+
+// TestTryUnchangedEntry_ViaBatchStore verifies the chunked-file fast path
+// end to end against a BatchExistencer store: all referenced blobs present
+// yields an "unchanged" entry that preserves the previous chunk list, and a
+// missing blob rejects the fast path so the file is re-uploaded.
+func TestTryUnchangedEntry_ViaBatchStore(t *testing.T) {
+	store := &batchCountingStore{mockBlobStore: newMockBlobStore()}
+	h1 := SHA256Bytes([]byte("chunk-1"))
+	h2 := SHA256Bytes([]byte("chunk-2"))
+	h3 := SHA256Bytes([]byte("chunk-3"))
+	store.blobs[h1] = []byte("chunk-1")
+	store.blobs[h2] = []byte("chunk-2")
+
+	p := newBatchTestPipeline(t, store)
+	fe := scanEntry{relPath: "f.bin", absPath: "/f.bin", size: 2, mtime: "2026-01-01T00:00:00Z", mode: 0644}
+	prev := FileEntry{
+		Name:        "f.bin",
+		ContentHash: "filehash",
+		Chunks:      []ChunkRef{{Hash: h1, Size: 1}, {Hash: h2, Size: 1}},
+	}
+
+	entry, ok := p.tryUnchangedEntry(context.Background(), fe, prev, "filehash")
+	if !ok {
+		t.Fatal("tryUnchangedEntry rejected an entry whose blobs are all present")
+	}
+	if entry.Status != "unchanged" {
+		t.Errorf("Status = %q, want %q", entry.Status, "unchanged")
+	}
+	if len(entry.Chunks) != 2 || entry.Chunks[0].Hash != h1 || entry.Chunks[1].Hash != h2 {
+		t.Errorf("entry.Chunks not preserved from previous manifest: %+v", entry.Chunks)
+	}
+	if store.batchCalls != 1 {
+		t.Errorf("batchCalls = %d, want 1", store.batchCalls)
+	}
+
+	// A missing referenced blob must reject the fast path (re-upload).
+	prev.Chunks = append(prev.Chunks, ChunkRef{Hash: h3, Size: 1})
+	if _, ok := p.tryUnchangedEntry(context.Background(), fe, prev, "filehash"); ok {
+		t.Error("tryUnchangedEntry accepted an entry with a missing blob; want re-upload fallback")
+	}
+}
+
+// TestProcessFile_MissingBlob_ProbesEachHashOnce guards optimization 2
+// (fastPathBlobMissing): when the mtime/size fast path already established
+// that a referenced blob is gone, the streaming path must skip its own
+// tryUnchangedEntry. With K chunks the per-hash Exists count must be
+// exactly 2*K (one probe set in the fast path, one in
+// uploadChangedChunks) — the pre-optimization double tryUnchangedEntry
+// probed 3*K times.
+func TestProcessFile_MissingBlob_ProbesEachHashOnce(t *testing.T) {
+	dir := t.TempDir()
+	store := newMockBlobStore()
+	cfg := PipelineConfig{
+		SourceID:   1,
+		SourceName: "test",
+		SourcePath: dir,
+		DeviceID:   "dev",
+		DisableCDC: true, // fixed 4 MiB chunks: deterministic chunk count
+	}
+	p := NewSimplePipeline(cfg, store)
+
+	content := make([]byte, 8*1024*1024) // exactly 2 fixed chunks
+	rand.New(rand.NewSource(3)).Read(content)
+	fp := writeTestFile(t, dir, "probe.bin", string(content))
+	fe := scanEntry{
+		relPath: "probe.bin",
+		absPath: fp,
+		size:    fileSize(fp),
+		mtime:   fileMtime(fp),
+		mode:    0644,
+	}
+
+	entry1, _, _, _, err := p.processFile(context.Background(), fe, nil)
+	if err != nil {
+		t.Fatalf("first processFile: %v", err)
+	}
+	if entry1 == nil {
+		t.Fatal("first processFile returned nil entry")
+	}
+	if len(entry1.Chunks) != 2 {
+		t.Fatalf("chunks = %d, want 2", len(entry1.Chunks))
+	}
+
+	// Simulate blob loss of the second chunk before the next run.
+	if err := store.Delete(context.Background(), entry1.Chunks[1].Hash); err != nil {
+		t.Fatalf("delete chunk blob: %v", err)
+	}
+	basePuts := store.putCalls // both chunks were stored by the first pass
+
+	counting := &existsCountingStore{mockBlobStore: store}
+	p2 := NewSimplePipeline(cfg, counting)
+	prevFiles := map[string]FileEntry{"probe.bin": *entry1}
+
+	entry2, uploaded, isChanged, isNew, err := p2.processFile(context.Background(), fe, prevFiles)
+	if err != nil {
+		t.Fatalf("second processFile: %v", err)
+	}
+	if entry2 == nil {
+		t.Fatal("second processFile returned nil entry")
+	}
+	if uploaded != int64(4*1024*1024) {
+		t.Errorf("uploaded = %d, want %d (only the missing chunk re-uploaded)", uploaded, 4*1024*1024)
+	}
+	if isChanged || isNew {
+		t.Errorf("isChanged=%v isNew=%v; content is identical, only the blob was missing", isChanged, isNew)
+	}
+	if entry2.ContentHash != entry1.ContentHash {
+		t.Errorf("ContentHash changed: %q -> %q", entry1.ContentHash, entry2.ContentHash)
+	}
+	if store.putCalls-basePuts != 1 {
+		t.Errorf("re-upload Puts = %d, want 1 (single chunk re-upload)", store.putCalls-basePuts)
+	}
+	if counting.existsCalls != 4 {
+		t.Errorf("existsCalls = %d, want 4 (fast path 2 + upload pass 2; the old double tryUnchangedEntry probed 6)", counting.existsCalls)
+	}
+}
+
+// hideBatchStore hides the dynamic ExistsBatch method of the wrapped store
+// so the pipeline takes the per-hash fallback (the pre-batch behavior).
+type hideBatchStore struct{ SimpleBlobStore }
+
+func benchStoreWithBlobs(b *testing.B) (*LocalBlobStore, []string) {
+	b.Helper()
+	store := NewLocalBlobStore(b.TempDir())
+	ctx := context.Background()
+	hashes := make([]string, 64)
+	for i := range hashes {
+		data := []byte(fmt.Sprintf("benchmark blob %03d payload", i))
+		h := SHA256Bytes(data)
+		hashes[i] = h
+		if err := store.Put(ctx, h, data); err != nil {
+			b.Fatalf("seed blob: %v", err)
+		}
+	}
+	return store, hashes
+}
+
+func BenchmarkBlobsExist_LocalBatch(b *testing.B) {
+	store, hashes := benchStoreWithBlobs(b)
+	p := NewSimplePipeline(PipelineConfig{}, store)
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.blobsExist(ctx, hashes)
+	}
+}
+
+func BenchmarkBlobsExist_LocalPerHash(b *testing.B) {
+	store, hashes := benchStoreWithBlobs(b)
+	p := NewSimplePipeline(PipelineConfig{}, hideBatchStore{store})
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.blobsExist(ctx, hashes)
+	}
+}
+
+func benchUploadFile(b *testing.B, retain bool) *LocalBlobStore {
+	b.Helper()
+	store := NewLocalBlobStore(b.TempDir())
+	dir := b.TempDir()
+	content := make([]byte, 10*1024*1024)
+	rand.New(rand.NewSource(5)).Read(content)
+	// .png marks the data as likely incompressible so the benchmark
+	// measures read/hash/upload rather than zstd attempts.
+	fp := filepath.Join(dir, "bench.png")
+	if err := os.WriteFile(fp, content, 0644); err != nil {
+		b.Fatalf("write: %v", err)
+	}
+	p := NewSimplePipeline(PipelineConfig{DisableCDC: true}, store)
+	ctx := context.Background()
+	_, chunks, chunkData, err := p.hashFileWithChunks(ctx, fp, int64(len(content)), retain)
+	if err != nil {
+		b.Fatalf("hash: %v", err)
+	}
+	if !retain {
+		chunkData = nil
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := p.uploadChangedChunks(ctx, fp, int64(len(content)), chunks, chunkData, nil); err != nil {
+			b.Fatalf("upload: %v", err)
+		}
+	}
+	return store
+}
+
+// BenchmarkUploadChangedChunks_InMemory measures the optimized path: the
+// hash pass retained every chunk's plaintext (files <= 32 MiB), so the
+// upload pass neither re-reads nor re-hashes the file.
+func BenchmarkUploadChangedChunks_InMemory(b *testing.B) {
+	benchUploadFile(b, true)
+}
+
+// BenchmarkUploadChangedChunks_ReRead measures the pre-optimization
+// two-pass behavior (still used for files above the threshold): the upload
+// pass re-reads and re-verifies every chunk.
+func BenchmarkUploadChangedChunks_ReRead(b *testing.B) {
+	benchUploadFile(b, false)
 }

@@ -7,10 +7,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEncryptDecryptSmall(t *testing.T) {
@@ -384,6 +386,97 @@ func TestUploadBlobFromPath_SkipsCompressionForIncompressible(t *testing.T) {
 	}
 }
 
+// TestUploadBlobFromPath_HashMatchesStoredContent is the regression test for
+// the single-pass rework of UploadBlobFromPath: the returned hash must be
+// computed over exactly the bytes that were encrypted and stored. This is
+// verified by downloading the blob back and re-hashing the decrypted
+// content. Previously the hash came from a first read of the file and the
+// ciphertext from a second one, so a file modified in between produced a
+// "successful" upload whose blob could never be restored under that key.
+func TestUploadBlobFromPath_HashMatchesStoredContent(t *testing.T) {
+	key := make([]byte, 32)
+	enc := NewEncryptor(key, DefaultChunkSize)
+	dec := NewDecryptor(key, DefaultChunkSize)
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		data []byte
+		ext  string
+	}{
+		// ~120 KiB: exercises the in-memory (small) path, including the
+		// >= 64 KiB compression branch.
+		{"small", bytes.Repeat([]byte("small hash/content invariant "), 4096), ".txt"},
+		// ~8 MiB: exercises the streaming (>= chunkSize) path.
+		{"large_stream", bytes.Repeat([]byte("large hash/content invariant "), 300*1024), ".txt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewLocalBlobStore(t.TempDir())
+			src := filepath.Join(t.TempDir(), "src"+tc.ext)
+			if err := os.WriteFile(src, tc.data, 0644); err != nil {
+				t.Fatalf("write src: %v", err)
+			}
+			hash, err := UploadBlobFromPath(ctx, store, enc, src, "")
+			if err != nil {
+				t.Fatalf("upload: %v", err)
+			}
+			if want := SHA256Bytes(tc.data); hash != want {
+				t.Fatalf("returned hash = %q, want hash of source content %q", hash, want)
+			}
+			got, err := DownloadBlob(ctx, store, dec, hash)
+			if err != nil {
+				t.Fatalf("download (DownloadBlob verifies stored content against key): %v", err)
+			}
+			if !bytes.Equal(got, tc.data) {
+				t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(tc.data))
+			}
+			if SHA256Bytes(got) != hash {
+				t.Fatalf("hash of downloaded content %q != returned hash %q", SHA256Bytes(got), hash)
+			}
+		})
+	}
+}
+
+// TestUploadBlobFromPath_StaleKnownHashRejected covers the knownHash guard:
+// when the caller-supplied hash no longer matches the file's actual content
+// (the file changed between the caller's hash pass and this upload), the
+// upload must fail instead of storing the new content under the stale key.
+func TestUploadBlobFromPath_StaleKnownHashRejected(t *testing.T) {
+	dir := t.TempDir()
+	store := NewLocalBlobStore(dir)
+	key := make([]byte, 32)
+	enc := NewEncryptor(key, DefaultChunkSize)
+	ctx := context.Background()
+
+	small := bytes.Repeat([]byte("v1 content "), 100)
+	src := filepath.Join(dir, "small.txt")
+	if err := os.WriteFile(src, small, 0644); err != nil {
+		t.Fatalf("write small: %v", err)
+	}
+
+	staleHash := SHA256Bytes([]byte("completely different content"))
+	if _, err := UploadBlobFromPath(ctx, store, enc, src, staleHash); err == nil {
+		t.Fatal("expected error for stale knownHash on small path")
+	}
+
+	// A correct knownHash must still upload successfully.
+	freshStore := NewLocalBlobStore(t.TempDir())
+	if _, err := UploadBlobFromPath(ctx, freshStore, enc, src, SHA256Bytes(small)); err != nil {
+		t.Fatalf("upload with correct knownHash: %v", err)
+	}
+
+	// Same guard on the streaming (>= chunkSize) path.
+	large := bytes.Repeat([]byte("v1 large content "), 300*1024)
+	largeSrc := filepath.Join(dir, "large.txt")
+	if err := os.WriteFile(largeSrc, large, 0644); err != nil {
+		t.Fatalf("write large: %v", err)
+	}
+	if _, err := UploadBlobFromPath(ctx, freshStore, enc, largeSrc, staleHash); err == nil {
+		t.Fatal("expected error for stale knownHash on large path")
+	}
+}
+
 func TestPipelineBackupRestore(t *testing.T) {
 	repoDir := t.TempDir()
 	sourceDir := filepath.Join(t.TempDir(), "source")
@@ -401,9 +494,9 @@ func TestPipelineBackupRestore(t *testing.T) {
 		t.Fatalf("init: %v", err)
 	}
 	key, _ := GenerateRandomKey()
-	ManifestDecryptHook = func(encrypted []byte) ([]byte, error) {
+	SetManifestDecryptHook(func(encrypted []byte) ([]byte, error) {
 		return DecryptManifest(encrypted, key)
-	}
+	})
 	store := NewLocalBlobStore(repoDir)
 	ctx := context.Background()
 
@@ -460,9 +553,9 @@ func TestPipelineIncremental(t *testing.T) {
 		t.Fatalf("init: %v", err)
 	}
 	key, _ := GenerateRandomKey()
-	ManifestDecryptHook = func(encrypted []byte) ([]byte, error) {
+	SetManifestDecryptHook(func(encrypted []byte) ([]byte, error) {
 		return DecryptManifest(encrypted, key)
-	}
+	})
 	store := NewLocalBlobStore(repoDir)
 	ctx := context.Background()
 
@@ -607,9 +700,13 @@ func TestLocalBlobStore_RejectsInvalidHash(t *testing.T) {
 			}
 		})
 		t.Run("Exists_"+h, func(t *testing.T) {
+			// Exists must reject malformed hashes like every other blob
+			// operation: reporting (false, nil) would invite callers to
+			// misread "invalid hash" as "blob missing" and retry the
+			// upload, which Put would then reject anyway.
 			exists, err := store.Exists(ctx, h)
-			if err != nil || exists {
-				t.Errorf("Exists(%q) = (%v, %v); want (false, nil)", h, exists, err)
+			if err != ErrInvalidHash || exists {
+				t.Errorf("Exists(%q) = (%v, %v); want (false, ErrInvalidHash)", h, exists, err)
 			}
 		})
 		t.Run("Delete_"+h, func(t *testing.T) {
@@ -732,9 +829,9 @@ func TestRestoreSkipsLockedAndFailedEntries(t *testing.T) {
 		t.Fatalf("init: %v", err)
 	}
 	key, _ := GenerateRandomKey()
-	ManifestDecryptHook = func(encrypted []byte) ([]byte, error) {
+	SetManifestDecryptHook(func(encrypted []byte) ([]byte, error) {
 		return DecryptManifest(encrypted, key)
-	}
+	})
 	store := NewLocalBlobStore(repoDir)
 	ctx := context.Background()
 	enc := NewEncryptor(key, DefaultChunkSize)
@@ -830,9 +927,9 @@ func TestRestoreCreatesEmptyDirectories(t *testing.T) {
 		t.Fatalf("init: %v", err)
 	}
 	key, _ := GenerateRandomKey()
-	ManifestDecryptHook = func(encrypted []byte) ([]byte, error) {
+	SetManifestDecryptHook(func(encrypted []byte) ([]byte, error) {
 		return DecryptManifest(encrypted, key)
-	}
+	})
 	store := NewLocalBlobStore(repoDir)
 	ctx := context.Background()
 
@@ -871,5 +968,191 @@ func TestRestoreCreatesEmptyDirectories(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(restoreDir, "file.txt")); err != nil {
 		t.Fatalf("file.txt not restored: %v", err)
+	}
+}
+
+// TestInMemoryChunkBackup_ModifyDedupAndRestore guards optimization 1a
+// (chunk plaintext retained in memory for files <= 32 MiB): a multi-chunk
+// file must round-trip through backup, zero-upload re-run, tail
+// modification (only the touched chunk re-uploaded), and streaming
+// restore. Fixed chunking keeps the chunk layout deterministic.
+func TestInMemoryChunkBackup_ModifyDedupAndRestore(t *testing.T) {
+	repoDir := t.TempDir()
+	sourceDir := t.TempDir()
+	if err := InitRepo(InitParams{RepoRoot: repoDir, DeviceID: "test"}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	key, _ := GenerateRandomKey()
+	SetManifestDecryptHook(func(encrypted []byte) ([]byte, error) {
+		return DecryptManifest(encrypted, key)
+	})
+	store := NewLocalBlobStore(repoDir)
+	ctx := context.Background()
+
+	// 10 MiB = fixed chunks of 4+4+2 MiB, below inMemoryChunkThreshold.
+	content := make([]byte, 10*1024*1024)
+	rand.New(rand.NewSource(11)).Read(content)
+	fp := filepath.Join(sourceDir, "mem.bin")
+	if err := os.WriteFile(fp, content, 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	cfg := PipelineConfig{
+		RepoRoot:   repoDir,
+		SourceID:   1,
+		SourceName: "test",
+		SourcePath: sourceDir,
+		DeviceID:   "test",
+		Key:        key,
+		DisableCDC: true,
+	}
+
+	result1, err := NewSimplePipeline(cfg, store).Run(ctx)
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if result1.NewFiles != 1 || result1.FailedFiles != 0 {
+		t.Fatalf("first run: new=%d failed=%d, want 1/0", result1.NewFiles, result1.FailedFiles)
+	}
+
+	// Second run with no changes: the mtime fast path plus batch existence
+	// check must report the file unchanged with zero uploaded bytes.
+	result2, err := NewSimplePipeline(cfg, store).Run(ctx)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result2.UnchangedFiles != 1 || result2.UploadedBytes != 0 {
+		t.Fatalf("second run: unchanged=%d uploaded=%d, want 1/0", result2.UnchangedFiles, result2.UploadedBytes)
+	}
+
+	// Rewrite only the final 1 MiB (inside the last 2 MiB chunk) and bump
+	// mtime explicitly so the same-second RFC3339 window cannot hide it.
+	updated := append([]byte(nil), content...)
+	tail := make([]byte, 1024*1024)
+	rand.New(rand.NewSource(12)).Read(tail)
+	copy(updated[len(updated)-len(tail):], tail)
+	if err := os.WriteFile(fp, updated, 0644); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	future := time.Now().Add(3 * time.Second)
+	if err := os.Chtimes(fp, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// Third run: content hash changes, but only the modified last chunk
+	// (2 MiB plaintext) is re-uploaded — the in-memory pass uploads the
+	// exact hashed bytes, and prefix chunks dedup against the store.
+	result3, err := NewSimplePipeline(cfg, store).Run(ctx)
+	if err != nil {
+		t.Fatalf("third run: %v", err)
+	}
+	if result3.ChangedFiles != 1 {
+		t.Fatalf("third run: changed=%d, want 1", result3.ChangedFiles)
+	}
+	if result3.UploadedBytes != int64(2*1024*1024) {
+		t.Fatalf("third run: uploaded=%d, want %d (only the modified chunk)", result3.UploadedBytes, 2*1024*1024)
+	}
+
+	// Restore from the latest manifest and verify byte-exact content —
+	// proves the blobs uploaded from the in-memory pass decrypt back to
+	// exactly what was hashed, and exercises the streaming chunked restore.
+	restoreDir := filepath.Join(t.TempDir(), "restore")
+	restore := NewSimpleRestore(RestoreConfig{
+		RepoRoot:  repoDir,
+		TargetDir: restoreDir,
+		SourceID:  1,
+		DeviceID:  "test",
+		Key:       key,
+		Overwrite: true,
+	}, store)
+	rResult, err := restore.Run(ctx)
+	if err != nil {
+		t.Fatalf("restore run: %v", err)
+	}
+	if rResult.RestoredFiles != 1 {
+		t.Fatalf("restored files: got %d, want 1", rResult.RestoredFiles)
+	}
+	got, err := os.ReadFile(filepath.Join(restoreDir, "mem.bin"))
+	if err != nil {
+		t.Fatalf("read restored file: %v", err)
+	}
+	if !bytes.Equal(got, updated) {
+		t.Fatalf("restored content mismatch: got %d bytes, want %d", len(got), len(updated))
+	}
+}
+
+// TestUploadChangedChunks_ReReadPath_RestoreRoundtrip exercises the
+// two-pass upload path (re-read + per-chunk hash verification, used for
+// files above the in-memory threshold) together with the streaming chunked
+// restore: blobs produced by re-reading the file must restore to the exact
+// original content, chunk by chunk.
+func TestUploadChangedChunks_ReReadPath_RestoreRoundtrip(t *testing.T) {
+	repoDir := t.TempDir()
+	sourceDir := t.TempDir()
+	key, _ := GenerateRandomKey()
+	store := NewLocalBlobStore(repoDir)
+	ctx := context.Background()
+
+	content := make([]byte, 10*1024*1024)
+	rand.New(rand.NewSource(7)).Read(content)
+	fp := filepath.Join(sourceDir, "twopass.bin")
+	if err := os.WriteFile(fp, content, 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	p := NewSimplePipeline(PipelineConfig{
+		SourceID:   1,
+		SourceName: "test",
+		SourcePath: sourceDir,
+		DeviceID:   "test",
+		Key:        key,
+		DisableCDC: true,
+	}, store)
+
+	// Hash without retention and upload through the re-read path.
+	contentHash, chunks, retained, err := p.hashFileWithChunks(ctx, fp, int64(len(content)), false)
+	if err != nil {
+		t.Fatalf("hashFileWithChunks: %v", err)
+	}
+	if len(retained) != 0 {
+		t.Fatalf("retain=false returned %d chunk buffers, want 0", len(retained))
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("chunks = %d, want 3 (10 MiB in 4 MiB fixed chunks)", len(chunks))
+	}
+	uploaded, err := p.uploadChangedChunks(ctx, fp, int64(len(content)), chunks, nil, nil)
+	if err != nil {
+		t.Fatalf("uploadChangedChunks: %v", err)
+	}
+	if uploaded != int64(len(content)) {
+		t.Fatalf("uploaded = %d, want %d", uploaded, len(content))
+	}
+
+	// Stream-restore the resulting chunk list and compare byte-exact.
+	restoreDir := filepath.Join(t.TempDir(), "restore")
+	r := NewSimpleRestore(RestoreConfig{
+		RepoRoot:  repoDir,
+		TargetDir: restoreDir,
+		SourceID:  1,
+		DeviceID:  "test",
+		Key:       key,
+	}, store)
+	entry := FileEntry{
+		Name:        "twopass.bin",
+		ContentHash: contentHash,
+		Size:        int64(len(content)),
+		Mode:        0644,
+		Chunks:      chunks,
+	}
+	target := filepath.Join(restoreDir, "twopass.bin")
+	if err := r.restoreChunkedFile(ctx, entry, target); err != nil {
+		t.Fatalf("restoreChunkedFile: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read restored file: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("restored content mismatch: got %d bytes, want %d", len(got), len(content))
 	}
 }

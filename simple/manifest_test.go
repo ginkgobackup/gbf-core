@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -283,11 +284,11 @@ func TestSaveManifestWithKey(t *testing.T) {
 		t.Fatalf("save with key: %v", err)
 	}
 
-	origHook := ManifestDecryptHook
-	ManifestDecryptHook = func(encrypted []byte) ([]byte, error) {
+	origHook := GetManifestDecryptHook()
+	SetManifestDecryptHook(func(encrypted []byte) ([]byte, error) {
 		return DecryptManifest(encrypted, key)
-	}
-	defer func() { ManifestDecryptHook = origHook }()
+	})
+	defer func() { SetManifestDecryptHook(origHook) }()
 
 	loaded, err := LoadLatestManifest(dir, ManifestPathKey("dev1", "1"))
 	if err != nil {
@@ -374,11 +375,11 @@ func TestLoadManifestFromData(t *testing.T) {
 			t.Fatalf("magic: got %q, want %q", encrypted[:4], GKM1Magic)
 		}
 
-		origHook := ManifestDecryptHook
-		ManifestDecryptHook = func(enc []byte) ([]byte, error) {
+		origHook := GetManifestDecryptHook()
+		SetManifestDecryptHook(func(enc []byte) ([]byte, error) {
 			return DecryptManifest(enc, key)
-		}
-		defer func() { ManifestDecryptHook = origHook }()
+		})
+		defer func() { SetManifestDecryptHook(origHook) }()
 
 		loaded, err := LoadManifestFromData(encrypted)
 		if err != nil {
@@ -398,9 +399,9 @@ func TestLoadManifestFromData(t *testing.T) {
 		compressed, _ := localManifestCompressor.Compress(plaintext)
 		encrypted, _ := EncryptManifest(compressed, key)
 
-		origHook := ManifestDecryptHook
-		ManifestDecryptHook = nil
-		defer func() { ManifestDecryptHook = origHook }()
+		origHook := GetManifestDecryptHook()
+		SetManifestDecryptHook(nil)
+		defer func() { SetManifestDecryptHook(origHook) }()
 
 		_, err = LoadManifestFromData(encrypted)
 		if err == nil {
@@ -1059,17 +1060,17 @@ func TestValidateCloudID(t *testing.T) {
 	}
 
 	invalid := []string{
-		"",                       // empty
-		"/etc/passwd",            // Unix absolute
-		`\windows\system32`,      // Windows absolute (UNC-style prefix)
-		`C:\evil`,                // Windows drive
-		"C:/evil",                // Windows drive with slash
-		"../../evil",             // Unix-style escape
-		`..\..\evil`,             // Windows-style escape (backslash separators)
-		`dev1\..\..\evil`,        // mixed separators
-		"..",                     // bare parent
-		"a/../../../b",           // embedded escape
-		`a\..\b`,                 // backslash-separated parent segment
+		"",                  // empty
+		"/etc/passwd",       // Unix absolute
+		`\windows\system32`, // Windows absolute (UNC-style prefix)
+		`C:\evil`,           // Windows drive
+		"C:/evil",           // Windows drive with slash
+		"../../evil",        // Unix-style escape
+		`..\..\evil`,        // Windows-style escape (backslash separators)
+		`dev1\..\..\evil`,   // mixed separators
+		"..",                // bare parent
+		"a/../../../b",      // embedded escape
+		`a\..\b`,            // backslash-separated parent segment
 	}
 	for _, id := range invalid {
 		if err := validateCloudID(id); err == nil {
@@ -1151,4 +1152,34 @@ func TestSaveManifestSameSecondConflict(t *testing.T) {
 	if _, err := LoadManifestByTimestamp(dir, cloudID, "2026-05-19T10:00:00Z"); err != nil {
 		t.Fatalf("LoadManifestByTimestamp: %v", err)
 	}
+}
+
+// TestManifestDecryptHookConcurrent exercises concurrent Set/Get of the
+// manifest decrypt hook. The hook used to be a plain package variable read
+// by every manifest load; under -race this test fails with a data race on
+// the old unsynchronized implementation.
+func TestManifestDecryptHookConcurrent(t *testing.T) {
+	orig := GetManifestDecryptHook()
+	defer SetManifestDecryptHook(orig)
+
+	hook := func(encrypted []byte) ([]byte, error) { return encrypted, nil }
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				SetManifestDecryptHook(hook)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				if h := GetManifestDecryptHook(); h != nil {
+					_, _ = h(nil)
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

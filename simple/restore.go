@@ -5,7 +5,10 @@ package simple
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -240,6 +243,115 @@ func (r *SimpleRestore) Run(ctx context.Context) (*RestoreResult, error) {
 	return result, nil
 }
 
+// maxChunkBlobSize bounds one chunk blob read during streamed chunked
+// restore. Chunk plaintext never exceeds cdcMaxSize (16 MiB CDC cap; fixed
+// chunks are DefaultChunkSize), and compression is applied before
+// encryption so the ciphertext adds only magic + IV + AEAD tag plus a small
+// expansion margin.
+const maxChunkBlobSize = cdcMaxSize + MagicSize + IVSize + TagSize + (1 << 20)
+
+// readAllBounded reads r into buf (reusing its capacity and growing up to
+// limit) and returns the filled slice. Blobs larger than limit are rejected
+// so a crafted blob cannot force an unbounded allocation.
+func readAllBounded(buf []byte, r io.Reader, limit int) ([]byte, error) {
+	buf = buf[:0]
+	scratch := make([]byte, 128*1024)
+	for {
+		n, rErr := r.Read(scratch)
+		if n > 0 {
+			if len(buf)+n > limit {
+				return buf, fmt.Errorf("blob exceeds max size %d", limit)
+			}
+			if len(buf)+n > cap(buf) {
+				newCap := cap(buf) * 2
+				if newCap < len(buf)+n {
+					newCap = len(buf) + n
+				}
+				grown := make([]byte, len(buf), newCap)
+				copy(grown, buf)
+				buf = grown
+			}
+			buf = append(buf, scratch[:n]...)
+		}
+		if rErr == io.EOF {
+			return buf, nil
+		}
+		if rErr != nil {
+			return buf, rErr
+		}
+	}
+}
+
+// decryptChunkBlobStream decrypts one independently encrypted chunk blob
+// (GB1 magic + IV + AEAD ciphertext, the format uploadChangedChunks writes)
+// from src, verifies the plaintext against expectedHash, and appends it to
+// dst. ctBuf and ptBuf are scratch buffers reused across the chunks of one
+// file: ctBuf holds the raw blob (read via readAllBounded), ptBuf is the
+// AEAD output buffer (gcm.Open appends into it without reallocating).
+// Blobs that don't match the single-blob layout (GB2 containers or legacy
+// ambiguous IVs whose first 4 bytes look like a chunk count) fall back to
+// the full Decrypt path, which tries every interpretation. The possibly
+// grown buffers are returned for the next chunk.
+func decryptChunkBlobStream(dec *Decryptor, src io.Reader, dst io.Writer, expectedHash string, ctBuf, ptBuf []byte) ([]byte, []byte, error) {
+	data, err := readAllBounded(ctBuf, src, maxChunkBlobSize)
+	if err != nil {
+		return data, ptBuf, fmt.Errorf("read chunk blob: %w", err)
+	}
+
+	var plaintext []byte
+	if len(data) > MagicSize+IVSize+TagSize &&
+		string(data[:MagicSize]) == MagicGB1 &&
+		!isChunkCount(data[MagicSize:MagicSize+ChunkCountSize]) {
+		// Single-blob layout: magic + IV + ciphertext. newSmallBlobIV
+		// guarantees the first 4 IV bytes never parse as a chunk count for
+		// blobs written by this engine, so this is the common path.
+		block, bErr := aes.NewCipher(dec.key)
+		if bErr != nil {
+			return data, ptBuf, fmt.Errorf("aes cipher: %w", bErr)
+		}
+		gcm, gErr := cipher.NewGCM(block)
+		if gErr != nil {
+			return data, ptBuf, fmt.Errorf("gcm: %w", gErr)
+		}
+		iv := data[MagicSize : MagicSize+IVSize]
+		ciphertext := data[MagicSize+IVSize:]
+		opened, oErr := gcm.Open(ptBuf[:0], iv, ciphertext, nil)
+		if oErr != nil {
+			// Legacy blob with an ambiguous IV — let Decrypt try both
+			// GB1 interpretations (small and large) like DownloadBlob did.
+			plaintext, err = dec.Decrypt(data)
+			if err != nil {
+				return data, ptBuf, fmt.Errorf("decrypt chunk blob: %w", err)
+			}
+		} else {
+			plaintext = opened
+		}
+	} else {
+		// GB2 container or malformed/legacy layout: full Decrypt semantics.
+		plaintext, err = dec.Decrypt(data)
+		if err != nil {
+			return data, ptBuf, fmt.Errorf("decrypt chunk blob: %w", err)
+		}
+	}
+
+	if defaultStreamDecompressor.IsCompressed(plaintext) {
+		decompressed, dErr := defaultStreamDecompressor.Decompress(plaintext)
+		if dErr != nil {
+			return data, ptBuf, fmt.Errorf("decompress chunk blob: %w", dErr)
+		}
+		plaintext = decompressed
+	}
+
+	actualHash := SHA256Bytes(plaintext)
+	if actualHash != expectedHash {
+		return data, ptBuf, fmt.Errorf("hash mismatch: expected %s, got %s", expectedHash, actualHash)
+	}
+	if _, err := dst.Write(plaintext); err != nil {
+		return data, ptBuf, fmt.Errorf("write chunk: %w", err)
+	}
+	return data, plaintext, nil
+}
+
 func (r *SimpleRestore) restoreChunkedFile(ctx context.Context, file FileEntry, targetPath string) error {
 	dir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -255,18 +367,22 @@ func (r *SimpleRestore) restoreChunkedFile(ctx context.Context, file FileEntry, 
 		_ = os.Remove(tmp)
 	}()
 
+	// Stream chunk blobs: GetStream + per-chunk decrypt straight into the
+	// tmp file. Peak memory is one chunk blob's ciphertext plus its
+	// plaintext (AEAD needs the full chunk), with both scratch buffers
+	// reused across chunks — instead of a full store.Get copy per chunk.
+	// Chunk order, tamper verification (per-chunk SHA-256) and the final
+	// fsync/rename semantics are unchanged.
+	var ctBuf, ptBuf []byte
 	for _, chunk := range file.Chunks {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		plaintext, err := DownloadBlob(ctx, r.store, r.dec, chunk.Hash)
-		if err != nil {
+		if err := r.restoreChunkStream(ctx, chunk.Hash, tmpF, &ctBuf, &ptBuf); err != nil {
 			return fmt.Errorf("download chunk %s: %w", chunk.Hash[:12], err)
 		}
-		if _, err := tmpF.Write(plaintext); err != nil {
-			return fmt.Errorf("write chunk: %w", err)
-		}
 	}
+	ctBuf, ptBuf = nil, nil // drop the scratch buffers before the fsync
 
 	// Apply the source file's mode bits to the staged tmp file. A failure
 	// here is non-fatal — the file content is already written and durable —
@@ -283,4 +399,27 @@ func (r *SimpleRestore) restoreChunkedFile(ctx context.Context, file FileEntry, 
 	}
 
 	return os.Rename(tmp, targetPath)
+}
+
+// restoreChunkStream fetches one chunk blob via GetStream and streams its
+// decryption into dst. If the store cannot stream the blob it falls back
+// to the buffered DownloadBlob path with identical decrypt/verify
+// semantics.
+func (r *SimpleRestore) restoreChunkStream(ctx context.Context, hash string, dst io.Writer, ctBuf, ptBuf *[]byte) error {
+	rc, err := r.store.GetStream(ctx, hash)
+	if err != nil {
+		plaintext, dErr := DownloadBlob(ctx, r.store, r.dec, hash)
+		if dErr != nil {
+			return dErr
+		}
+		if _, wErr := dst.Write(plaintext); wErr != nil {
+			return fmt.Errorf("write chunk: %w", wErr)
+		}
+		return nil
+	}
+	defer func() { _ = rc.Close() }()
+
+	var dErr error
+	*ctBuf, *ptBuf, dErr = decryptChunkBlobStream(r.dec, rc, dst, hash, *ctBuf, *ptBuf)
+	return dErr
 }

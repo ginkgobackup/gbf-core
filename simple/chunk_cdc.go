@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
+	"sync/atomic"
 
 	"github.com/restic/chunker"
 )
@@ -22,19 +22,19 @@ const (
 	cdcMaxSize     = 16 * 1024 * 1024 // 16 MiB
 )
 
-var (
-	cdcPolynomialMu sync.RWMutex
-	cdcPolynomial   chunker.Pol
-)
+// cdcPolynomial is the global fallback CDC polynomial, stored atomically so
+// concurrent pipelines reading the fallback (instances constructed without
+// a per-instance polynomial) never race with SetCDCPolynomial. Pipelines
+// created via NewSimplePipeline carry their own copy and don't read this.
+var cdcPolynomial atomic.Uint64
 
 // SetCDCPolynomial sets the CDC polynomial used for content-defined chunking.
 // This must be called before any backup operation to ensure consistent
 // chunk boundaries across incremental backups. The polynomial should be
-// stored in the repo config and loaded at startup.
+// stored in the repo config and loaded at startup. The store is atomic and
+// safe for concurrent use with pipelines reading the fallback polynomial.
 func SetCDCPolynomial(pol uint64) {
-	cdcPolynomialMu.Lock()
-	cdcPolynomial = chunker.Pol(pol)
-	cdcPolynomialMu.Unlock()
+	cdcPolynomial.Store(pol)
 }
 
 // LoadCDCPolynomial reads the persisted CDC polynomial from the repo config
@@ -68,8 +68,10 @@ func LoadCDCPolynomial(repoRoot string) (chunker.Pol, error) {
 // match the polynomial the repo was initialized with.
 //
 // Kept for backward compatibility; new code should prefer LoadCDCPolynomial
-// and hold the result per-instance — the global write/read pair races when
-// two pipelines targeting different repos run concurrently.
+// and hold the result per-instance — the global is shared state, so two
+// pipelines targeting different repos can still observe each other's
+// polynomial through the fallback read (the access itself is atomic and
+// race-free, but the semantics remain last-writer-wins).
 func LoadCDCPolynomialFromConfig(repoRoot string) error {
 	pol, err := LoadCDCPolynomial(repoRoot)
 	if err != nil {
@@ -100,41 +102,49 @@ func (p *SimplePipeline) cdcEnabled() bool {
 	return !p.cfg.DisableCDC
 }
 
-func (p *SimplePipeline) hashFileWithCDC(ctx context.Context, filePath string, size int64) (string, []ChunkRef, error) {
+// hashFileWithCDC content-hash chunks a file with CDC boundaries. When
+// retain is true each chunk's plaintext is copied out and returned so the
+// upload pass can store the exact hashed bytes without re-reading; the
+// retention is abandoned mid-file if the file grew past
+// inMemoryChunkThreshold since the scan (the chunk hashes stay valid —
+// they describe the bytes actually read). The scratch buffer is pooled.
+func (p *SimplePipeline) hashFileWithCDC(ctx context.Context, filePath string, size int64, retain bool) (string, []ChunkRef, [][]byte, error) {
 	f, err := openFileWithRetry(ctx, filePath)
 	if err != nil {
-		return "", nil, fmt.Errorf("open: %w", err)
+		return "", nil, nil, fmt.Errorf("open: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
 	// Prefer the per-instance polynomial (set in NewSimplePipeline) so that
 	// concurrent pipelines targeting different repos don't clobber each
-	// other. Fall back to the global if the instance wasn't initialized
-	// (e.g. tests constructing SimplePipeline directly without going
-	// through NewSimplePipeline).
+	// other. Fall back to the global (read atomically) if the instance
+	// wasn't initialized (e.g. tests constructing SimplePipeline directly
+	// without going through NewSimplePipeline).
 	pol := p.cdcPolynomial
 	if pol == 0 {
-		cdcPolynomialMu.RLock()
-		pol = cdcPolynomial
-		cdcPolynomialMu.RUnlock()
+		pol = chunker.Pol(cdcPolynomial.Load())
 	}
 	c := chunker.NewWithBoundaries(f, pol, cdcMinSize, cdcMaxSize)
 	c.SetAverageBits(cdcAverageBits)
 
 	h := sha256.New()
 	var chunks []ChunkRef
-	buf := make([]byte, 0, cdcMaxSize)
+	var retained [][]byte
+	retainedBytes := 0
+	bp := getChunkBuf(cdcMaxSize)
+	defer putChunkBuf(bp)
+	buf := (*bp)[:0]
 
 	for {
 		if ctx.Err() != nil {
-			return "", nil, ctx.Err()
+			return "", nil, nil, ctx.Err()
 		}
 		chunk, err := c.Next(buf[:0])
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return "", nil, fmt.Errorf("chunk: %w", err)
+			return "", nil, nil, fmt.Errorf("chunk: %w", err)
 		}
 		data := chunk.Data
 		h.Write(data)
@@ -143,8 +153,22 @@ func (p *SimplePipeline) hashFileWithCDC(ctx context.Context, filePath string, s
 			Hash: hex.EncodeToString(ch[:]),
 			Size: int64(len(data)),
 		})
+		if retain {
+			if retainedBytes+len(data) > inMemoryChunkThreshold {
+				// File grew beyond the threshold since the scan: drop the
+				// retained bytes (the upload pass falls back to re-reading)
+				// but keep hashing to complete the chunk list.
+				retained = nil
+				retain = false
+				continue
+			}
+			cp := make([]byte, len(data))
+			copy(cp, data)
+			retained = append(retained, cp)
+			retainedBytes += len(cp)
+		}
 	}
 
 	contentHash := hex.EncodeToString(h.Sum(nil))
-	return contentHash, chunks, nil
+	return contentHash, chunks, retained, nil
 }

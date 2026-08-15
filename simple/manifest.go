@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -92,6 +93,16 @@ type FileEntry struct {
 
 type FlexTime string
 
+// Timestamp unit detection thresholds for FlexTime.UnmarshalJSON. Values
+// above millisVsMicrosThreshold are treated as microseconds; values above
+// secVsMillisThreshold (and below that) as milliseconds; anything else as
+// seconds. Both constants are exact integers, so comparisons against them
+// are pure int64 arithmetic.
+const (
+	secVsMillisThreshold    int64 = 100_000_000_000     // 1e11: today's epoch millis start with ~1.7
+	millisVsMicrosThreshold int64 = 100_000_000_000_000 // 1e14: today's epoch micros start with ~1.7
+)
+
 func (f *FlexTime) UnmarshalJSON(data []byte) error {
 	if len(data) > 0 && data[0] == '"' {
 		var s string
@@ -113,12 +124,13 @@ func (f *FlexTime) UnmarshalJSON(data []byte) error {
 		//   - seconds   today: ~1.7e9
 		//   - millis    today: ~1.7e12
 		//   - micros    today: ~1.7e15
-		// With iv > 1e14 we must be looking at microseconds (a 2024 millis
-		// value ~1.7e12 would otherwise be misread as µs and land in 1970).
-		// With iv > 1e11 (and <= 1e14) we must be looking at millis.
-		if iv > 1e14 {
+		// Above millisVsMicrosThreshold we must be looking at microseconds
+		// (a 2024 millis value ~1.7e12 would otherwise be misread as µs and
+		// land in 1970). Above secVsMillisThreshold (and <= 1e14) we must be
+		// looking at millis.
+		if iv > millisVsMicrosThreshold {
 			s = time.UnixMicro(iv).UTC().Format(time.RFC3339Nano)
-		} else if iv > 1e11 {
+		} else if iv > secVsMillisThreshold {
 			s = time.UnixMilli(iv).UTC().Format(time.RFC3339Nano)
 		} else {
 			s = time.Unix(iv, 0).UTC().Format(time.RFC3339Nano)
@@ -438,10 +450,37 @@ func ResolveCloudID(deviceID string, sourceID int64) string {
 // Chunks still use the 4 MiB default via defaultStreamDecompressor.
 var localManifestCompressor = compress.NewZstdCompressorWithLimit(1, compress.MaxManifestDecompressedSize, compress.ErrManifestDecompressedTooLarge)
 
+// manifestDecryptHook atomically stores the manifest decryption hook so
+// concurrent pipelines can load (and decrypt) manifests while the hook is
+// being registered, e.g. during startup. It is the single source of truth
+// for LoadManifestFromData and extractHashesFromManifestFile.
+var manifestDecryptHook atomic.Pointer[func(encrypted []byte) ([]byte, error)]
+
+// ManifestDecryptHook is kept for backward compatibility with code that
+// references the variable directly. It is no longer read or written by this
+// package: assigning to it has no effect and unsynchronized direct access
+// from multiple goroutines is a data race. Use SetManifestDecryptHook to
+// register a hook and GetManifestDecryptHook to read the current one — both
+// are safe for concurrent use.
+//
+// Deprecated: use SetManifestDecryptHook / GetManifestDecryptHook.
 var ManifestDecryptHook func(encrypted []byte) ([]byte, error)
 
-func SetManifestDecryptHook(fn func([]byte) ([]byte, error)) {
-	ManifestDecryptHook = fn
+// SetManifestDecryptHook atomically registers the hook used to decrypt
+// GKM1-encrypted manifests. Passing nil clears the hook. Safe for concurrent
+// use with manifest loading.
+func SetManifestDecryptHook(fn func(encrypted []byte) ([]byte, error)) {
+	manifestDecryptHook.Store(&fn)
+}
+
+// GetManifestDecryptHook returns the currently registered manifest
+// decryption hook, or nil if none is set. Safe for concurrent use.
+func GetManifestDecryptHook() func(encrypted []byte) ([]byte, error) {
+	fn := manifestDecryptHook.Load()
+	if fn == nil {
+		return nil
+	}
+	return *fn
 }
 
 func ManifestFilePath(metaDir string, cloudID string, ts time.Time, deviceID string) string {
@@ -544,6 +583,19 @@ func manifestChecksumPath(manifestPath string) string {
 }
 
 func verifyManifestChecksum(manifestPath string, data []byte) error {
+	// GKM1-encrypted manifests carry their own integrity protection via
+	// AES-256-GCM authentication. When the .sha256 sidecar is missing
+	// (common in mesh-backup peer-receive repos where manifests are
+	// uploaded as opaque blobs without their sidecar checksum files),
+	// the GCM tag is sufficient to detect tampering. Skip the sidecar
+	// requirement for encrypted manifests so they can be loaded.
+	if len(data) >= MagicSize && string(data[:MagicSize]) == GKM1Magic {
+		checksumPath := manifestChecksumPath(manifestPath)
+		if _, err := os.Stat(checksumPath); os.IsNotExist(err) {
+			return nil
+		}
+		// Sidecar exists — verify it for defense in depth.
+	}
 	checksumPath := manifestChecksumPath(manifestPath)
 	expectedBytes, err := os.ReadFile(checksumPath)
 	if err != nil {
@@ -582,11 +634,12 @@ func LoadManifest(path string) (*Manifest, error) {
 
 func LoadManifestFromData(data []byte) (*Manifest, error) {
 	if len(data) >= MagicSize && string(data[:MagicSize]) == GKM1Magic {
-		if ManifestDecryptHook == nil {
+		hook := GetManifestDecryptHook()
+		if hook == nil {
 			return nil, fmt.Errorf("manifest is encrypted (GKM1) but no decrypt hook registered")
 		}
 		var err error
-		data, err = ManifestDecryptHook(data)
+		data, err = hook(data)
 		if err != nil {
 			return nil, fmt.Errorf("decrypt manifest: %w", err)
 		}
@@ -658,15 +711,67 @@ func isManifestFile(name string) bool {
 	return strings.HasSuffix(name, ".json.zst") || strings.HasSuffix(name, ".json")
 }
 
-func ManifestExistsByTimestamp(metaDir string, cloudID string, unixSec int64) bool {
-	dir := ManifestDir(metaDir, cloudID)
+// readManifestDirEntries returns the non-directory entries of dir in ReadDir
+// order. The raw os.ReadDir error is passed through so each caller keeps its
+// own missing-directory semantics (not-found sentinel, empty result, or
+// plain error).
+func readManifestDirEntries(dir string) ([]os.DirEntry, error) {
 	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var files []os.DirEntry
+	for _, e := range entries {
+		if !e.IsDir() {
+			files = append(files, e)
+		}
+	}
+	return files, nil
+}
+
+// readManifestFiles is readManifestDirEntries restricted to entries whose
+// names pass isManifestFile.
+func readManifestFiles(dir string) ([]os.DirEntry, error) {
+	entries, err := readManifestDirEntries(dir)
+	if err != nil {
+		return nil, err
+	}
+	var files []os.DirEntry
+	for _, e := range entries {
+		if isManifestFile(e.Name()) {
+			files = append(files, e)
+		}
+	}
+	return files, nil
+}
+
+// forEachManifest loads every entry (as returned by readManifestFiles) and
+// hands the parsed manifest to fn; iteration stops early once fn returns
+// true. Load failures are accumulated as "name: error" strings and returned
+// so callers keep their own error-reporting behavior.
+func forEachManifest(dir string, entries []os.DirEntry, fn func(m *Manifest, name string) bool) []string {
+	var loadErrors []string
+	for _, e := range entries {
+		m, err := LoadManifest(filepath.Join(dir, e.Name()))
+		if err != nil {
+			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", e.Name(), err))
+			continue
+		}
+		if fn(m, e.Name()) {
+			break
+		}
+	}
+	return loadErrors
+}
+
+func ManifestExistsByTimestamp(metaDir string, cloudID string, unixSec int64) bool {
+	entries, err := readManifestFiles(ManifestDir(metaDir, cloudID))
 	if err != nil {
 		return false
 	}
 	prefix := fmt.Sprintf("%d_", unixSec)
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasPrefix(e.Name(), prefix) && isManifestFile(e.Name()) {
+		if strings.HasPrefix(e.Name(), prefix) {
 			return true
 		}
 	}
@@ -679,7 +784,7 @@ func LoadManifestByTimestamp(metaDir string, cloudID string, timestamp string) (
 		return nil, fmt.Errorf("parse timestamp %q: %w", timestamp, err)
 	}
 	dir := ManifestDir(metaDir, cloudID)
-	entries, err := os.ReadDir(dir)
+	entries, err := readManifestDirEntries(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrManifestNotFound
@@ -688,7 +793,7 @@ func LoadManifestByTimestamp(metaDir string, cloudID string, timestamp string) (
 	}
 	prefix := fmt.Sprintf("%d_", ts.Unix())
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+		if !strings.HasPrefix(e.Name(), prefix) {
 			continue
 		}
 		return LoadManifest(filepath.Join(dir, e.Name()))
@@ -698,31 +803,58 @@ func LoadManifestByTimestamp(metaDir string, cloudID string, timestamp string) (
 
 func LoadLatestManifest(metaDir string, cloudID string) (*Manifest, error) {
 	dir := ManifestDir(metaDir, cloudID)
-	entries, err := os.ReadDir(dir)
+	entries, err := readManifestFiles(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrManifestNotFound
 		}
 		return nil, fmt.Errorf("readdir: %w", err)
 	}
-	if len(entries) == 0 {
-		return nil, ErrManifestNotFound
+
+	type candidate struct {
+		name    string
+		unixSec int64
+		modNano int64
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name() > entries[j].Name()
-	})
+	var candidates []candidate
 	for _, e := range entries {
-		if e.IsDir() || !isManifestFile(e.Name()) {
+		ts, parseErr := ParseManifestFilenameTimestamp(e.Name())
+		if parseErr != nil {
 			continue
 		}
-		return LoadManifest(filepath.Join(dir, e.Name()))
+		var unixSec int64
+		if t, pErr := time.Parse(time.RFC3339, ts); pErr == nil {
+			unixSec = t.Unix()
+		}
+		var modNano int64
+		if info, iErr := e.Info(); iErr == nil {
+			modNano = info.ModTime().UnixNano()
+		}
+		candidates = append(candidates, candidate{name: e.Name(), unixSec: unixSec, modNano: modNano})
 	}
-	return nil, ErrManifestNotFound
+	if len(candidates) == 0 {
+		return nil, ErrManifestNotFound
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].unixSec != candidates[j].unixSec {
+			return candidates[i].unixSec > candidates[j].unixSec
+		}
+		// Same-second conflicts carry a random 6-hex suffix (see
+		// SaveManifestWithKey), so filename order within one second is
+		// arbitrary. Tie-break on file modification time, which reflects
+		// the actual write order; the name stays as the final tie-break
+		// for filesystems with coarse mtime granularity.
+		if candidates[i].modNano != candidates[j].modNano {
+			return candidates[i].modNano > candidates[j].modNano
+		}
+		return candidates[i].name > candidates[j].name
+	})
+	return LoadManifest(filepath.Join(dir, candidates[0].name))
 }
 
 func ListManifests(metaDir string, cloudID string) ([]*Manifest, []string, error) {
 	dir := ManifestDir(metaDir, cloudID)
-	entries, err := os.ReadDir(dir)
+	entries, err := readManifestFiles(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil, nil
@@ -730,18 +862,10 @@ func ListManifests(metaDir string, cloudID string) ([]*Manifest, []string, error
 		return nil, nil, fmt.Errorf("readdir: %w", err)
 	}
 	var result []*Manifest
-	var loadErrors []string
-	for _, e := range entries {
-		if e.IsDir() || !isManifestFile(e.Name()) {
-			continue
-		}
-		m, err := LoadManifest(filepath.Join(dir, e.Name()))
-		if err != nil {
-			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", e.Name(), err))
-			continue
-		}
+	loadErrors := forEachManifest(dir, entries, func(m *Manifest, _ string) bool {
 		result = append(result, m)
-	}
+		return false
+	})
 	if len(loadErrors) > 0 {
 		slog.Warn("GBF manifest load errors during ListManifests",
 			"component", "manifest",
@@ -758,7 +882,7 @@ func ListManifests(metaDir string, cloudID string) ([]*Manifest, []string, error
 
 func ListManifestTimestamps(metaDir string, cloudID string) ([]string, error) {
 	dir := ManifestDir(metaDir, cloudID)
-	entries, err := os.ReadDir(dir)
+	entries, err := readManifestFiles(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -767,9 +891,6 @@ func ListManifestTimestamps(metaDir string, cloudID string) ([]string, error) {
 	}
 	var result []string
 	for _, e := range entries {
-		if e.IsDir() || !isManifestFile(e.Name()) {
-			continue
-		}
 		ts, parseErr := ParseManifestFilenameTimestamp(e.Name())
 		if parseErr != nil {
 			continue
@@ -800,34 +921,7 @@ func ParseManifestFilenameTimestamp(filename string) (string, error) {
 }
 
 func DeleteManifest(metaDir string, cloudID string, timestamp, deviceID string) error {
-	dir := ManifestDir(metaDir, cloudID)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("readdir: %w", err)
-	}
-	var loadErrors []string
-	for _, e := range entries {
-		if e.IsDir() || !isManifestFile(e.Name()) {
-			continue
-		}
-		m, err := LoadManifest(filepath.Join(dir, e.Name()))
-		if err != nil {
-			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", e.Name(), err))
-			continue
-		}
-		if m.Timestamp == timestamp && m.DeviceID == deviceID {
-			manifestPath := filepath.Join(dir, e.Name())
-			_ = os.Remove(manifestChecksumPath(manifestPath))
-			return os.Remove(manifestPath)
-		}
-	}
-	if len(loadErrors) > 0 {
-		slog.Warn("GBF manifest load errors during DeleteManifest",
-			"component", "manifest",
-			"cloud_id", cloudID,
-			"errors", loadErrors)
-	}
-	return fmt.Errorf("manifest not found: %s/%s", timestamp, deviceID)
+	return deleteOrTrashManifest(metaDir, cloudID, timestamp, deviceID, false)
 }
 
 func ManifestTrashDir(metaDir string, cloudID string) string {
@@ -835,28 +929,35 @@ func ManifestTrashDir(metaDir string, cloudID string) string {
 }
 
 func TrashManifest(metaDir string, cloudID string, timestamp, deviceID string) error {
+	return deleteOrTrashManifest(metaDir, cloudID, timestamp, deviceID, true)
+}
+
+// deleteOrTrashManifest finds the manifest matching timestamp+deviceID and
+// either deletes it (together with its checksum sidecar) or moves it to the
+// source's trash directory. The two operations share every step except the
+// final remove vs rename.
+func deleteOrTrashManifest(metaDir string, cloudID string, timestamp, deviceID string, trash bool) error {
 	srcDir := ManifestDir(metaDir, cloudID)
-	entries, err := os.ReadDir(srcDir)
+	entries, err := readManifestFiles(srcDir)
 	if err != nil {
 		return fmt.Errorf("readdir: %w", err)
 	}
-	var loadErrors []string
-	for _, e := range entries {
-		if e.IsDir() || !isManifestFile(e.Name()) {
-			continue
-		}
-		m, err := LoadManifest(filepath.Join(srcDir, e.Name()))
-		if err != nil {
-			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", e.Name(), err))
-			continue
-		}
+	var matched string
+	loadErrors := forEachManifest(srcDir, entries, func(m *Manifest, name string) bool {
 		if m.Timestamp == timestamp && m.DeviceID == deviceID {
+			matched = name
+			return true
+		}
+		return false
+	})
+	if matched != "" {
+		srcPath := filepath.Join(srcDir, matched)
+		if trash {
 			dstDir := ManifestTrashDir(metaDir, cloudID)
 			if err := os.MkdirAll(dstDir, 0755); err != nil {
 				return fmt.Errorf("create trash dir: %w", err)
 			}
-			srcPath := filepath.Join(srcDir, e.Name())
-			dstPath := filepath.Join(dstDir, e.Name())
+			dstPath := filepath.Join(dstDir, matched)
 			if err := renameWithFallback(srcPath, dstPath); err != nil {
 				return err
 			}
@@ -867,9 +968,15 @@ func TrashManifest(metaDir string, cloudID string, timestamp, deviceID string) e
 			}
 			return nil
 		}
+		_ = os.Remove(manifestChecksumPath(srcPath))
+		return os.Remove(srcPath)
 	}
 	if len(loadErrors) > 0 {
-		slog.Warn("GBF manifest load errors during TrashManifest",
+		action := "DeleteManifest"
+		if trash {
+			action = "TrashManifest"
+		}
+		slog.Warn("GBF manifest load errors during "+action,
 			"component", "manifest",
 			"cloud_id", cloudID,
 			"errors", loadErrors)
@@ -949,63 +1056,55 @@ func isCrossDeviceError(err error) bool {
 }
 
 func TrashAllSourceManifests(metaDir string, cloudID string) (int, error) {
-	srcDir := ManifestDir(metaDir, cloudID)
-	entries, err := os.ReadDir(srcDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("readdir: %w", err)
-	}
-	dstDir := ManifestTrashDir(metaDir, cloudID)
-	if err := os.MkdirAll(dstDir, 0755); err != nil {
-		return 0, fmt.Errorf("create trash dir: %w", err)
-	}
-	moved := 0
-	for _, e := range entries {
-		if e.IsDir() || !isManifestFile(e.Name()) {
-			continue
-		}
-		srcPath := filepath.Join(srcDir, e.Name())
-		dstPath := filepath.Join(dstDir, e.Name())
-		if err := renameWithFallback(srcPath, dstPath); err != nil {
-			slog.Warn("trash manifest move failed", "component", "manifest", "file", e.Name(), "error", err)
-			continue
-		}
-		moved++
-	}
-	remaining, _ := os.ReadDir(srcDir)
-	if len(remaining) == 0 {
-		_ = os.Remove(srcDir)
-	}
-	return moved, nil
+	return deleteOrTrashAllManifests(metaDir, cloudID, true)
 }
 
 func DeleteAllSourceManifests(metaDir string, cloudID string) (int, error) {
+	return deleteOrTrashAllManifests(metaDir, cloudID, false)
+}
+
+// deleteOrTrashAllManifests moves (trash) or deletes every manifest of a
+// source, then removes the now-empty source directory.
+func deleteOrTrashAllManifests(metaDir string, cloudID string, trash bool) (int, error) {
 	srcDir := ManifestDir(metaDir, cloudID)
-	entries, err := os.ReadDir(srcDir)
+	entries, err := readManifestFiles(srcDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("readdir: %w", err)
 	}
-	deleted := 0
+	var dstDir string
+	if trash {
+		dstDir = ManifestTrashDir(metaDir, cloudID)
+		if err := os.MkdirAll(dstDir, 0755); err != nil {
+			return 0, fmt.Errorf("create trash dir: %w", err)
+		}
+	}
+	count := 0
 	for _, e := range entries {
-		if e.IsDir() || !isManifestFile(e.Name()) {
+		srcPath := filepath.Join(srcDir, e.Name())
+		var opErr error
+		if trash {
+			opErr = renameWithFallback(srcPath, filepath.Join(dstDir, e.Name()))
+		} else {
+			opErr = os.Remove(srcPath)
+		}
+		if opErr != nil {
+			if trash {
+				slog.Warn("trash manifest move failed", "component", "manifest", "file", e.Name(), "error", opErr)
+			} else {
+				slog.Warn("delete manifest failed", "component", "manifest", "file", e.Name(), "error", opErr)
+			}
 			continue
 		}
-		if err := os.Remove(filepath.Join(srcDir, e.Name())); err != nil {
-			slog.Warn("delete manifest failed", "component", "manifest", "file", e.Name(), "error", err)
-			continue
-		}
-		deleted++
+		count++
 	}
 	remaining, _ := os.ReadDir(srcDir)
 	if len(remaining) == 0 {
 		_ = os.Remove(srcDir)
 	}
-	return deleted, nil
+	return count, nil
 }
 
 func DeleteSourceRegistry(metaDir string, cloudID string) error {
@@ -1062,7 +1161,7 @@ func ListTrashSourceIDs(metaDir string) ([]string, error) {
 
 func CleanTrashManifestsForSource(metaDir string, cloudID string, maxAge time.Duration) (int, error) {
 	dir := ManifestTrashDir(metaDir, cloudID)
-	entries, err := os.ReadDir(dir)
+	entries, err := readManifestDirEntries(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
@@ -1072,9 +1171,6 @@ func CleanTrashManifestsForSource(metaDir string, cloudID string, maxAge time.Du
 	now := time.Now()
 	cleaned := 0
 	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
 		info, statErr := e.Info()
 		if statErr != nil {
 			continue
@@ -1105,7 +1201,7 @@ func cleanTrashSourceRegistry(metaDir string, cloudID string) {
 
 func ListTrashManifests(metaDir string, cloudID string) ([]*Manifest, []string, error) {
 	dir := ManifestTrashDir(metaDir, cloudID)
-	entries, err := os.ReadDir(dir)
+	entries, err := readManifestFiles(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil, nil
@@ -1113,18 +1209,10 @@ func ListTrashManifests(metaDir string, cloudID string) ([]*Manifest, []string, 
 		return nil, nil, fmt.Errorf("readdir: %w", err)
 	}
 	var result []*Manifest
-	var loadErrors []string
-	for _, e := range entries {
-		if e.IsDir() || !isManifestFile(e.Name()) {
-			continue
-		}
-		m, err := LoadManifest(filepath.Join(dir, e.Name()))
-		if err != nil {
-			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", e.Name(), err))
-			continue
-		}
+	loadErrors := forEachManifest(dir, entries, func(m *Manifest, _ string) bool {
 		result = append(result, m)
-	}
+		return false
+	})
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].Timestamp > result[j].Timestamp
 	})
@@ -1185,7 +1273,7 @@ func CollectAliveHashes(manifests []*Manifest) map[string]bool {
 
 func CollectAliveHashesStreaming(metaDir string, cloudID string) (map[string]bool, []string, error) {
 	dir := ManifestDir(metaDir, cloudID)
-	entries, err := os.ReadDir(dir)
+	entries, err := readManifestFiles(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return make(map[string]bool), nil, nil
@@ -1196,9 +1284,6 @@ func CollectAliveHashesStreaming(metaDir string, cloudID string) (map[string]boo
 	alive := make(map[string]bool)
 	var loadErrors []string
 	for _, e := range entries {
-		if e.IsDir() || !isManifestFile(e.Name()) {
-			continue
-		}
 		hashes, err := extractHashesFromManifestFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", e.Name(), err))
@@ -1220,10 +1305,11 @@ func extractHashesFromManifestFile(path string) ([]string, error) {
 		return nil, err
 	}
 	if len(data) >= MagicSize && string(data[:MagicSize]) == GKM1Magic {
-		if ManifestDecryptHook == nil {
+		hook := GetManifestDecryptHook()
+		if hook == nil {
 			return nil, fmt.Errorf("manifest is encrypted (GKM1) but no decrypt hook registered")
 		}
-		data, err = ManifestDecryptHook(data)
+		data, err = hook(data)
 		if err != nil {
 			return nil, fmt.Errorf("decrypt manifest: %w", err)
 		}

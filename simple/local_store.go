@@ -242,9 +242,13 @@ func (s *LocalBlobStore) GetStream(ctx context.Context, hash string) (io.ReadClo
 	return os.Open(s.resolveBlobPath(hash))
 }
 
+// Exists reports whether the blob identified by hash is present in the
+// store. Like Put/Get/Delete/GetStream it returns ErrInvalidHash for a
+// malformed hash: callers must not treat that as "blob missing" and retry
+// the upload — the subsequent Put would fail with the same error anyway.
 func (s *LocalBlobStore) Exists(ctx context.Context, hash string) (bool, error) {
 	if !validateHash(hash) {
-		return false, nil
+		return false, ErrInvalidHash
 	}
 	s.existsMu.RLock()
 	if s.existsSet[hash] {
@@ -264,6 +268,50 @@ func (s *LocalBlobStore) Exists(ctx context.Context, hash string) (bool, error) 
 		return false, nil
 	}
 	return false, err
+}
+
+// ExistsBatch implements BatchExistencer. It resolves the whole batch with a
+// single RLock pass over the in-memory exists cache, stats only the misses
+// (without holding the lock across filesystem calls), and merges the found
+// hashes back under one Lock — replacing one lock+stat per hash with one
+// lock pass + N stats + one lock.
+func (s *LocalBlobStore) ExistsBatch(ctx context.Context, hashes []string) (map[string]bool, error) {
+	result := make(map[string]bool, len(hashes))
+	var missing []string
+	s.existsMu.RLock()
+	for _, h := range hashes {
+		if !validateHash(h) {
+			s.existsMu.RUnlock()
+			return nil, ErrInvalidHash
+		}
+		if s.existsSet[h] {
+			result[h] = true
+		} else {
+			missing = append(missing, h)
+		}
+	}
+	s.existsMu.RUnlock()
+
+	var found []string
+	for _, h := range missing {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if _, err := os.Stat(s.blobPath(h)); err == nil {
+			result[h] = true
+			found = append(found, h)
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+	if len(found) > 0 {
+		s.existsMu.Lock()
+		for _, h := range found {
+			s.existsSet[h] = true
+		}
+		s.existsMu.Unlock()
+	}
+	return result, nil
 }
 
 func (s *LocalBlobStore) WarmExistsCache(ctx context.Context) error {

@@ -26,6 +26,57 @@ import (
 	"github.com/restic/chunker"
 )
 
+// inMemoryChunkThreshold is the maximum file size for which the hash pass
+// retains each chunk's plaintext in memory so the upload pass can encrypt
+// and store the exact bytes that were hashed (no second read, no second
+// hash). Larger files keep the two-pass streaming behavior. Memory upper
+// bound: workerCount × threshold (default 8 workers × 32 MiB = 256 MiB
+// worst case, and only when all workers simultaneously process large
+// files); the retained slices are released as soon as the upload finishes.
+const inMemoryChunkThreshold = 32 << 20
+
+// Two size classes cover every buffer the streaming paths allocate:
+// DefaultChunkSize (4 MiB fixed-chunk buffers) and cdcMaxSize (16 MiB CDC
+// buffers). Buffers whose capacity matches neither class (custom chunk
+// sizes) are dropped for GC instead of pooled. Pool entries are *[]byte so
+// the slice header itself is not copied on Put/Get.
+var (
+	smallChunkBufPool = sync.Pool{New: func() any { b := make([]byte, DefaultChunkSize); return &b }}
+	largeChunkBufPool = sync.Pool{New: func() any { b := make([]byte, cdcMaxSize); return &b }}
+)
+
+// getChunkBuf returns a buffer (as a pointer, len == 0) with capacity >=
+// minCap. Callers slice it to the size they need and must not retain any
+// slice of it past putChunkBuf.
+func getChunkBuf(minCap int) *[]byte {
+	switch {
+	case minCap <= DefaultChunkSize:
+		return smallChunkBufPool.Get().(*[]byte)
+	case minCap <= cdcMaxSize:
+		return largeChunkBufPool.Get().(*[]byte)
+	default:
+		b := make([]byte, minCap)
+		return &b
+	}
+}
+
+// putChunkBuf returns a buffer to its pool after truncating the slice so
+// the pooled entry holds no logical data. Callers must have released every
+// reference to the buffer's contents (compression/AEAD helpers all copy).
+func putChunkBuf(b *[]byte) {
+	if b == nil {
+		return
+	}
+	switch cap(*b) {
+	case DefaultChunkSize:
+		*b = (*b)[:0]
+		smallChunkBufPool.Put(b)
+	case cdcMaxSize:
+		*b = (*b)[:0]
+		largeChunkBufPool.Put(b)
+	}
+}
+
 type PipelineConfig struct {
 	RepoRoot   string
 	SourceID   int64
@@ -148,18 +199,8 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	result := &PipelineResult{}
 	metaDir := MetaDir(p.cfg.RepoRoot)
 
-	// Load the per-repo CDC polynomial so chunk boundaries match what was
-	// persisted at init time. Without this, incremental backups would compute
-	// different chunk hashes against a different polynomial and re-upload
-	// everything. The polynomial is bound to this pipeline instance (set
-	// before any worker goroutine starts) — never via the package global,
-	// which races when pipelines for different repos run concurrently.
-	pol, err := LoadCDCPolynomial(p.cfg.RepoRoot)
-	if err != nil {
-		return nil, fmt.Errorf("load cdc polynomial: %w", err)
-	}
-	if p.cdcPolynomial == 0 {
-		p.cdcPolynomial = pol
+	if err := p.ensureCDCPolynomial(); err != nil {
+		return nil, err
 	}
 
 	slog.Info("GBF pipeline starting", "source_id", p.cfg.SourceID, "source", p.cfg.SourceName, "repo", p.cfg.RepoRoot, "source_path", p.cfg.SourcePath, "scan_path", p.cfg.ScanPath, "session_id", p.cfg.SessionID)
@@ -168,20 +209,122 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	if p.cfg.ScanPath != "" {
 		scanPath = p.cfg.ScanPath
 	}
-	ignorePatterns := fsutil.LoadIgnoreFile(scanPath)
-	merged := fsutil.MergeExcludes(p.cfg.Excludes, ignorePatterns)
-	p.posExcludes, p.negExcludes, p.sizeFilters = fsutil.SplitExcludePatterns(merged)
+	p.loadExcludePatterns(scanPath)
 
 	if p.progress != nil {
 		p.progress.SetPhase(PhaseScanning)
 	}
+	p.warmStoreCache(ctx)
 
+	cloudID := ResolveCloudID(p.cfg.DeviceID, p.cfg.SourceID)
+	prevFiles, err := p.loadPreviousFiles(metaDir, cloudID)
+	if err != nil {
+		return nil, err
+	}
+
+	newManifest := NewManifest(p.cfg.SourceID, cloudID, p.cfg.SourceName, p.cfg.SourcePath, p.cfg.DeviceID)
+
+	if p.progress != nil {
+		p.progress.SetPhase(PhaseUploading)
+	}
+
+	files, dirEntries, err := p.scanSourceTree(ctx, scanPath)
+	if err != nil {
+		return nil, err
+	}
+
+	addEmptyDirs(newManifest, files, dirEntries)
+
+	var totalSourceSize int64
+	for _, fe := range files {
+		totalSourceSize += fe.size
+	}
+	slog.Info("GBF source size", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "total_bytes", totalSourceSize, "session_id", p.cfg.SessionID)
+
+	if p.progress != nil {
+		p.progress.SetTotal(len(files), totalSourceSize)
+	}
+
+	stats := p.runUploadWorkers(ctx, files, prevFiles, newManifest)
+
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	result.NewFiles = stats.newFiles
+	result.ChangedFiles = stats.changedFiles
+	result.UnchangedFiles = stats.unchangedFiles
+	result.UploadedBytes = stats.uploadedBytes
+	result.DeletedFiles = countDeletedFiles(prevFiles, files)
+
+	newManifest.Stats.NewFiles = stats.newFiles
+	newManifest.Stats.ChangedFiles = stats.changedFiles
+	newManifest.Stats.UnchangedFiles = stats.unchangedFiles
+	newManifest.Stats.NewBytes = stats.uploadedBytes
+
+	p.logUploadAnomalies(len(files), stats)
+
+	// SaveManifestWithKey sets newManifest.FilePath to the actual path
+	// written (same-second conflicts get a suffixed name), which downstream
+	// consumers (snapshot target records, cloud upload) rely on.
+	if _, err := SaveManifestWithKey(metaDir, newManifest, p.cfg.Key); err != nil {
+		return nil, fmt.Errorf("save manifest: %w", err)
+	}
+
+	p.updateSourceRegistry(metaDir, cloudID, newManifest)
+
+	if p.progress != nil {
+		p.progress.SetPhase(PhaseComplete)
+	}
+
+	result.Manifest = newManifest
+	result.Duration = time.Since(start)
+	result.FailedFiles = stats.failedFiles
+	result.FailedPaths = stats.failedPaths
+	result.FailedErrors = stats.failedErrors
+	result.LockedFiles = stats.lockedFiles
+	result.LockedPaths = stats.lockedPaths
+	result.TotalSourceSize = totalSourceSize
+
+	p.logRunSummary(result, stats, totalSourceSize)
+
+	return result, nil
+}
+
+// ensureCDCPolynomial loads the per-repo CDC polynomial so chunk boundaries
+// match what was persisted at init time. Without this, incremental backups
+// would compute different chunk hashes against a different polynomial and
+// re-upload everything. The polynomial is bound to this pipeline instance
+// (set before any worker goroutine starts) — never via the package global,
+// which races when pipelines for different repos run concurrently.
+func (p *SimplePipeline) ensureCDCPolynomial() error {
+	pol, err := LoadCDCPolynomial(p.cfg.RepoRoot)
+	if err != nil {
+		return fmt.Errorf("load cdc polynomial: %w", err)
+	}
+	if p.cdcPolynomial == 0 {
+		p.cdcPolynomial = pol
+	}
+	return nil
+}
+
+func (p *SimplePipeline) loadExcludePatterns(scanPath string) {
+	ignorePatterns := fsutil.LoadIgnoreFile(scanPath)
+	merged := fsutil.MergeExcludes(p.cfg.Excludes, ignorePatterns)
+	p.posExcludes, p.negExcludes, p.sizeFilters = fsutil.SplitExcludePatterns(merged)
+}
+
+func (p *SimplePipeline) warmStoreCache(ctx context.Context) {
 	if lbs, ok := p.store.(*LocalBlobStore); ok {
 		_ = lbs.WarmExistsCache(ctx)
 	}
+}
 
+// loadPreviousFiles returns the file map of the latest manifest for this
+// source, or nil when a full backup is requested or no previous manifest
+// exists.
+func (p *SimplePipeline) loadPreviousFiles(metaDir, cloudID string) (map[string]FileEntry, error) {
 	var prevFiles map[string]FileEntry
-	cloudID := ResolveCloudID(p.cfg.DeviceID, p.cfg.SourceID)
 	if !p.cfg.ForceFull {
 		prevManifest, loadErr := LoadLatestManifest(metaDir, cloudID)
 		if loadErr != nil && !errors.Is(loadErr, ErrManifestNotFound) {
@@ -196,15 +339,13 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	} else {
 		slog.Info("GBF force full backup, skipping previous manifest", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "session_id", p.cfg.SessionID)
 	}
+	return prevFiles, nil
+}
 
-	newManifest := NewManifest(p.cfg.SourceID, cloudID, p.cfg.SourceName, p.cfg.SourcePath, p.cfg.DeviceID)
-
-	if p.progress != nil {
-		p.progress.SetPhase(PhaseUploading)
-	}
-
-	var files []scanEntry
-	var dirEntries []scanEntry
+// scanSourceTree walks scanPath and partitions the result into file and
+// directory entries. Unreadable paths are counted and logged while the walk
+// continues; only walk failures or a cancelled context abort the scan.
+func (p *SimplePipeline) scanSourceTree(ctx context.Context, scanPath string) (files []scanEntry, dirEntries []scanEntry, err error) {
 	var walkErrors int
 	var walkErrorPaths []string
 	walkErr := filepath.Walk(scanPath, func(path string, info os.FileInfo, err error) error {
@@ -262,7 +403,7 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 		return nil
 	})
 	if walkErr != nil {
-		return nil, fmt.Errorf("walk: %w", walkErr)
+		return nil, nil, fmt.Errorf("walk: %w", walkErr)
 	}
 	if walkErrors > 0 {
 		slog.Warn("GBF scan encountered errors",
@@ -273,6 +414,12 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 
 	slog.Info("GBF scan complete", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "files", len(files), "session_id", p.cfg.SessionID)
 
+	return files, dirEntries, nil
+}
+
+// addEmptyDirs records directories that contain neither files nor other
+// directories in the manifest so restores can recreate them.
+func addEmptyDirs(m *Manifest, files, dirEntries []scanEntry) {
 	dirHasChildren := make(map[string]bool)
 	for _, f := range files {
 		parts := strings.Split(f.relPath, "/")
@@ -295,19 +442,28 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 		if dirName == "" {
 			continue
 		}
-		newManifest.AddEmptyDir(d.relPath)
+		m.AddEmptyDir(d.relPath)
 	}
+}
 
-	var totalSourceSize int64
-	for _, fe := range files {
-		totalSourceSize += fe.size
-	}
-	slog.Info("GBF source size", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "total_bytes", totalSourceSize, "session_id", p.cfg.SessionID)
+// uploadStats aggregates the per-file outcomes of the upload worker pool.
+type uploadStats struct {
+	uploadedBytes  int64
+	newFiles       int
+	changedFiles   int
+	unchangedFiles int
+	skippedFiles   int
+	failedFiles    int
+	lockedFiles    int
+	failedPaths    []string
+	lockedPaths    []string
+	failedErrors   []string
+}
 
-	if p.progress != nil {
-		p.progress.SetTotal(len(files), totalSourceSize)
-	}
-
+// runUploadWorkers feeds the scanned files through a worker pool and returns
+// the aggregated outcomes. The manifest mutex plus WaitGroup serialize the
+// counter updates; the returned stats are read only after all workers exit.
+func (p *SimplePipeline) runUploadWorkers(ctx context.Context, files []scanEntry, prevFiles map[string]FileEntry, newManifest *Manifest) uploadStats {
 	manifestMu := sync.Mutex{}
 	var uploadedBytes int64
 	var newFiles, changedFiles, unchangedFiles, skippedFiles, failedFiles, lockedFiles int
@@ -413,116 +569,107 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	close(ch)
 	wg.Wait()
 
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	return uploadStats{
+		uploadedBytes:  uploadedBytes,
+		newFiles:       newFiles,
+		changedFiles:   changedFiles,
+		unchangedFiles: unchangedFiles,
+		skippedFiles:   skippedFiles,
+		failedFiles:    failedFiles,
+		lockedFiles:    lockedFiles,
+		failedPaths:    failedPaths,
+		lockedPaths:    lockedPaths,
+		failedErrors:   failedErrors,
 	}
+}
 
-	result.NewFiles = newFiles
-	result.ChangedFiles = changedFiles
-	result.UnchangedFiles = unchangedFiles
-	result.UploadedBytes = uploadedBytes
-
-	if len(prevFiles) > 0 {
-		curSet := make(map[string]struct{}, len(files))
-		for _, f := range files {
-			curSet[f.relPath] = struct{}{}
+// countDeletedFiles reports how many paths present in the previous manifest
+// no longer exist in the current scan.
+func countDeletedFiles(prevFiles map[string]FileEntry, files []scanEntry) int {
+	if len(prevFiles) == 0 {
+		return 0
+	}
+	curSet := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		curSet[f.relPath] = struct{}{}
+	}
+	deleted := 0
+	for path := range prevFiles {
+		if _, ok := curSet[path]; !ok {
+			deleted++
 		}
-		deleted := 0
-		for path := range prevFiles {
-			if _, ok := curSet[path]; !ok {
-				deleted++
-			}
-		}
-		result.DeletedFiles = deleted
+	}
+	return deleted
+}
+
+func (p *SimplePipeline) logUploadAnomalies(totalFiles int, stats uploadStats) {
+	if stats.skippedFiles > 0 {
+		slog.Warn("GBF skipped files during backup", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "skipped", stats.skippedFiles, "total", totalFiles, "session_id", p.cfg.SessionID)
 	}
 
-	newManifest.Stats.NewFiles = newFiles
-	newManifest.Stats.ChangedFiles = changedFiles
-	newManifest.Stats.UnchangedFiles = unchangedFiles
-	newManifest.Stats.NewBytes = uploadedBytes
-
-	if skippedFiles > 0 {
-		slog.Warn("GBF skipped files during backup", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "skipped", skippedFiles, "total", len(files), "session_id", p.cfg.SessionID)
-	}
-
-	if lockedFiles > 0 {
-		samplePaths := lockedPaths
+	if stats.lockedFiles > 0 {
+		samplePaths := stats.lockedPaths
 		if len(samplePaths) > 10 {
 			samplePaths = samplePaths[:10]
 		}
 		slog.Warn("GBF files locked by another process, skipped after retries",
 			"source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot,
-			"locked", lockedFiles, "sample_paths", samplePaths, "session_id", p.cfg.SessionID)
+			"locked", stats.lockedFiles, "sample_paths", samplePaths, "session_id", p.cfg.SessionID)
 	}
+}
 
-	// SaveManifestWithKey sets newManifest.FilePath to the actual path
-	// written (same-second conflicts get a suffixed name), which downstream
-	// consumers (snapshot target records, cloud upload) rely on.
-	if _, err := SaveManifestWithKey(metaDir, newManifest, p.cfg.Key); err != nil {
-		return nil, fmt.Errorf("save manifest: %w", err)
-	}
-
+// updateSourceRegistry refreshes the source registry after a successful
+// manifest save. A failed registry save only warns: the backup itself is
+// already durable at that point.
+func (p *SimplePipeline) updateSourceRegistry(metaDir, cloudID string, m *Manifest) {
 	reg, regErr := LoadSourceRegistry(metaDir, cloudID)
 	if regErr != nil {
 		reg = &SourceRegistry{
 			CloudID:   cloudID,
-			Name:      newManifest.SourceName,
-			Path:      newManifest.SourcePath,
-			DeviceID:  newManifest.DeviceID,
-			CreatedAt: newManifest.Timestamp,
+			Name:      m.SourceName,
+			Path:      m.SourcePath,
+			DeviceID:  m.DeviceID,
+			CreatedAt: m.Timestamp,
 		}
 	}
-	reg.Name = newManifest.SourceName
-	reg.Path = newManifest.SourcePath
-	reg.DeviceID = newManifest.DeviceID
-	reg.LastSnapshot = newManifest.Timestamp
+	reg.Name = m.SourceName
+	reg.Path = m.SourcePath
+	reg.DeviceID = m.DeviceID
+	reg.LastSnapshot = m.Timestamp
 	reg.SnapshotCount++
 
 	if saveErr := SaveSourceRegistry(metaDir, reg); saveErr != nil {
 		slog.Warn("GBF source registry save failed", "cloud_id", cloudID, "error", saveErr)
 	}
+}
 
-	if p.progress != nil {
-		p.progress.SetPhase(PhaseComplete)
-	}
-
-	result.Manifest = newManifest
-	result.Duration = time.Since(start)
-	result.FailedFiles = failedFiles
-	result.FailedPaths = failedPaths
-	result.FailedErrors = failedErrors
-	result.LockedFiles = lockedFiles
-	result.LockedPaths = lockedPaths
-	result.TotalSourceSize = totalSourceSize
-
-	totalFiles := newFiles + changedFiles + unchangedFiles
+func (p *SimplePipeline) logRunSummary(result *PipelineResult, stats uploadStats, totalSourceSize int64) {
+	totalFiles := stats.newFiles + stats.changedFiles + stats.unchangedFiles
 	var dedupRatio float64
 	if totalFiles > 0 {
-		dedupRatio = float64(unchangedFiles) / float64(totalFiles)
+		dedupRatio = float64(stats.unchangedFiles) / float64(totalFiles)
 	}
 	var throughputMBps float64
 	if result.Duration.Seconds() > 0 {
-		throughputMBps = float64(uploadedBytes) / result.Duration.Seconds() / (1024 * 1024)
+		throughputMBps = float64(stats.uploadedBytes) / result.Duration.Seconds() / (1024 * 1024)
 	}
 
 	slog.Info("GBF pipeline complete",
 		"source_id", p.cfg.SourceID,
 		"repo", p.cfg.RepoRoot,
-		"new", newFiles,
-		"changed", changedFiles,
-		"unchanged", unchangedFiles,
-		"skipped", skippedFiles,
-		"failed", failedFiles,
-		"locked", lockedFiles,
-		"uploaded_bytes", uploadedBytes,
+		"new", stats.newFiles,
+		"changed", stats.changedFiles,
+		"unchanged", stats.unchangedFiles,
+		"skipped", stats.skippedFiles,
+		"failed", stats.failedFiles,
+		"locked", stats.lockedFiles,
+		"uploaded_bytes", stats.uploadedBytes,
 		"total_source_bytes", totalSourceSize,
 		"dedup_ratio", fmt.Sprintf("%.1f%%", dedupRatio*100),
 		"throughput_mbps", fmt.Sprintf("%.1f", throughputMBps),
 		"duration", result.Duration.Round(time.Millisecond),
 		"session_id", p.cfg.SessionID,
 	)
-
-	return result, nil
 }
 
 func resolveFileStatus(hasPrev bool, contentHash, prevHash string) (status string, isNew, isChanged bool) {
@@ -604,6 +751,44 @@ func openFileWithRetry(ctx context.Context, path string) (*os.File, error) {
 	return nil, lastErr
 }
 
+// blobsExist resolves the presence of the given (deduplicated) hashes in
+// the store. Stores implementing BatchExistencer answer the whole batch
+// with one call; otherwise — and whenever the batch call fails — the code
+// falls back to per-hash Exists with the historical error semantics (an
+// error counts as "missing" so the caller re-uploads instead of failing
+// the backup).
+func (p *SimplePipeline) blobsExist(ctx context.Context, hashes []string) map[string]bool {
+	result := make(map[string]bool, len(hashes))
+	if len(hashes) == 0 {
+		return result
+	}
+	uniq := make([]string, 0, len(hashes))
+	for _, h := range hashes {
+		// Key-presence check, not value: absent hashes map to false, and a
+		// value check would re-enqueue every duplicate of a missing hash.
+		if _, ok := result[h]; ok {
+			continue
+		}
+		result[h] = false
+		uniq = append(uniq, h)
+	}
+	if be, ok := p.store.(BatchExistencer); ok {
+		if batch, bErr := be.ExistsBatch(ctx, uniq); bErr == nil {
+			for _, h := range uniq {
+				result[h] = batch[h]
+			}
+			return result
+		}
+	}
+	for _, h := range uniq {
+		exists, eErr := p.store.Exists(ctx, h)
+		if eErr == nil && exists {
+			result[h] = true
+		}
+	}
+	return result
+}
+
 // tryUnchangedEntry returns an "unchanged" FileEntry for fe if every blob
 // referenced by prevFile is still present in the store. Any Exists() error
 // is treated as "blob missing" so we fall back to re-uploading rather than
@@ -614,23 +799,20 @@ func openFileWithRetry(ctx context.Context, path string) (*os.File, error) {
 // fast path in processFileStreaming so the existence-check loop can't drift
 // between the two callers.
 func (p *SimplePipeline) tryUnchangedEntry(ctx context.Context, fe scanEntry, prevFile FileEntry, contentHash string) (*FileEntry, bool) {
-	allExist := true
+	var hashes []string
 	if len(prevFile.Chunks) > 0 {
+		hashes = make([]string, 0, len(prevFile.Chunks))
 		for _, c := range prevFile.Chunks {
-			exists, eErr := p.store.Exists(ctx, c.Hash)
-			if eErr != nil || !exists {
-				allExist = false
-				break
-			}
+			hashes = append(hashes, c.Hash)
 		}
 	} else {
-		exists, eErr := p.store.Exists(ctx, contentHash)
-		if eErr != nil || !exists {
-			allExist = false
-		}
+		hashes = []string{contentHash}
 	}
-	if !allExist {
-		return nil, false
+	presence := p.blobsExist(ctx, hashes)
+	for _, h := range hashes {
+		if !presence[h] {
+			return nil, false
+		}
 	}
 	entry := makeFileEntry(fe, contentHash, "unchanged")
 	if len(prevFile.Chunks) > 0 {
@@ -641,10 +823,17 @@ func (p *SimplePipeline) tryUnchangedEntry(ctx context.Context, fe scanEntry, pr
 
 func (p *SimplePipeline) processFile(ctx context.Context, fe scanEntry, prevFiles map[string]FileEntry) (_ *FileEntry, _ int64, _ bool, _ bool, ferr error) {
 	prevFile, hasPrev := prevFiles[fe.relPath]
+	// fastPathBlobMissing records that the mtime/size fast path already ran
+	// tryUnchangedEntry and confirmed a referenced blob is absent (the only
+	// way that check can fail once mtime+size matched). The streaming path
+	// then skips its own tryUnchangedEntry — it would probe the exact same
+	// hash set and fail again — halving the existence checks for this file.
+	fastPathBlobMissing := false
 	if hasPrev && string(prevFile.Mtime) == fe.mtime && prevFile.Size == fe.size && len(prevFile.ContentHash) >= 2 {
 		if entry, ok := p.tryUnchangedEntry(ctx, fe, prevFile, prevFile.ContentHash); ok {
 			return entry, 0, false, false, nil
 		}
+		fastPathBlobMissing = true
 		hashLog := prevFile.ContentHash
 		if len(hashLog) > 16 {
 			hashLog = hashLog[:16]
@@ -656,7 +845,7 @@ func (p *SimplePipeline) processFile(ctx context.Context, fe scanEntry, prevFile
 	useStream := fe.size >= int64(p.enc.chunkSize)
 
 	if useStream {
-		return p.processFileStreaming(ctx, fe, prevFiles)
+		return p.processFileStreaming(ctx, fe, prevFiles, fastPathBlobMissing)
 	}
 
 	contentHash, ciphertext, err := p.hashAndEncryptFile(ctx, fe.absPath, fe.size)
@@ -672,23 +861,30 @@ func (p *SimplePipeline) processFile(ctx context.Context, fe scanEntry, prevFile
 	return p.checkAndUploadBlob(ctx, fe, hasPrev, prevFile.ContentHash, contentHash, ciphertext, prevChunks)
 }
 
-func (p *SimplePipeline) processFileStreaming(ctx context.Context, fe scanEntry, prevFiles map[string]FileEntry) (_ *FileEntry, _ int64, _ bool, _ bool, ferr error) {
+func (p *SimplePipeline) processFileStreaming(ctx context.Context, fe scanEntry, prevFiles map[string]FileEntry, skipUnchangedEntry bool) (_ *FileEntry, _ int64, _ bool, _ bool, ferr error) {
 	prevFile, hasPrev := prevFiles[fe.relPath]
+
+	// Small/medium files: retain each chunk's plaintext from the hash pass
+	// so uploadChangedChunks encrypts exactly the bytes that were hashed
+	// (single read, single hash). Larger files fall back to the two-pass
+	// streaming behavior.
+	retain := fe.size <= inMemoryChunkThreshold
 
 	var contentHash string
 	var chunkRefs []ChunkRef
+	var chunkData [][]byte
 	var hashErr error
 	if p.cdcEnabled() {
-		contentHash, chunkRefs, hashErr = p.hashFileWithCDC(ctx, fe.absPath, fe.size)
+		contentHash, chunkRefs, chunkData, hashErr = p.hashFileWithCDC(ctx, fe.absPath, fe.size, retain)
 	} else {
-		contentHash, chunkRefs, hashErr = p.hashFileWithChunks(ctx, fe.absPath, fe.size)
+		contentHash, chunkRefs, chunkData, hashErr = p.hashFileWithChunks(ctx, fe.absPath, fe.size, retain)
 	}
 	if hashErr != nil {
 		slog.Warn("GBF hash streaming failed", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "file", fe.relPath, "error", hashErr, "session_id", p.cfg.SessionID)
 		return nil, 0, false, false, fmt.Errorf("hash streaming %s: %w", fe.relPath, hashErr)
 	}
 
-	if hasPrev && prevFile.ContentHash == contentHash {
+	if hasPrev && prevFile.ContentHash == contentHash && !skipUnchangedEntry {
 		if entry, ok := p.tryUnchangedEntry(ctx, fe, prevFile, contentHash); ok {
 			return entry, 0, false, false, nil
 		}
@@ -701,7 +897,8 @@ func (p *SimplePipeline) processFileStreaming(ctx context.Context, fe scanEntry,
 		prevChunks = prevFile.Chunks
 	}
 
-	uploaded, uploadErr := p.uploadChangedChunks(ctx, fe.absPath, fe.size, chunkRefs, prevChunks)
+	uploaded, uploadErr := p.uploadChangedChunks(ctx, fe.absPath, fe.size, chunkRefs, chunkData, prevChunks)
+	chunkData = nil // release retained chunk bytes promptly after the upload
 	if uploadErr != nil {
 		slog.Warn("GBF chunk upload failed", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "file", fe.relPath, "error", uploadErr, "session_id", p.cfg.SessionID)
 		return nil, 0, false, false, fmt.Errorf("chunk upload %s: %w", fe.relPath, uploadErr)
@@ -800,7 +997,9 @@ func (p *SimplePipeline) hashOnlyFile(ctx context.Context, path string, size int
 	}
 	defer func() { _ = f.Close() }()
 	h := sha256.New()
-	buf := make([]byte, p.enc.chunkSize)
+	bp := getChunkBuf(p.enc.chunkSize)
+	buf := (*bp)[:p.enc.chunkSize]
+	defer putChunkBuf(bp)
 	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return "", nil, fmt.Errorf("hash: %w", err)
 	}
@@ -818,29 +1017,63 @@ func (p *SimplePipeline) hashOnlyFile(ctx context.Context, path string, size int
 	return contentHash, nil, fmt.Errorf("large unencrypted file (%d bytes) must use streaming path", size)
 }
 
-func (p *SimplePipeline) hashFileWithChunks(ctx context.Context, filePath string, size int64) (string, []ChunkRef, error) {
+// hashFileWithChunks hashes a file in fixed-size chunks. When retain is
+// true (file at or below inMemoryChunkThreshold) the plaintext of every
+// chunk is kept in memory and returned alongside the refs so the upload
+// pass can store exactly the bytes that were hashed. With retain=false a
+// pooled scratch buffer is used and no chunk data is returned.
+func (p *SimplePipeline) hashFileWithChunks(ctx context.Context, filePath string, size int64, retain bool) (string, []ChunkRef, [][]byte, error) {
 	f, err := openFileWithRetry(ctx, filePath)
 	if err != nil {
-		return "", nil, fmt.Errorf("open: %w", err)
+		return "", nil, nil, fmt.Errorf("open: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
-	buf := make([]byte, p.enc.chunkSize)
+	var retained [][]byte
+	var bp *[]byte
+	var buf []byte
+	if !retain {
+		bp = getChunkBuf(p.enc.chunkSize)
+		buf = (*bp)[:p.enc.chunkSize]
+		defer putChunkBuf(bp)
+	}
 	var chunks []ChunkRef
 	remaining := size
 
 	for remaining > 0 {
 		if ctx.Err() != nil {
-			return "", nil, ctx.Err()
+			return "", nil, nil, ctx.Err()
 		}
-		readSize := int64(len(buf))
-		if remaining < readSize {
-			readSize = remaining
+		readSize := remaining
+		if retain {
+			// Read straight into a per-chunk allocation: the bytes are
+			// handed to the upload pass, so no shared buffer may be used.
+			chunkBuf := make([]byte, min(readSize, int64(p.enc.chunkSize)))
+			n, readErr := io.ReadFull(f, chunkBuf)
+			if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
+				return "", nil, nil, fmt.Errorf("read: %w", readErr)
+			}
+			if n == 0 {
+				break
+			}
+			chunkData := chunkBuf[:n]
+			h.Write(chunkData)
+			ch := sha256.Sum256(chunkData)
+			chunks = append(chunks, ChunkRef{
+				Hash: hex.EncodeToString(ch[:]),
+				Size: int64(n),
+			})
+			retained = append(retained, chunkData)
+			remaining -= int64(n)
+			continue
+		}
+		if readSize > int64(len(buf)) {
+			readSize = int64(len(buf))
 		}
 		n, readErr := io.ReadFull(f, buf[:readSize])
 		if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
-			return "", nil, fmt.Errorf("read: %w", readErr)
+			return "", nil, nil, fmt.Errorf("read: %w", readErr)
 		}
 		if n == 0 {
 			break
@@ -856,19 +1089,30 @@ func (p *SimplePipeline) hashFileWithChunks(ctx context.Context, filePath string
 	}
 
 	contentHash := hex.EncodeToString(h.Sum(nil))
-	return contentHash, chunks, nil
+	if !retain {
+		return contentHash, chunks, nil, nil
+	}
+	return contentHash, chunks, retained, nil
 }
 
-func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath string, size int64, chunks []ChunkRef, prevChunks []ChunkRef) (int64, error) {
+// uploadChangedChunks stores every chunk of the freshly hashed file that is
+// not already present. chunkData carries the plaintext retained by the hash
+// pass (files at or below inMemoryChunkThreshold): those bytes are exactly
+// what was hashed, so they are uploaded directly — no second file read and
+// no re-hash. When chunkData is empty the file is re-read chunk by chunk and
+// each chunk is re-verified against its hash (tamper detection between the
+// two passes is preserved).
+func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath string, size int64, chunks []ChunkRef, chunkData [][]byte, prevChunks []ChunkRef) (int64, error) {
 	prevChunkMap := make(map[string]bool, len(prevChunks))
-	for _, c := range prevChunks {
-		prevChunkMap[c.Hash] = true
-	}
-
-	for _, c := range prevChunks {
-		exists, _ := p.store.Exists(ctx, c.Hash)
-		if !exists {
+	if len(prevChunks) > 0 {
+		prevHashes := make([]string, 0, len(prevChunks))
+		for _, c := range prevChunks {
 			prevChunkMap[c.Hash] = false
+			prevHashes = append(prevHashes, c.Hash)
+		}
+		presence := p.blobsExist(ctx, prevHashes)
+		for h := range prevChunkMap {
+			prevChunkMap[h] = presence[h]
 		}
 	}
 
@@ -883,22 +1127,35 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 		return 0, nil
 	}
 
-	f, err := openFileWithRetry(ctx, filePath)
-	if err != nil {
-		return 0, fmt.Errorf("open: %w", err)
+	// In-memory fast path: the hash pass handed us the exact plaintext of
+	// every chunk, so the store receives the very bytes that were hashed.
+	useMemChunks := len(chunks) > 0 && len(chunkData) == len(chunks)
+
+	var f *os.File
+	var bp *[]byte
+	var buf []byte
+	if !useMemChunks {
+		var err error
+		f, err = openFileWithRetry(ctx, filePath)
+		if err != nil {
+			return 0, fmt.Errorf("open: %w", err)
+		}
+		defer func() { _ = f.Close() }()
+
+		bufSize := p.enc.chunkSize
+		if p.cdcEnabled() && bufSize < cdcMaxSize {
+			bufSize = cdcMaxSize
+		}
+		bp = getChunkBuf(bufSize)
+		buf = (*bp)[:bufSize]
+		defer putChunkBuf(bp)
 	}
-	defer func() { _ = f.Close() }()
 
 	gcm, gcmErr := p.getGCM()
 	if gcmErr != nil {
 		return 0, fmt.Errorf("gcm: %w", gcmErr)
 	}
 
-	bufSize := p.enc.chunkSize
-	if p.cdcEnabled() && bufSize < cdcMaxSize {
-		bufSize = cdcMaxSize
-	}
-	buf := make([]byte, bufSize)
 	tryCompress := p.compressor != nil && !isLikelyIncompressible(filePath)
 	var uploaded int64
 	chunkIdx := 0
@@ -907,47 +1164,63 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 		if ctx.Err() != nil {
 			return uploaded, ctx.Err()
 		}
-		readSize := chunks[chunkIdx].Size
-		if readSize > int64(len(buf)) {
-			readSize = int64(len(buf))
-		}
-		n, readErr := io.ReadFull(f, buf[:readSize])
-		if readErr != nil && readErr != io.EOF {
-			if readErr == io.ErrUnexpectedEOF {
-				// File was truncated/modified since the manifest was built:
-				// we requested chunks[chunkIdx].Size bytes but got fewer.
-				// Uploading the partial buffer would store data under a hash
-				// that does not match the bytes, corrupting the blob store.
-				// Surface as an error so the caller can re-process the file.
-				return uploaded, fmt.Errorf("read chunk %d: file truncated (expected %d bytes, got %d): %w", chunkIdx, readSize, n, readErr)
-			}
-			return uploaded, fmt.Errorf("read chunk %d: %w", chunkIdx, readErr)
-		}
-		if n == 0 {
-			break
-		}
 
 		c := chunks[chunkIdx]
-		if prevChunkMap[c.Hash] {
-			skipped++
-			chunkIdx++
-			continue
+		var chunkBytes []byte
+		if useMemChunks {
+			// No file is being read, so an already-present chunk can be
+			// skipped without touching anything.
+			if prevChunkMap[c.Hash] {
+				skipped++
+				chunkIdx++
+				continue
+			}
+			// These bytes were hashed by the same pass that produced
+			// c.Hash — the consistency check is inherent, no re-hash.
+			chunkBytes = chunkData[chunkIdx]
+		} else {
+			// The file must be read sequentially even for chunks that are
+			// skipped, otherwise the offset desyncs from the chunk list.
+			readSize := c.Size
+			if readSize > int64(len(buf)) {
+				readSize = int64(len(buf))
+			}
+			n, readErr := io.ReadFull(f, buf[:readSize])
+			if readErr != nil && readErr != io.EOF {
+				if readErr == io.ErrUnexpectedEOF {
+					// File was truncated/modified since the manifest was built:
+					// we requested chunks[chunkIdx].Size bytes but got fewer.
+					// Uploading the partial buffer would store data under a hash
+					// that does not match the bytes, corrupting the blob store.
+					// Surface as an error so the caller can re-process the file.
+					return uploaded, fmt.Errorf("read chunk %d: file truncated (expected %d bytes, got %d): %w", chunkIdx, readSize, n, readErr)
+				}
+				return uploaded, fmt.Errorf("read chunk %d: %w", chunkIdx, readErr)
+			}
+			if n == 0 {
+				break
+			}
+			if prevChunkMap[c.Hash] {
+				skipped++
+				chunkIdx++
+				continue
+			}
+			chunkBytes = buf[:n]
+			// Verify the chunk content still matches the hash computed earlier
+			// (during hashFileWithCDC/hashFileWithChunks). If the file was
+			// modified in place between the hash pass and this read, storing
+			// the new content under the old hash would corrupt the content-
+			// addressed blob store. Treat as a fatal error so the caller can
+			// re-process the file.
+			actualHash := fmt.Sprintf("%x", sha256.Sum256(chunkBytes))
+			if actualHash != c.Hash {
+				return uploaded, fmt.Errorf("chunk %d content changed since hash (expected %s, got %s): file modified during backup", chunkIdx, c.Hash[:12], actualHash[:12])
+			}
 		}
 
-		chunkData := buf[:n]
-		// Verify the chunk content still matches the hash computed earlier
-		// (during hashFileWithCDC/hashFileWithChunks). If the file was
-		// modified in place between the hash pass and this read, storing
-		// the new content under the old hash would corrupt the content-
-		// addressed blob store. Treat as a fatal error so the caller can
-		// re-process the file.
-		actualHash := fmt.Sprintf("%x", sha256.Sum256(chunkData))
-		if actualHash != c.Hash {
-			return uploaded, fmt.Errorf("chunk %d content changed since hash (expected %s, got %s): file modified during backup", chunkIdx, c.Hash[:12], actualHash[:12])
-		}
-		toStore := chunkData
-		if tryCompress && len(chunkData) >= 65536 {
-			if compressed, cerr := p.compressor.Compress(chunkData); cerr == nil && len(compressed) < len(chunkData) {
+		toStore := chunkBytes
+		if tryCompress && len(chunkBytes) >= 65536 {
+			if compressed, cerr := p.compressor.Compress(chunkBytes); cerr == nil && len(compressed) < len(chunkBytes) {
 				toStore = compressed
 			}
 		}
@@ -970,7 +1243,7 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 		if err := p.store.Put(ctx, c.Hash, blobData); err != nil {
 			return uploaded, fmt.Errorf("put chunk %d: %w", chunkIdx, err)
 		}
-		uploaded += int64(n)
+		uploaded += int64(len(chunkBytes))
 		chunkIdx++
 	}
 

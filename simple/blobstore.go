@@ -25,3 +25,13 @@ type SimpleBlobStore interface {
 	Delete(ctx context.Context, hash string) error
 	Close() error
 }
+
+// BatchExistencer is an optional capability interface a SimpleBlobStore may
+// implement to answer many existence checks with a single call (one lock
+// pass + stat loop for local stores, one RPC or a bounded fan-out for
+// remote stores). Implementations return a map keyed by hash; hashes that
+// are absent from the map or map to false are treated as missing. On error
+// callers fall back to per-hash Exists, preserving existing semantics.
+type BatchExistencer interface {
+	ExistsBatch(ctx context.Context, hashes []string) (map[string]bool, error)
+}
