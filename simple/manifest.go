@@ -177,7 +177,13 @@ type ManifestStats struct {
 	NewFiles       int   `json:"newFiles"`
 	ChangedFiles   int   `json:"changedFiles"`
 	UnchangedFiles int   `json:"unchangedFiles"`
-	NewBytes       int64 `json:"newBytes"`
+	// DeletedFiles is the number of paths present in the previous
+	// manifest but missing from this one. Cloud/peer snapshot targets
+	// are rebuilt from these stats after async sync, so without this
+	// field their deleted_count would always be 0 and diverge from the
+	// local repo row.
+	DeletedFiles int   `json:"deletedFiles"`
+	NewBytes     int64 `json:"newBytes"`
 }
 
 func NewManifest(sourceID int64, cloudID, sourceName, sourcePath, deviceID string) *Manifest {
