@@ -36,6 +36,28 @@ jobs:
           version: v2.12.2
           args: --timeout=5m
 
+  fmt:
+    name: gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Files not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
   vet:
     name: go vet
     runs-on: ubuntu-latest
@@ -54,11 +76,11 @@ jobs:
 
   build:
     name: Build (${{ matrix.os }})
-    needs: [lint, vet]
+    needs: [lint, vet, fmt]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -75,11 +97,11 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }})
-    needs: [lint, vet]
+    needs: [lint, vet, fmt]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout

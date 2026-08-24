@@ -72,6 +72,41 @@ Vulnerabilities in third-party dependencies should be reported to the
 upstream maintainer directly. We will track and update affected dependencies
 as fixes become available.
 
+## Restore Path Defense Model
+
+Restore refuses to traverse pre-existing symlinks/junctions inside the
+target directory. The strength of this defense differs by platform:
+
+- **POSIX (Linux/macOS/BSD): kernel-level prevention.** All restore
+  writes go through `openat(O_NOFOLLOW)` / `mkdirat` / `renameat` /
+  `utimensat` chains relative to held directory file descriptors. A
+  path component swapped for a symlink between checks fails the
+  syscall itself; there is no check-then-write window.
+- **Windows: detection-based (known platform gap).** NTFS reparse
+  points cannot be rejected portably at open time from Go, so restore
+  verifies every component with `Lstat` before writing and re-checks
+  it (including the empty-directory skeleton) after writing. A swap
+  during the window is detected and aborts the restore, but bytes may
+  already have been written through the swapped link. Restoration into
+  directories writable by a hostile local process is therefore not
+  guaranteed sandbox-safe on Windows; the eventual hardening requires
+  handle-level `FILE_FLAG_OPEN_REPARSE_POINT` checks, which need
+  platform-specific syscalls.
+
+## Manifest Commit Model
+
+Manifest saves are cross-process no-replace: the staged manifest is
+committed atomically via `link(2)` (POSIX) or `MoveFileEx` without
+`REPLACE_EXISTING` (Windows), so concurrent processes saving the same
+cloudID/second never silently overwrite each other — the loser retries
+under a random same-second suffix. Within one process, saves are
+additionally serialized by a mutex. A crash between the manifest
+commit and its checksum sidecar leaves a sidecar-less manifest that
+loaders reject and skip, rolling back the interrupted save without
+damaging another save's files. The manifest and its checksum sidecar
+are two separate atomic writes, not a single transaction; this is a
+documented design trade-off.
+
 ## What You Should Not Report
 
 - General support questions (use GitHub Discussions)

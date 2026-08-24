@@ -1,0 +1,38 @@
+name: govulncheck
+
+on:
+  schedule:
+    # 03:17 UTC every Monday — off-peak hour, odd minute to reduce
+    # shared-infrastructure load spikes.
+    - cron: "17 3 * * 1"
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: "1.25"
+          # Only fail on vulnerabilities reachable from this module's code;
+          # unreachable advisories in the dependency graph are tracked via
+          # dependabot instead.
+          go-package: ./...

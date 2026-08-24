@@ -11,9 +11,9 @@ This document covers the expectations for contributing to the
 
 - **Go 1.25 or newer** (the module is tracked at `go 1.25.5`).
 - Git, with a GitHub account able to open pull requests.
-- A POSIX-like shell or PowerShell; the test suite must pass on both Linux
-  and Windows because the codebase has platform-specific filesystem helpers
-  under `fsutil/`.
+- A POSIX-like shell or PowerShell; the test suite must pass on Linux,
+  Windows, and macOS because the codebase has platform-specific filesystem
+  helpers under `fsutil/` (CI runs build and race tests on all three).
 
 Clone and verify it builds:
 

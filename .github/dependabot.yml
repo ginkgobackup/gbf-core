@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # Go module dependencies: weekly checks, grouped into one PR per week to
+  # keep the review load low. Security updates are always opened
+  # immediately and ungrouped.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    labels:
+      - dependencies
+    commit-message:
+      prefix: deps
+
+  # GitHub Actions versions (checkout, setup-go, golangci-lint, ...).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci

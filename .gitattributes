@@ -1,0 +1,4 @@
+# Test fixtures are checksum-verified against .sha256 sidecars; any
+# line-ending or encoding conversion would break those checksums.
+# Keep fixtures byte-exact on every platform.
+simple/testdata/** -text

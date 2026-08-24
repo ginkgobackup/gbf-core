@@ -1,0 +1,97 @@
+name: Release
+
+# Versioning policy: Git tags are the single source of truth for versions
+# (see CONTRIBUTING.md). Pushing a v* tag runs the full quality gate
+# (format, vet, race tests, vulnerability scan) on all supported OSes,
+# then publishes a GitHub Release with module-level artifacts.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Files not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+  vuln:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: "1.25"
+          go-package: ./...
+
+  release:
+    name: Publish release
+    needs: [verify, vuln]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Build demo binaries
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o dist/demo-linux-amd64       ./cmd/demo
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/demo-windows-amd64.exe ./cmd/demo
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -o dist/demo-darwin-amd64      ./cmd/demo
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o dist/demo-darwin-arm64      ./cmd/demo
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
