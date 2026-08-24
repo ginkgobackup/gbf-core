@@ -27,26 +27,8 @@ func writeFileAtomicCommon(path string, data []byte, perm os.FileMode) error {
 	// Per-call unique temp name so concurrent WriteFileAtomic calls on the
 	// same path do not clobber each other's staging file.
 	tmp := path + "." + uuid.NewString() + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return fmt.Errorf("create tmp file: %w", err)
-	}
-
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("write tmp file: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("sync tmp file: %w", err)
-	}
-
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("close tmp file: %w", err)
+	if err := WriteStagingFile(tmp, data, perm); err != nil {
+		return err
 	}
 
 	if err := os.Rename(tmp, path); err != nil {
@@ -55,6 +37,37 @@ func writeFileAtomicCommon(path string, data []byte, perm os.FileMode) error {
 	}
 
 	return syncParentDir(dir)
+}
+
+// WriteStagingFile writes data to a fresh staging file at path, fsyncs it,
+// and returns WITHOUT renaming: the caller commits it to its final name
+// with CommitFileNoReplace (or os.Rename for replace semantics) and owns
+// cleanup on failure. Use a per-call unique staging name — the file is
+// created with O_TRUNC, so concurrent writers to the same staging name
+// would clobber each other.
+func WriteStagingFile(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return fmt.Errorf("create tmp file: %w", err)
+	}
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("write tmp file: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("sync tmp file: %w", err)
+	}
+
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("close tmp file: %w", err)
+	}
+	return nil
 }
 
 // SyncParent fsyncs the parent directory of path (or dir itself if path is a

@@ -19,8 +19,19 @@ import (
 
 var _ vault.Encryptor = (*AESEncryptor)(nil)
 
+// maxGCMCacheEntries caps how many AEAD instances are cached. A long-lived
+// process cycling through many distinct master keys would otherwise grow
+// the cache without bound. Once the cap is reached, additional keys are
+// served without caching (AEAD construction is cheap relative to GCM
+// sealing, so this is a graceful degradation, not an error). The cap is a
+// strict bound: insertions happen under e.mu with the size checked first,
+// so the cache never exceeds maxGCMCacheEntries entries, even transiently
+// under concurrency.
+const maxGCMCacheEntries = 256
+
 type AESEncryptor struct {
-	cache sync.Map
+	mu    sync.Mutex
+	cache map[string]*gcmEntry
 }
 
 type gcmEntry struct {
@@ -30,7 +41,15 @@ type gcmEntry struct {
 }
 
 func NewAESEncryptor() *AESEncryptor {
-	return &AESEncryptor{}
+	return &AESEncryptor{cache: make(map[string]*gcmEntry)}
+}
+
+func newGCM(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
 }
 
 func (e *AESEncryptor) getGCM(key []byte) (cipher.AEAD, error) {
@@ -38,34 +57,37 @@ func (e *AESEncryptor) getGCM(key []byte) (cipher.AEAD, error) {
 	// This avoids retaining the actual secret key material in the map.
 	hash := sha256.Sum256(key)
 	keyStr := string(hash[:])
-	if v, ok := e.cache.Load(keyStr); ok {
-		entry := v.(*gcmEntry)
-		entry.once.Do(func() {
-			var block cipher.Block
-			block, entry.err = aes.NewCipher(key)
-			if entry.err != nil {
-				return
-			}
-			entry.gcm, entry.err = cipher.NewGCM(block)
-		})
-		return entry.gcm, entry.err
-	}
 
-	entry := &gcmEntry{}
-	entry.once.Do(func() {
-		var block cipher.Block
-		block, entry.err = aes.NewCipher(key)
-		if entry.err != nil {
-			return
+	e.mu.Lock()
+	entry, ok := e.cache[keyStr]
+	if !ok {
+		if len(e.cache) >= maxGCMCacheEntries {
+			// Cache full: serve this key uncached. Holding the mutex only
+			// for the map access keeps the critical section tiny.
+			e.mu.Unlock()
+			return newGCM(key)
 		}
-		entry.gcm, entry.err = cipher.NewGCM(block)
+		entry = &gcmEntry{}
+		e.cache[keyStr] = entry
+	}
+	e.mu.Unlock()
+
+	// AEAD construction happens outside the lock; sync.Once collapses
+	// concurrent construction for the same key.
+	entry.once.Do(func() {
+		entry.gcm, entry.err = newGCM(key)
 	})
 	if entry.err != nil {
+		// Don't cache failed constructions — a bad key (wrong length)
+		// would otherwise permanently occupy a cache slot.
+		e.mu.Lock()
+		if cur, ok := e.cache[keyStr]; ok && cur == entry {
+			delete(e.cache, keyStr)
+		}
+		e.mu.Unlock()
 		return nil, entry.err
 	}
-
-	actual, _ := e.cache.LoadOrStore(keyStr, entry)
-	return actual.(*gcmEntry).gcm, nil
+	return entry.gcm, nil
 }
 
 func (e *AESEncryptor) Encrypt(plaintext []byte, key []byte) ([]byte, error) {

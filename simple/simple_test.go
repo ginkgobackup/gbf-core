@@ -1205,7 +1205,12 @@ func TestUploadChangedChunks_ReReadPath_RestoreRoundtrip(t *testing.T) {
 		Chunks:      chunks,
 	}
 	target := filepath.Join(restoreDir, "twopass.bin")
-	if err := r.restoreChunkedFile(ctx, entry, target); err != nil {
+	secureRoot, err := openSecureDir(restoreDir)
+	if err != nil {
+		t.Fatalf("openSecureDir: %v", err)
+	}
+	defer secureRoot.Close()
+	if err := r.restoreChunkedFile(ctx, entry, secureRoot, "twopass.bin"); err != nil {
 		t.Fatalf("restoreChunkedFile: %v", err)
 	}
 	got, err := os.ReadFile(target)

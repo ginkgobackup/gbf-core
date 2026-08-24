@@ -29,8 +29,8 @@ type RepoConfig struct {
 	// blobs. The field is kept only so config files written by older
 	// versions still parse; DefaultConfig keeps writing DefaultChunkSize.
 	// Deprecated: do not use; the effective chunk size is DefaultChunkSize.
-	ChunkSize       int    `json:"chunkSize"`
-	DisableCDC      bool   `json:"disable_cdc,omitempty"`
+	ChunkSize  int  `json:"chunkSize"`
+	DisableCDC bool `json:"disable_cdc,omitempty"`
 	// CDCPolynomial is the content-defined chunking polynomial persisted
 	// at repo init. Each repo derives its own polynomial so chunk boundaries
 	// are stable for that repo but not shared across all installations.

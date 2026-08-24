@@ -274,6 +274,12 @@ func (d *Decryptor) decryptLarge(data []byte) ([]byte, error) {
 		plaintext = append(plaintext, decrypted...)
 		data = data[chunkEnd:]
 	}
+	// A legitimately written blob is fully consumed by the chunk loop;
+	// leftover bytes mean the blob was truncated or has data appended,
+	// which the chunked GCM authentication cannot detect.
+	if len(data) != 0 {
+		return nil, fmt.Errorf("gb1 trailing data after final chunk: %d bytes", len(data))
+	}
 	return plaintext, nil
 }
 
@@ -337,6 +343,10 @@ func (d *Decryptor) decryptLargeV2(data []byte) ([]byte, error) {
 			decrypted = decompressed
 		}
 		plaintext = append(plaintext, decrypted...)
+	}
+	// Same trailing-data check as GB1: the blob must be fully consumed.
+	if len(data) != 0 {
+		return nil, fmt.Errorf("gb2 trailing data after final chunk: %d bytes", len(data))
 	}
 	return plaintext, nil
 }

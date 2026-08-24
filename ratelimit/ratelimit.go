@@ -17,13 +17,23 @@ type Limiter struct {
 	// <= 0 means "no limit" and WaitN never blocks.
 	bytesPerSecond atomic.Int64
 	bucket         int64
-	maxBucket      int64
-	mu             sync.Mutex
-	ticker         *time.Ticker
-	stopCh         chan struct{}
-	stopOnce       sync.Once
+	// fracAccum accumulates fractional tokens between refill ticks so low
+	// rates (where rate/10 truncates to zero, e.g. 1..9 bytes/s) still
+	// refill over time. Stored in tenths of a token: 10 units = 1 token.
+	fracAccum int64
+	maxBucket int64
+	mu        sync.Mutex
+	ticker    *time.Ticker
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	// stopped is guarded by mu and set by Stop; SetRate checks it so a
+	// limiter that was explicitly stopped is never revived.
+	stopped bool
 }
 
+// NewLimiter creates a token bucket limiter. If bytesPerSecond <= 0, no
+// rate limiting is applied and WaitN returns immediately; a positive rate
+// can still be enabled later via SetRate, which starts the refill loop.
 func NewLimiter(bytesPerSecond int64) *Limiter {
 	if bytesPerSecond <= 0 {
 		return &Limiter{}
@@ -49,6 +59,11 @@ func (l *Limiter) refill() {
 			if rate := l.bytesPerSecond.Load(); rate > 0 {
 				l.mu.Lock()
 				l.bucket += rate / 10
+				l.fracAccum += rate % 10
+				if l.fracAccum >= 10 {
+					l.bucket += l.fracAccum / 10
+					l.fracAccum %= 10
+				}
 				if l.bucket > l.maxBucket {
 					l.bucket = l.maxBucket
 				}
@@ -99,20 +114,49 @@ func (l *Limiter) WaitN(ctx context.Context, n int) error {
 	return nil
 }
 
+// SetRate atomically updates the rate limit. A value <= 0 disables
+// limiting. Calling SetRate with a positive value on a limiter created
+// via NewLimiter(0) starts the refill loop (with a full bucket), so
+// dynamically enabling rate limiting works. SetRate has no effect after
+// Stop.
 func (l *Limiter) SetRate(bytesPerSecond int64) {
+	l.mu.Lock()
+	if l.stopped {
+		// A stopped limiter stays inert: re-enabling it would leave the
+		// rate updated with no refill loop running, so waiters would block
+		// on an empty bucket forever.
+		l.mu.Unlock()
+		return
+	}
 	l.bytesPerSecond.Store(bytesPerSecond)
 	if bytesPerSecond > 0 {
-		l.mu.Lock()
 		l.maxBucket = bytesPerSecond * 2
 		if l.bucket > l.maxBucket {
 			l.bucket = l.maxBucket
 		}
+		// NewLimiter(0) returned a bare limiter with no refill loop; start
+		// one now that a positive rate is configured. mu makes this safe
+		// against a concurrent Stop.
+		startRefill := l.ticker == nil
+		if startRefill {
+			l.bucket = bytesPerSecond // start from a full bucket
+			l.ticker = time.NewTicker(100 * time.Millisecond)
+			l.stopCh = make(chan struct{})
+		}
 		l.mu.Unlock()
+		if startRefill {
+			go l.refill()
+		}
+		return
 	}
+	l.mu.Unlock()
 }
 
 func (l *Limiter) Stop() {
 	l.stopOnce.Do(func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.stopped = true
 		if l.ticker != nil {
 			l.ticker.Stop()
 			close(l.stopCh)

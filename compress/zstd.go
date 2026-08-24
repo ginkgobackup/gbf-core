@@ -47,6 +47,14 @@ var ErrDecompressedTooLarge = fmt.Errorf("decompressed output exceeds %d bytes",
 // distinguish from chunk compression-bomb defense.
 var ErrManifestDecompressedTooLarge = fmt.Errorf("manifest exceeds decompression limit %d bytes", MaxManifestDecompressedSize)
 
+// Compressor is the compression abstraction used for blob chunks and
+// manifests.
+//
+// Alias contract: implementations may return the input slice itself when
+// no transformation is needed (NoneCompressor does exactly this). Callers
+// must treat returned slices as read-only and must not modify them — doing
+// so would also corrupt the caller's own input buffer. Callers that need
+// to mutate the output must copy it first.
 type Compressor interface {
 	Type() CompressorType
 	Compress(data []byte) ([]byte, error)
@@ -154,6 +162,10 @@ func DefaultCompressor() *ZstdCompressor {
 	return NewZstdCompressor(1)
 }
 
+// NewCompressor returns a Compressor for the given type. For backward
+// compatibility, an unknown type falls back to zstd at the requested level
+// instead of failing. Use NewCompressorStrict when a mistyped configuration
+// must surface as an error rather than silently changing the format.
 func NewCompressor(ct CompressorType, level int) Compressor {
 	switch ct {
 	case CompressNone:
@@ -165,6 +177,24 @@ func NewCompressor(ct CompressorType, level int) Compressor {
 	case CompressZstd:
 		return NewZstdCompressor(level)
 	default:
-		return NewZstdCompressor(3)
+		return NewZstdCompressor(level)
+	}
+}
+
+// NewCompressorStrict is like NewCompressor but returns an error for
+// unknown compressor types instead of silently falling back to zstd.
+// Prefer this when validating user-supplied configuration.
+func NewCompressorStrict(ct CompressorType, level int) (Compressor, error) {
+	switch ct {
+	case CompressNone:
+		return &NoneCompressor{}, nil
+	case CompressS2:
+		return NewS2Compressor(level), nil
+	case CompressDeflate:
+		return NewDeflateCompressor(level), nil
+	case CompressZstd:
+		return NewZstdCompressor(level), nil
+	default:
+		return nil, fmt.Errorf("unknown compressor type: %q", string(ct))
 	}
 }

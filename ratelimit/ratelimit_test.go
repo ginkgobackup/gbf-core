@@ -145,6 +145,90 @@ func TestLimiterStopOnZeroRate(t *testing.T) {
 	l.Stop()
 }
 
+// TestLimiterLowRateRefillsAfterDrain pins the fractional-token fix: at
+// rates where rate/10 truncates to zero (1..9 bytes/s), the integer
+// refill `bucket += rate / 10` never added anything, so a drained bucket
+// stayed empty forever. The fractional accumulator must eventually
+// produce new tokens.
+func TestLimiterLowRateRefillsAfterDrain(t *testing.T) {
+	l := NewLimiter(5) // 5 bytes/s → 0.5 tokens per 100ms tick
+	defer l.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := l.WaitN(ctx, 5); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	// 400ms ≈ 4 ticks × 0.5 tokens = 2 tokens.
+	time.Sleep(400 * time.Millisecond)
+	if err := l.WaitN(ctx, 1); err != nil {
+		t.Fatalf("WaitN after fractional refill: %v — low-rate limiter stalled forever", err)
+	}
+}
+
+// TestLimiterSingleBytePerSecondRefills is the extreme low-rate case: at
+// 1 byte/s each tick adds 0.1 tokens, so a full token needs ~1s.
+func TestLimiterSingleBytePerSecondRefills(t *testing.T) {
+	l := NewLimiter(1)
+	defer l.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := l.WaitN(ctx, 1); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if err := l.WaitN(ctx, 1); err != nil {
+		t.Fatalf("WaitN(1 byte/s) after 1.2s: %v — limiter stalled forever", err)
+	}
+}
+
+// TestLimiterZeroRateThenEnable pins the dynamic-enable lifecycle: a
+// limiter created with NewLimiter(0) has no refill loop, so SetRate with a
+// positive value must start one (with a full bucket) — otherwise WaitN
+// blocks forever on an eternally empty bucket.
+func TestLimiterZeroRateThenEnable(t *testing.T) {
+	l := NewLimiter(0)
+	l.SetRate(1024)
+	defer l.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- l.WaitN(ctx, 1024) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitN after dynamic enable: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("WaitN blocked forever after NewLimiter(0)+SetRate(positive)")
+	}
+}
+
+// TestLimiterStoppedIgnoresSetRate verifies that a stopped limiter stays
+// inert: SetRate after Stop must be ignored entirely. If the rate were
+// applied without a refill loop (or with the bucket shrunk to the new
+// burst cap), waiters would block forever on an empty bucket.
+func TestLimiterStoppedIgnoresSetRate(t *testing.T) {
+	l := NewLimiter(1000) // full 1000-token bucket
+	l.Stop()
+	l.SetRate(100) // must be ignored: rate stays 1000, bucket stays full
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- l.WaitN(ctx, 1000) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitN on stopped limiter: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SetRate after Stop took effect — stopped limiter must be inert")
+	}
+}
+
 func TestWriterThrottlesLargeWrite(t *testing.T) {
 	l := NewLimiter(1 << 10) // 1 KiB/s
 	defer l.Stop()

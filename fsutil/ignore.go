@@ -5,6 +5,7 @@ package fsutil
 
 import (
 	"bufio"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -110,6 +111,12 @@ func ParseSizeFilter(s string) (SizeFilter, bool) {
 	}
 	val, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
 	if err != nil {
+		return SizeFilter{}, false
+	}
+	// Reject negative sizes (meaningless) and overflow: e.g.
+	// "size:>9223372036854775807gb" would wrap around to a negative value
+	// and silently invert the filter's semantics.
+	if val < 0 || (multiplier > 1 && val > math.MaxInt64/multiplier) {
 		return SizeFilter{}, false
 	}
 	return SizeFilter{Op: op, Bytes: val * multiplier}, true

@@ -252,3 +252,21 @@ func TestDefaultCompressorIsZstd(t *testing.T) {
 		t.Fatalf("DefaultCompressor: got %q, want %q", c.Type(), CompressZstd)
 	}
 }
+
+// TestNewCompressorStrict verifies that the strict factory rejects unknown
+// compressor types (a mistyped config must surface as an error) while
+// accepting every known type.
+func TestNewCompressorStrict(t *testing.T) {
+	for _, ct := range []CompressorType{CompressNone, CompressZstd, CompressDeflate, CompressS2} {
+		c, err := NewCompressorStrict(ct, 1)
+		if err != nil {
+			t.Fatalf("NewCompressorStrict(%q): %v", ct, err)
+		}
+		if c.Type() != ct {
+			t.Errorf("NewCompressorStrict(%q): got %q", ct, c.Type())
+		}
+	}
+	if c, err := NewCompressorStrict(CompressorType("bogus"), 1); err == nil {
+		t.Errorf("NewCompressorStrict accepted unknown type, got %v", c)
+	}
+}

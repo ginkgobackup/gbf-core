@@ -3,6 +3,9 @@
 
 package compress
 
+// NoneCompressor is the identity Compressor. Per the Compressor alias
+// contract, Compress and Decompress return the input slice itself (no
+// copy); callers must not modify the returned buffer.
 type NoneCompressor struct{}
 
 func (c *NoneCompressor) Type() CompressorType { return CompressNone }

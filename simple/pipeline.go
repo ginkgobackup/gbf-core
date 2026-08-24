@@ -101,6 +101,13 @@ type PipelineConfig struct {
 	// back to a sensible default derived from runtime.NumCPU() (capped to
 	// avoid thrashing on high-core machines).
 	WorkerCount int
+	// AllowScanErrors permits the backup to proceed when some paths cannot
+	// be read during the scan (permission errors, network hiccups, ...).
+	// The resulting manifest records Stats.ScanErrors and must never be
+	// used as an incremental baseline (loadPreviousFiles skips it). The
+	// default (false) fails the run so an incomplete manifest is never
+	// committed silently.
+	AllowScanErrors bool
 }
 
 type PipelineResult struct {
@@ -217,7 +224,14 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	}
 	p.warmStoreCache(ctx)
 
-	cloudID := ResolveCloudID(p.cfg.DeviceID, p.cfg.SourceID)
+	// An explicit CloudID (imported sources, cross-device manifests, or a
+	// caller-supplied manifest directory) takes precedence over the derived
+	// key; see RestoreConfig.CloudID and SaveManifestWithKey for the same
+	// precedence.
+	cloudID := p.cfg.CloudID
+	if cloudID == "" {
+		cloudID = ResolveCloudID(p.cfg.DeviceID, p.cfg.SourceID)
+	}
 	prevFiles, err := p.loadPreviousFiles(metaDir, cloudID)
 	if err != nil {
 		return nil, err
@@ -229,10 +243,18 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 		p.progress.SetPhase(PhaseUploading)
 	}
 
-	files, dirEntries, err := p.scanSourceTree(ctx, scanPath)
+	files, dirEntries, scanErrCount, err := p.scanSourceTree(ctx, scanPath)
 	if err != nil {
 		return nil, err
 	}
+	if scanErrCount > 0 && !p.cfg.AllowScanErrors {
+		// Committing a manifest built from an incomplete scan would misreport
+		// the missing files as deleted and pollute the incremental baseline.
+		// Fail loudly instead; callers that genuinely tolerate an incomplete
+		// snapshot must opt in via AllowScanErrors.
+		return nil, fmt.Errorf("scan encountered %d unreadable path(s); aborting to prevent an incomplete manifest (set PipelineConfig.AllowScanErrors to allow an incomplete snapshot)", scanErrCount)
+	}
+	newManifest.Stats.ScanErrors = scanErrCount
 
 	addEmptyDirs(newManifest, files, dirEntries)
 
@@ -324,13 +346,21 @@ func (p *SimplePipeline) warmStoreCache(ctx context.Context) {
 
 // loadPreviousFiles returns the file map of the latest manifest for this
 // source, or nil when a full backup is requested or no previous manifest
-// exists.
+// exists. A manifest recorded with scan errors (an incomplete snapshot
+// produced under AllowScanErrors) is never used as an incremental baseline:
+// its missing files would be misreported as deleted.
 func (p *SimplePipeline) loadPreviousFiles(metaDir, cloudID string) (map[string]FileEntry, error) {
 	var prevFiles map[string]FileEntry
 	if !p.cfg.ForceFull {
 		prevManifest, loadErr := LoadLatestManifest(metaDir, cloudID)
 		if loadErr != nil && !errors.Is(loadErr, ErrManifestNotFound) {
 			return nil, fmt.Errorf("load previous manifest: %w", loadErr)
+		}
+		if prevManifest != nil && prevManifest.Stats.ScanErrors > 0 {
+			slog.Warn("GBF previous manifest is incomplete (scan errors), ignoring it as incremental baseline",
+				"source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot,
+				"scan_errors", prevManifest.Stats.ScanErrors, "session_id", p.cfg.SessionID)
+			prevManifest = nil
 		}
 		if prevManifest != nil {
 			prevFiles = prevManifest.BuildFileMap()
@@ -345,15 +375,17 @@ func (p *SimplePipeline) loadPreviousFiles(metaDir, cloudID string) (map[string]
 }
 
 // scanSourceTree walks scanPath and partitions the result into file and
-// directory entries. Unreadable paths are counted and logged while the walk
-// continues; only walk failures or a cancelled context abort the scan.
-func (p *SimplePipeline) scanSourceTree(ctx context.Context, scanPath string) (files []scanEntry, dirEntries []scanEntry, err error) {
-	var walkErrors int
+// directory entries. Unreadable paths are counted (and returned as
+// scanErrCount) and logged while the walk continues; only a cancelled
+// context aborts the scan. The caller decides whether a non-zero
+// scanErrCount fails the run (default) or is tolerated via
+// PipelineConfig.AllowScanErrors.
+func (p *SimplePipeline) scanSourceTree(ctx context.Context, scanPath string) (files []scanEntry, dirEntries []scanEntry, scanErrCount int, err error) {
 	var walkErrorPaths []string
 	walkErr := filepath.Walk(scanPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			walkErrors++
-			if walkErrors <= 10 {
+			scanErrCount++
+			if scanErrCount <= 10 {
 				walkErrorPaths = append(walkErrorPaths, path)
 			}
 			if info != nil && info.IsDir() {
@@ -405,18 +437,18 @@ func (p *SimplePipeline) scanSourceTree(ctx context.Context, scanPath string) (f
 		return nil
 	})
 	if walkErr != nil {
-		return nil, nil, fmt.Errorf("walk: %w", walkErr)
+		return nil, nil, scanErrCount, fmt.Errorf("walk: %w", walkErr)
 	}
-	if walkErrors > 0 {
+	if scanErrCount > 0 {
 		slog.Warn("GBF scan encountered errors",
 			"source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot,
-			"error_count", walkErrors,
+			"error_count", scanErrCount,
 			"sample_paths", walkErrorPaths, "session_id", p.cfg.SessionID)
 	}
 
 	slog.Info("GBF scan complete", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "files", len(files), "session_id", p.cfg.SessionID)
 
-	return files, dirEntries, nil
+	return files, dirEntries, scanErrCount, nil
 }
 
 // addEmptyDirs records directories that contain neither files nor other

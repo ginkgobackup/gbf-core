@@ -18,9 +18,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/ginkgobackup/gbf-core/compress"
 	"github.com/ginkgobackup/gbf-core/fsutil"
@@ -184,6 +185,11 @@ type ManifestStats struct {
 	// local repo row.
 	DeletedFiles int   `json:"deletedFiles"`
 	NewBytes     int64 `json:"newBytes"`
+	// ScanErrors counts paths that could not be read during the source
+	// scan. It is only non-zero for snapshots created with
+	// PipelineConfig.AllowScanErrors; such a snapshot is incomplete and is
+	// never used as an incremental baseline (see loadPreviousFiles).
+	ScanErrors int `json:"scanErrors,omitempty"`
 }
 
 func NewManifest(sourceID int64, cloudID, sourceName, sourcePath, deviceID string) *Manifest {
@@ -465,37 +471,46 @@ func ResolveCloudID(deviceID string, sourceID int64) string {
 // Chunks still use the 4 MiB default via defaultStreamDecompressor.
 var localManifestCompressor = compress.NewZstdCompressorWithLimit(1, compress.MaxManifestDecompressedSize, compress.ErrManifestDecompressedTooLarge)
 
-// manifestDecryptHook atomically stores the manifest decryption hook so
-// concurrent pipelines can load (and decrypt) manifests while the hook is
-// being registered, e.g. during startup. It is the single source of truth
-// for LoadManifestFromData and extractHashesFromManifestFile.
-var manifestDecryptHook atomic.Pointer[func(encrypted []byte) ([]byte, error)]
+// hookMu guards ManifestDecryptHook. The exported variable is the legacy
+// direct-assignment API retained for backward compatibility; the
+// setter/getter below are the concurrency-safe API. Both operate on the
+// same storage, so it does not matter which one a caller uses.
+var (
+	hookMu sync.RWMutex
 
-// ManifestDecryptHook is kept for backward compatibility with code that
-// references the variable directly. It is no longer read or written by this
-// package: assigning to it has no effect and unsynchronized direct access
-// from multiple goroutines is a data race. Use SetManifestDecryptHook to
-// register a hook and GetManifestDecryptHook to read the current one — both
-// are safe for concurrent use.
-//
-// Deprecated: use SetManifestDecryptHook / GetManifestDecryptHook.
-var ManifestDecryptHook func(encrypted []byte) ([]byte, error)
+	// ManifestDecryptHook decrypts GKM1-encrypted manifests. It is the
+	// original package-level registration API, kept for backward
+	// compatibility with callers that assign it directly:
+	//
+	//	simple.ManifestDecryptHook = decrypt
+	//
+	// Direct assignment bypasses hookMu and is only safe before any
+	// manifest-loading goroutine starts (the usual startup-time
+	// registration). New code must use SetManifestDecryptHook /
+	// GetManifestDecryptHook, which are safe for concurrent use with
+	// manifest loading.
+	//
+	// Deprecated: Direct assignment is a data race when concurrent
+	// manifest loads are running. Use SetManifestDecryptHook instead;
+	// this variable will be removed in the next minor version.
+	ManifestDecryptHook func(encrypted []byte) ([]byte, error)
+)
 
-// SetManifestDecryptHook atomically registers the hook used to decrypt
-// GKM1-encrypted manifests. Passing nil clears the hook. Safe for concurrent
-// use with manifest loading.
+// SetManifestDecryptHook registers the hook used to decrypt GKM1-encrypted
+// manifests. Passing nil clears the hook. Safe for concurrent use with
+// manifest loading.
 func SetManifestDecryptHook(fn func(encrypted []byte) ([]byte, error)) {
-	manifestDecryptHook.Store(&fn)
+	hookMu.Lock()
+	defer hookMu.Unlock()
+	ManifestDecryptHook = fn
 }
 
 // GetManifestDecryptHook returns the currently registered manifest
 // decryption hook, or nil if none is set. Safe for concurrent use.
 func GetManifestDecryptHook() func(encrypted []byte) ([]byte, error) {
-	fn := manifestDecryptHook.Load()
-	if fn == nil {
-		return nil
-	}
-	return *fn
+	hookMu.RLock()
+	defer hookMu.RUnlock()
+	return ManifestDecryptHook
 }
 
 func ManifestFilePath(metaDir string, cloudID string, ts time.Time, deviceID string) string {
@@ -510,14 +525,27 @@ func SaveManifest(metaDir string, m *Manifest) (string, error) {
 	return SaveManifestWithKey(metaDir, m, nil)
 }
 
+// manifestSaveMu serializes manifest saves within this process. Saves are
+// low-frequency (once per backup run), so this costs nothing and keeps the
+// same-second conflict log noise down. Correctness across processes no
+// longer depends on it: the final manifest commit goes through
+// fsutil.CommitFileNoReplace, which atomically refuses to overwrite an
+// existing file EVEN when the contender is another process (see
+// TestManifestConcurrentSavesSameSecond and TestManifestCrossProcessSave).
+var manifestSaveMu sync.Mutex
+
 // SaveManifestWithKey persists a manifest under
 // metaDir/manifests/{cloudID}/{unix}_{deviceID}.json.zst and returns the
 // actual path written.
 //
 // Same-second conflict: the deterministic filename only has second
 // resolution, so two backups of the same source completing within one second
-// would silently overwrite each other. When the target path already exists,
-// this function writes to "{unix}_{deviceID}_{6hex}.json.zst" instead. The
+// would collide. The manifest is committed with a NO-REPLACE atomic commit:
+// if the target name already exists, the commit fails with os.ErrExist and
+// the save retries under "{unix}_{deviceID}_{6hex}.json.zst". Unlike a
+// Stat-then-write pre-check, this is race-free even against OTHER PROCESSES
+// saving into the same repository — on POSIX the commit is link(2)-based,
+// on Windows it is MoveFileEx without MOVEFILE_REPLACE_EXISTING. The
 // suffixed name remains visible to all readers (prefix scans in
 // LoadManifestByTimestamp/ManifestExistsByTimestamp, content matching in
 // Delete/TrashManifest, isManifestFile listing). Lexicographically it sorts
@@ -527,6 +555,8 @@ func SaveManifest(metaDir string, m *Manifest) (string, error) {
 // via ManifestFilePath only find the FIRST manifest of that second — they
 // must use the returned path when they need the exact file just written.
 func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) (string, error) {
+	manifestSaveMu.Lock()
+	defer manifestSaveMu.Unlock()
 	ts, err := time.Parse(time.RFC3339, m.Timestamp)
 	if err != nil {
 		ts = time.Now()
@@ -563,28 +593,62 @@ func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) (string
 	sum := sha256.Sum256(compressed)
 	checksumHex := hex.EncodeToString(sum[:])
 
-	// Resolve same-second conflicts by suffixing rather than overwriting.
-	// A handful of attempts is plenty: each suffix has 24 bits of entropy.
-	finalPath := path
-	for attempt := 0; attempt < 4; attempt++ {
-		if _, statErr := os.Stat(finalPath); os.IsNotExist(statErr) {
+	// Stage the manifest body once (fsynced, unique name so cross-process
+	// savers cannot clobber each other's staging file), then commit it
+	// with a no-replace atomic move under the primary name — or, when
+	// another save (possibly from another process) already claimed that
+	// name this second, under a random 6-hex suffix.
+	staging := path + "." + uuid.NewString() + ".tmp"
+	if err := fsutil.WriteStagingFile(staging, compressed, 0600); err != nil {
+		return "", fmt.Errorf("stage manifest: %w", err)
+	}
+
+	// Commit attempts are side-effect free: no file is written until the
+	// no-replace commit succeeds, so a losing attempt cannot damage the
+	// winner's manifest or sidecar. (Writing the sidecar BEFORE the
+	// commit — the pre-no-replace order — would clobber and then orphan
+	// the winner's sidecar on same-second conflicts; see
+	// TestSaveManifestSameSecondConflict.)
+	var finalPath string
+	for attempt := 0; ; attempt++ {
+		candidate := path
+		if attempt > 0 {
+			var b [3]byte
+			if _, randErr := rand.Read(b[:]); randErr != nil {
+				_ = os.Remove(staging)
+				return "", fmt.Errorf("generate conflict suffix: %w", randErr)
+			}
+			candidate = strings.TrimSuffix(path, ".json.zst") + "_" + hex.EncodeToString(b[:]) + ".json.zst"
+			slog.Warn("GBF manifest same-second conflict, retrying with suffix",
+				"component", "manifest", "cloud_id", cloudID, "path", filepath.Base(candidate))
+		}
+		if attempt >= 8 {
+			// Astronomically unlikely: 7 suffixed attempts all collided.
+			_ = os.Remove(staging)
+			return "", fmt.Errorf("manifest same-second conflict: no free name under %s", path)
+		}
+
+		err := fsutil.CommitFileNoReplace(staging, candidate)
+		if err == nil {
+			finalPath = candidate
 			break
 		}
-		var b [3]byte
-		if _, randErr := rand.Read(b[:]); randErr != nil {
-			return "", fmt.Errorf("generate conflict suffix: %w", randErr)
+		if errors.Is(err, os.ErrExist) {
+			// Another save (this process or another) claimed the name.
+			// Retry under a random suffix — nothing to clean up.
+			continue
 		}
-		finalPath = strings.TrimSuffix(path, ".json.zst") + "_" + hex.EncodeToString(b[:]) + ".json.zst"
-	}
-	if finalPath != path {
-		slog.Warn("GBF manifest same-second conflict, writing with suffix",
-			"component", "manifest", "cloud_id", cloudID, "path", filepath.Base(finalPath))
+		_ = os.Remove(staging)
+		return "", fmt.Errorf("commit manifest: %w", err)
 	}
 
-	if err := fsutil.WriteFileAtomic(finalPath, compressed, 0600); err != nil {
-		return "", fmt.Errorf("write manifest: %w", err)
-	}
-
+	// The sidecar is written AFTER the commit. A crash in between leaves a
+	// committed manifest without its sidecar, which LoadManifest rejects
+	// and LoadLatestManifest skips via its fallback-to-older-manifest
+	// logic — the interrupted save is effectively rolled back, and no
+	// other save's files are ever damaged. After a successful commit the
+	// final name is exclusively ours, so overwriting the sidecar (e.g. a
+	// leftover from a crashed attempt) is always safe.
 	checksumPath := manifestChecksumPath(finalPath)
 	if err := fsutil.WriteFileAtomic(checksumPath, []byte(checksumHex), 0600); err != nil {
 		return "", fmt.Errorf("write manifest checksum: %w", err)
@@ -865,7 +929,26 @@ func LoadLatestManifest(metaDir string, cloudID string) (*Manifest, error) {
 		}
 		return candidates[i].name > candidates[j].name
 	})
-	return LoadManifest(filepath.Join(dir, candidates[0].name))
+	// Try candidates newest-first instead of committing to the first one.
+	// If the newest manifest fails to load (crash between the manifest and
+	// checksum writes from an older code version, partial sync, bit rot),
+	// falling back to the previous snapshot keeps incremental backups and
+	// restores working instead of hard-failing until someone deletes the
+	// broken file by hand.
+	var firstErr error
+	for _, cand := range candidates {
+		m, loadErr := LoadManifest(filepath.Join(dir, cand.name))
+		if loadErr == nil {
+			return m, nil
+		}
+		if firstErr == nil {
+			firstErr = loadErr
+		}
+		slog.Warn("GBF manifest load failed, trying older candidate",
+			"component", "manifest", "cloud_id", cloudID,
+			"file", cand.name, "error", loadErr.Error())
+	}
+	return nil, fmt.Errorf("load latest manifest: newest candidate %q failed (%w) and %d older candidate(s) also failed", candidates[0].name, firstErr, len(candidates)-1)
 }
 
 func ListManifests(metaDir string, cloudID string) ([]*Manifest, []string, error) {

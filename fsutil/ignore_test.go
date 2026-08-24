@@ -69,6 +69,13 @@ func TestParseSizeFilter(t *testing.T) {
 		{"size:", "", 0, false},
 		{"size:>abc", "", 0, false},
 		{"size:>", "", 0, false},
+		// Overflow: MaxInt64 × 1024³ would wrap to a negative value and
+		// silently invert the filter's semantics — must be rejected.
+		{"size:>9223372036854775807gb", "", 0, false},
+		{"size:>9223372036854775807mb", "", 0, false},
+		{"size:>9223372036854775807kb", "", 0, false},
+		// Negative sizes are meaningless.
+		{"size:>-1kb", "", 0, false},
 	}
 	for _, tt := range tests {
 		f, ok := ParseSizeFilter(tt.input)

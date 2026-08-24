@@ -1,0 +1,69 @@
+{
+  "version": 2,
+  "sourceId": 7,
+  "cloudId": "fixture-device/7",
+  "sourceName": "fixture-source",
+  "sourcePath": "C:\\Users\\fixture\\Documents",
+  "timestamp": "2026-05-11T08:00:00Z",
+  "deviceId": "fixture-device",
+  "dirs": {
+    "": {
+      "files": [
+        {
+          "name": "report.txt",
+          "contentHash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "size": 123,
+          "mtime": "2026-05-11T08:00:00Z",
+          "mode": 420
+        }
+      ],
+      "subdirs": [
+        "docs",
+        "empty-dir"
+      ]
+    },
+    "docs": {
+      "files": [
+        {
+          "name": "data.bin",
+          "contentHash": "2222222222222222222222222222222222222222222222222222222222222222",
+          "size": 4567,
+          "mtime": 1778486400000000000,
+          "mode": 420,
+          "chunks": [
+            {
+              "hash": "3333333333333333333333333333333333333333333333333333333333333333",
+              "size": 4096
+            },
+            {
+              "hash": "4444444444444444444444444444444444444444444444444444444444444444444",
+              "size": 471
+            }
+          ]
+        },
+        {
+          "name": "legacy-millis.txt",
+          "contentHash": "5555555555555555555555555555555555555555555555555555555555555555555",
+          "size": 8,
+          "mtime": 1778486400000,
+          "mode": 416
+        }
+      ],
+      "subdirs": []
+    },
+    "empty-dir": {
+      "files": [],
+      "subdirs": []
+    }
+  },
+  "stats": {
+    "fileCount": 3,
+    "totalSize": 4698,
+    "newFiles": 3,
+    "changedFiles": 0,
+    "unchangedFiles": 0,
+    "deletedFiles": 1,
+    "newBytes": 4698,
+    "scanErrors": 2
+  }
+}

@@ -5,10 +5,86 @@ package crypto
 
 import (
 	"crypto/rand"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/ginkgobackup/gbf-core/vault"
 )
+
+// cacheSize returns the current number of cached AEAD instances.
+func cacheSize(e *AESEncryptor) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.cache)
+}
+
+// TestAESEncryptorGCMCacheCap pins the bounded-cache behavior: more than
+// maxGCMCacheEntries distinct keys must still round-trip (extra keys are
+// served uncached), and the cache entry count must never exceed the cap.
+func TestAESEncryptorGCMCacheCap(t *testing.T) {
+	e := NewAESEncryptor()
+	for i := 0; i < maxGCMCacheEntries+16; i++ {
+		key := []byte(fmt.Sprintf("%032d", i)) // exactly 32 bytes, distinct
+		ct, err := e.Encrypt([]byte("payload"), key)
+		if err != nil {
+			t.Fatalf("encrypt key %d: %v", i, err)
+		}
+		pt, err := e.Decrypt(ct, key)
+		if err != nil {
+			t.Fatalf("decrypt key %d: %v", i, err)
+		}
+		if string(pt) != "payload" {
+			t.Fatalf("roundtrip mismatch for key %d", i)
+		}
+	}
+	if n := cacheSize(e); n > maxGCMCacheEntries {
+		t.Fatalf("cache size = %d, want <= %d", n, maxGCMCacheEntries)
+	}
+}
+
+// TestAESEncryptorGCMCacheCapStrict verifies the cap is a STRICT bound:
+// under concurrent inserts of distinct keys the cache must never exceed
+// maxGCMCacheEntries — not even transiently — and every key must still
+// round-trip (the overflow keys are simply served uncached).
+func TestAESEncryptorGCMCacheCapStrict(t *testing.T) {
+	e := NewAESEncryptor()
+	const workers = 8
+	const keysPerWorker = 96 // 8*96 = 768 distinct keys > 256 cap
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < keysPerWorker; i++ {
+				key := []byte(fmt.Sprintf("%032d", w*keysPerWorker+i))
+				ct, err := e.Encrypt([]byte("payload"), key)
+				if err != nil {
+					t.Errorf("encrypt key %d: %v", w*keysPerWorker+i, err)
+					return
+				}
+				pt, err := e.Decrypt(ct, key)
+				if err != nil {
+					t.Errorf("decrypt key %d: %v", w*keysPerWorker+i, err)
+					return
+				}
+				if string(pt) != "payload" {
+					t.Errorf("roundtrip mismatch for key %d", w*keysPerWorker+i)
+					return
+				}
+				if n := cacheSize(e); n > maxGCMCacheEntries {
+					t.Errorf("cache size = %d exceeds strict cap %d", n, maxGCMCacheEntries)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	if n := cacheSize(e); n > maxGCMCacheEntries {
+		t.Fatalf("final cache size = %d, want <= %d", n, maxGCMCacheEntries)
+	}
+}
 
 func TestAES_RoundTrip(t *testing.T) {
 	e := NewAESEncryptor()
