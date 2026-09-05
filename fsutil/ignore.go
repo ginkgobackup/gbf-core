@@ -16,6 +16,11 @@ import (
 
 const IgnoreFileName = ".ginkgo-backupignore"
 
+// RestoreTmpSuffix 是恢复流程写入的临时文件后缀。恢复中断可能在源目录留下
+// 残留文件；若被后续备份收录，将来恢复时会与同名真实文件的临时文件路径
+// 冲突（Windows 上表现为 rename Access denied）。此类文件永不应进入备份。
+const RestoreTmpSuffix = ".ginkgo-backup-restore-tmp"
+
 var caseInsensitiveFS = runtime.GOOS == "windows" || runtime.GOOS == "darwin"
 
 func normalizeForMatch(s string) string {
@@ -160,6 +165,10 @@ func SplitExcludePatterns(patterns []string) (positives []string, negatives []st
 }
 
 func IsExcluded(relPath string, positives []string, negatives []string) bool {
+	// 内置排除：恢复临时文件残留永远不备份，优先级高于任何用户负模式。
+	if strings.HasSuffix(normalizeForMatch(relPath), RestoreTmpSuffix) {
+		return true
+	}
 	relPath = normalizeForMatch(relPath)
 	matched := false
 	for _, pat := range positives {

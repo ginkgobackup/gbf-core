@@ -158,6 +158,23 @@ func TestIsExcludedEmptyPatterns(t *testing.T) {
 	}
 }
 
+func TestIsExcludedRestoreTmpSuffix(t *testing.T) {
+	// 恢复临时文件残留必须被内置排除，即使用户显式写了负模式想要包含它。
+	if !IsExcluded("resources.pak.ginkgo-backup-restore-tmp", nil, nil) {
+		t.Fatal("restore tmp residue should always be excluded")
+	}
+	if !IsExcluded("a/b/data.bin.ginkgo-backup-restore-tmp", nil, nil) {
+		t.Fatal("nested restore tmp residue should be excluded")
+	}
+	if IsExcluded("resources.pak", nil, nil) {
+		t.Fatal("normal files must not be excluded")
+	}
+	// 负模式也无法恢复临时文件：内置排除优先。
+	if !IsExcluded("keep.ginkgo-backup-restore-tmp", nil, []string{"*.ginkgo-backup-restore-tmp"}) {
+		t.Fatal("builtin exclusion must take precedence over negative patterns")
+	}
+}
+
 func TestMatchPatternExactPath(t *testing.T) {
 	if !MatchPattern("foo/bar.txt", "foo/bar.txt") {
 		t.Fatal("exact path should match")
