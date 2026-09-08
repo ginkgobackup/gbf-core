@@ -4,6 +4,7 @@
 package simple
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -663,26 +664,14 @@ func manifestChecksumPath(manifestPath string) string {
 }
 
 func verifyManifestChecksum(manifestPath string, data []byte) error {
-	// GKM1-encrypted manifests carry their own integrity protection via
-	// AES-256-GCM authentication. When the .sha256 sidecar is missing
-	// (common in mesh-backup peer-receive repos where manifests are
-	// uploaded as opaque blobs without their sidecar checksum files),
-	// the GCM tag is sufficient to detect tampering. Skip the sidecar
-	// requirement for encrypted manifests so they can be loaded.
-	if len(data) >= MagicSize && string(data[:MagicSize]) == GKM1Magic {
-		checksumPath := manifestChecksumPath(manifestPath)
-		if _, err := os.Stat(checksumPath); os.IsNotExist(err) {
-			return nil
-		}
-		// Sidecar exists — verify it for defense in depth.
-	}
 	checksumPath := manifestChecksumPath(manifestPath)
 	expectedBytes, err := os.ReadFile(checksumPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// A manifest without a sidecar checksum is not trustworthy: an
-			// attacker (or a partial sync) can tamper with the manifest body
-			// without detection. Reject it instead of silently accepting.
+			// A manifest without a sidecar checksum is never a complete local
+			// commit. Encrypted manifests have authenticated contents, but the
+			// sidecar still records that the local commit completed and keeps
+			// plaintext and encrypted manifests on one integrity contract.
 			return fmt.Errorf("manifest checksum missing: %s", checksumPath)
 		}
 		return fmt.Errorf("read manifest checksum: %w", err)
@@ -872,11 +861,24 @@ func LoadManifestByTimestamp(metaDir string, cloudID string, timestamp string) (
 		return nil, fmt.Errorf("readdir: %w", err)
 	}
 	prefix := fmt.Sprintf("%d_", ts.Unix())
+	var firstErr error
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), prefix) {
 			continue
 		}
-		return LoadManifest(filepath.Join(dir, e.Name()))
+		m, loadErr := LoadManifest(filepath.Join(dir, e.Name()))
+		if loadErr == nil {
+			return m, nil
+		}
+		if firstErr == nil {
+			firstErr = loadErr
+		}
+		slog.Warn("GBF manifest load failed for timestamp candidate",
+			"component", "manifest", "cloud_id", cloudID,
+			"file", e.Name(), "error", loadErr.Error())
+	}
+	if firstErr != nil {
+		return nil, fmt.Errorf("load manifest for timestamp %s: %w", timestamp, firstErr)
 	}
 	return nil, ErrManifestNotFound
 }
@@ -1550,6 +1552,104 @@ func sourceRegistriesDir(metaDir string) string {
 	return filepath.Join(metaDir, "manifests", "_sources")
 }
 
+// RegistryEnvelopeMagic prefixes the v1 source-registry envelope format:
+//
+//	"GBR1" (4 bytes) || SHA-256(compressed payload) (32 raw bytes) || payload
+//
+// The payload is the zstd-compressed registry JSON, exactly what legacy
+// (pre-envelope) files store as the whole file. Embedding the checksum in
+// the same atomically-renamed file makes checksum+payload a single commit
+// unit — a truncated or partially-written registry can never verify.
+// Corruption of any byte is detected either by the checksum mismatch or by
+// the zstd/JSON decode failing.
+const RegistryEnvelopeMagic = "GBR1"
+
+const registryEnvelopeHeaderSize = len(RegistryEnvelopeMagic) + sha256.Size
+
+// EncodeSourceRegistry serializes reg into the GBR1 checksum envelope.
+// Shared by the local store and the cloud store so both write the same
+// on-disk/on-object format.
+func EncodeSourceRegistry(reg *SourceRegistry) ([]byte, error) {
+	data, err := json.Marshal(reg)
+	if err != nil {
+		return nil, fmt.Errorf("marshal source registry: %w", err)
+	}
+	compressed, err := localManifestCompressor.Compress(data)
+	if err != nil {
+		return nil, fmt.Errorf("compress source registry: %w", err)
+	}
+	sum := sha256.Sum256(compressed)
+	out := make([]byte, 0, registryEnvelopeHeaderSize+len(compressed))
+	out = append(out, RegistryEnvelopeMagic...)
+	out = append(out, sum[:]...)
+	out = append(out, compressed...)
+	return out, nil
+}
+
+// DecodeSourceRegistry parses registry bytes in either the GBR1 checksum
+// envelope or the legacy format (bare zstd-compressed / plain JSON), so
+// repositories written before the envelope keep loading.
+func DecodeSourceRegistry(data []byte) (*SourceRegistry, error) {
+	if len(data) > registryEnvelopeHeaderSize && string(data[:len(RegistryEnvelopeMagic)]) == RegistryEnvelopeMagic {
+		want := data[len(RegistryEnvelopeMagic):registryEnvelopeHeaderSize]
+		payload := data[registryEnvelopeHeaderSize:]
+		got := sha256.Sum256(payload)
+		if !bytes.Equal(want, got[:]) {
+			return nil, fmt.Errorf("source registry checksum mismatch: envelope says %s, payload is %s",
+				hex.EncodeToString(want), hex.EncodeToString(got[:]))
+		}
+		data = payload
+	}
+	if localManifestCompressor.IsCompressed(data) {
+		var err error
+		data, err = localManifestCompressor.Decompress(data)
+		if err != nil {
+			return nil, fmt.Errorf("decompress source registry: %w", err)
+		}
+	}
+	var reg SourceRegistry
+	if err := json.Unmarshal(data, &reg); err != nil {
+		return nil, fmt.Errorf("unmarshal source registry: %w", err)
+	}
+	return &reg, nil
+}
+
+// SourceRegistryLoadFailure describes one registry file that failed to load
+// during a listing.
+type SourceRegistryLoadFailure struct {
+	CloudID string
+	Path    string
+	Err     error
+}
+
+func (f SourceRegistryLoadFailure) String() string {
+	if f.Path == "" {
+		return fmt.Sprintf("%s: %v", f.CloudID, f.Err)
+	}
+	return fmt.Sprintf("%s (%s): %v", f.CloudID, f.Path, f.Err)
+}
+
+// SourceRegistryLoadError reports registry files that failed to load during
+// ListSourceRegistries. The registries that DID load are still returned
+// alongside this error: callers must use them and surface the failure, not
+// treat the whole listing as failed — a corrupt registry must never be
+// silently mistaken for a source that does not exist.
+type SourceRegistryLoadError struct {
+	Failures []SourceRegistryLoadFailure
+}
+
+func (e *SourceRegistryLoadError) Error() string {
+	if len(e.Failures) == 1 {
+		return fmt.Sprintf("1 source registry failed to load: %s", e.Failures[0].String())
+	}
+	parts := make([]string, 0, len(e.Failures))
+	for _, f := range e.Failures {
+		parts = append(parts, f.String())
+	}
+	return fmt.Sprintf("%d source registries failed to load: %s", len(e.Failures), strings.Join(parts, "; "))
+}
+
+
 func SaveSourceRegistry(metaDir string, reg *SourceRegistry) error {
 	if err := validateCloudID(reg.CloudID); err != nil {
 		return fmt.Errorf("source registry cloudID: %w", err)
@@ -1558,13 +1658,9 @@ func SaveSourceRegistry(metaDir string, reg *SourceRegistry) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("mkdir sources registry: %w", err)
 	}
-	data, err := json.Marshal(reg)
+	encoded, err := EncodeSourceRegistry(reg)
 	if err != nil {
-		return fmt.Errorf("marshal source registry: %w", err)
-	}
-	compressed, err := localManifestCompressor.Compress(data)
-	if err != nil {
-		return fmt.Errorf("compress source registry: %w", err)
+		return err
 	}
 	// CloudID may contain path separators (it's a path key like "dev1/42"),
 	// so the final filename can be nested. Make sure the full parent dir
@@ -1574,8 +1670,11 @@ func SaveSourceRegistry(metaDir string, reg *SourceRegistry) error {
 		return fmt.Errorf("mkdir source registry parent: %w", err)
 	}
 	// Use WriteFileAtomic for fsync + atomic rename + parent dir sync,
-	// consistent with SaveManifestWithKey and SaveGEK1KeyFile.
-	if err := fsutil.WriteFileAtomic(path, compressed, 0600); err != nil {
+	// consistent with SaveManifestWithKey and SaveGEK1KeyFile. The checksum
+	// lives inside the envelope, so checksum and payload commit atomically
+	// as one file — unlike a sidecar, there is no window where the two can
+	// diverge.
+	if err := fsutil.WriteFileAtomic(path, encoded, 0600); err != nil {
 		return fmt.Errorf("write source registry: %w", err)
 	}
 	return nil
@@ -1591,17 +1690,18 @@ func LoadSourceRegistry(metaDir string, cloudID string) (*SourceRegistry, error)
 	if err != nil {
 		return nil, fmt.Errorf("read source registry: %w", err)
 	}
-	if localManifestCompressor.IsCompressed(data) {
-		data, err = localManifestCompressor.Decompress(data)
-		if err != nil {
-			return nil, fmt.Errorf("decompress source registry: %w", err)
-		}
+	reg, err := DecodeSourceRegistry(data)
+	if err != nil {
+		return nil, err
 	}
-	var reg SourceRegistry
-	if err := json.Unmarshal(data, &reg); err != nil {
-		return nil, fmt.Errorf("unmarshal source registry: %w", err)
+	// The registry must describe the source it is filed under. A mismatch
+	// means the file was renamed, copied over another source's file, or its
+	// payload silently corrupted into another registry — refuse it rather
+	// than returning source A's settings under source B's identity.
+	if reg.CloudID != cloudID {
+		return nil, fmt.Errorf("source registry identity mismatch: file is for cloudID %q but loaded as %q", reg.CloudID, cloudID)
 	}
-	return &reg, nil
+	return reg, nil
 }
 
 func ListSourceRegistries(metaDir string) ([]*SourceRegistry, error) {
@@ -1611,6 +1711,7 @@ func ListSourceRegistries(metaDir string) ([]*SourceRegistry, error) {
 	// subdirectory. A flat ReadDir would skip those subdirectories and
 	// silently drop every source that has a device fingerprint.
 	var result []*SourceRegistry
+	var loadFailures []SourceRegistryLoadFailure
 	walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -1631,7 +1732,15 @@ func ListSourceRegistries(metaDir string) ([]*SourceRegistry, error) {
 		cloudID := strings.TrimSuffix(filepath.ToSlash(rel), ".json.zst")
 		reg, loadErr := LoadSourceRegistry(metaDir, cloudID)
 		if loadErr != nil {
-			slog.Warn("source registry load failed", "cloud_id", cloudID, "error", loadErr)
+			// Do not silently skip a registry that fails to load: a corrupt
+			// registry must never be mistaken for a source that does not
+			// exist. Collect the failure and report it alongside the
+			// registries that did load (see SourceRegistryLoadError).
+			loadFailures = append(loadFailures, SourceRegistryLoadFailure{
+				CloudID: cloudID,
+				Path:    path,
+				Err:     loadErr,
+			})
 			return nil
 		}
 		result = append(result, reg)
@@ -1639,6 +1748,9 @@ func ListSourceRegistries(metaDir string) ([]*SourceRegistry, error) {
 	})
 	if walkErr != nil {
 		return nil, fmt.Errorf("walk source registries: %w", walkErr)
+	}
+	if len(loadFailures) > 0 {
+		return result, &SourceRegistryLoadError{Failures: loadFailures}
 	}
 	return result, nil
 }

@@ -6,7 +6,9 @@
 package fsutil
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -51,10 +53,16 @@ func WriteStagingFile(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("create tmp file: %w", err)
 	}
 
-	if _, err := f.Write(data); err != nil {
+	n, writeErr := io.Copy(f, bytes.NewReader(data))
+	if writeErr != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
-		return fmt.Errorf("write tmp file: %w", err)
+		return fmt.Errorf("write tmp file: %w", writeErr)
+	}
+	if n != int64(len(data)) {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("write tmp file: %w", io.ErrShortWrite)
 	}
 
 	if err := f.Sync(); err != nil {

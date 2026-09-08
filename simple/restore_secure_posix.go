@@ -165,7 +165,7 @@ func (d *posixDir) Chtimes(name string, t time.Time) error {
 		{Sec: t.Unix(), Nsec: int64(t.Nanosecond())},
 		{Sec: t.Unix(), Nsec: int64(t.Nanosecond())},
 	}
-	return unix.UtimesNanoAt(d.fd, name, ts, 0)
+	return unix.UtimesNanoAt(d.fd, name, ts, unix.AT_SYMLINK_NOFOLLOW)
 }
 
 func (d *posixDir) Close() error {

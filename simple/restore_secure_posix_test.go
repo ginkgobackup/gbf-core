@@ -117,6 +117,29 @@ func TestSecureDirPosixWriteAtomicAndChtimes(t *testing.T) {
 		t.Fatalf("mtime = %v, want %v", fi.ModTime(), want)
 	}
 
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside"), 0644); err != nil {
+		t.Fatalf("write outside: %v", err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	before, err := os.Stat(outside)
+	if err != nil {
+		t.Fatalf("stat outside before: %v", err)
+	}
+	if err := d.Chtimes("link.txt", want.Add(-time.Hour)); err != nil {
+		t.Fatalf("Chtimes symlink: %v", err)
+	}
+	after, err := os.Stat(outside)
+	if err != nil {
+		t.Fatalf("stat outside after: %v", err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("Chtimes changed outside target mtime")
+	}
+
 	// No staging leftovers.
 	entries, err := os.ReadDir(root)
 	if err != nil {

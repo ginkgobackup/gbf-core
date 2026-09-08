@@ -272,6 +272,29 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 	return nil
 }
 
+// verifyingWriter wraps a restore destination and tracks the SHA-256 and
+// byte count of the plaintext actually written, so streaming restore paths
+// can verify the decrypted content against the content-addressed hash.
+// AEAD success proves the blob is intact — not that the blob's plaintext is
+// the content the manifest references (e.g. a blob stored under the wrong
+// hash by an upstream bug, or a hash-keyed store returning the wrong
+// object).
+type verifyingWriter struct {
+	w io.Writer
+	h hash.Hash
+	n int64
+}
+
+func (vw *verifyingWriter) Write(p []byte) (int, error) {
+	n, err := vw.w.Write(p)
+	if n > 0 {
+		// hash.Hash.Write never returns an error.
+		vw.h.Write(p[:n])
+		vw.n += int64(n)
+	}
+	return n, err
+}
+
 func DownloadBlobToFile(ctx context.Context, store SimpleBlobStore, dec *Decryptor, hash string, targetPath string, mode uint32) error {
 	rc, err := store.GetStream(ctx, hash)
 	if err != nil {
@@ -320,8 +343,14 @@ func DownloadBlobToFile(ctx context.Context, store SimpleBlobStore, dec *Decrypt
 		_ = os.Remove(tmp)
 	}()
 
-	if err := decryptStreamToFile(dec, rc, tmpF); err != nil {
+	vw := &verifyingWriter{w: tmpF, h: sha256.New()}
+	if err := decryptStreamToFile(dec, rc, vw); err != nil {
 		return fmt.Errorf("stream decrypt: %w", err)
+	}
+	// The streaming path verifies the decrypted plaintext against the
+	// content-addressed hash, matching the buffered path above.
+	if got := hex.EncodeToString(vw.h.Sum(nil)); got != hash {
+		return fmt.Errorf("restored content hash mismatch: expected %s, got %s", hash, got)
 	}
 
 	// Apply the source file's mode bits to the staged tmp file. Non-fatal
@@ -405,7 +434,7 @@ func decryptStreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error {
 				smallData = append(smallData, iv...)
 				smallData = append(smallData, encrypted...)
 				if plaintext, serr := dec.decryptSmall(smallData); serr == nil {
-					if _, werr := dst.Write(plaintext); werr != nil {
+					if werr := writeSmallPlaintext(dst, plaintext); werr != nil {
 						return fmt.Errorf("write small blob: %w", werr)
 					}
 					return nil
@@ -500,6 +529,24 @@ func readBoundedSmall(initialData []byte, src io.Reader) ([]byte, error) {
 	return all, nil
 }
 
+// writeSmallPlaintext writes a decrypted GB1 small blob to dst, applying
+// the same IsCompressed→Decompress step as the buffered DownloadBlob path.
+// The pipeline (hashAndEncryptFile) and UploadBlobFromPath compress
+// small-blob plaintext before encryption while keying the blob by the hash
+// of the RAW content — without this step the streaming small-blob path
+// would write zstd frames and fail the content-hash verification.
+func writeSmallPlaintext(dst io.Writer, plaintext []byte) error {
+	if defaultStreamDecompressor.IsCompressed(plaintext) {
+		decompressed, err := defaultStreamDecompressor.Decompress(plaintext)
+		if err != nil {
+			return fmt.Errorf("decompress: %w", err)
+		}
+		plaintext = decompressed
+	}
+	_, err := dst.Write(plaintext)
+	return err
+}
+
 func decryptSmallStream(dec *Decryptor, initialData []byte, src io.Reader, dst io.Writer) error {
 	all, err := readBoundedSmall(initialData, src)
 	if err != nil {
@@ -509,8 +556,7 @@ func decryptSmallStream(dec *Decryptor, initialData []byte, src io.Reader, dst i
 	if err != nil {
 		return err
 	}
-	_, err = dst.Write(plaintext)
-	return err
+	return writeSmallPlaintext(dst, plaintext)
 }
 
 func decryptSmallStreamFromIV(dec *Decryptor, ivData []byte, src io.Reader, dst io.Writer) error {
@@ -522,6 +568,5 @@ func decryptSmallStreamFromIV(dec *Decryptor, ivData []byte, src io.Reader, dst 
 	if err != nil {
 		return err
 	}
-	_, err = dst.Write(plaintext)
-	return err
+	return writeSmallPlaintext(dst, plaintext)
 }

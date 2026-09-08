@@ -172,9 +172,9 @@ func TestManifestChecksumSidecarMissingIsRejected(t *testing.T) {
 
 	// A manifest without a sidecar checksum is not trustworthy: an attacker
 	// (or partial sync) could tamper with the body without detection. Load
-	// must refuse rather than silently accept.
+	// must refuse encrypted manifests for the same reason as plaintext ones.
 	if _, err := LoadManifest(manifestPath); err == nil {
-		t.Fatal("expected error when checksum sidecar is missing")
+		t.Fatal("expected error when encrypted checksum sidecar is missing")
 	}
 }
 
@@ -330,6 +330,32 @@ func TestSaveManifestWithKey(t *testing.T) {
 	}
 	if allFiles[0].Size != 42 {
 		t.Fatalf("Size: got %d, want 42", allFiles[0].Size)
+	}
+}
+
+func TestEncryptedManifestChecksumSidecarMissingIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	key, err := GenerateRandomKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	m := NewManifest(2, "", "src", "/data", "dev1")
+	m.Timestamp = "2026-05-19T10:00:00Z"
+	m.AddFile(FileEntry{Name: "secret.txt", Size: 10})
+	manifestPath, err := SaveManifestWithKey(dir, m, key)
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := os.Remove(manifestChecksumPath(manifestPath)); err != nil {
+		t.Fatalf("remove checksum: %v", err)
+	}
+	origHook := GetManifestDecryptHook()
+	SetManifestDecryptHook(func(encrypted []byte) ([]byte, error) {
+		return DecryptManifest(encrypted, key)
+	})
+	defer SetManifestDecryptHook(origHook)
+	if _, err := LoadManifest(manifestPath); err == nil {
+		t.Fatal("expected encrypted manifest without checksum to be rejected")
 	}
 }
 
@@ -908,6 +934,37 @@ func TestLoadManifestByTimestamp(t *testing.T) {
 			t.Fatal("expected error for invalid timestamp")
 		}
 	})
+}
+
+func TestLoadManifestByTimestampSkipsCorruptCandidate(t *testing.T) {
+	dir := t.TempDir()
+	cloudID := ManifestPathKey("dev1", "1")
+	m := NewManifest(1, cloudID, "valid", "/data", "dev1")
+	m.Timestamp = "2026-05-19T10:00:00Z"
+	validPath, err := SaveManifest(dir, m)
+	if err != nil {
+		t.Fatalf("save valid manifest: %v", err)
+	}
+
+	parsed, err := time.Parse(time.RFC3339, m.Timestamp)
+	if err != nil {
+		t.Fatalf("parse timestamp: %v", err)
+	}
+	corruptPath := filepath.Join(filepath.Dir(validPath), fmt.Sprintf("%d_dev1_corrupt.json.zst", parsed.Unix()))
+	if err := os.WriteFile(corruptPath, []byte("corrupt"), 0600); err != nil {
+		t.Fatalf("write corrupt manifest: %v", err)
+	}
+	if err := os.WriteFile(corruptPath+".sha256", []byte("bad"), 0600); err != nil {
+		t.Fatalf("write corrupt checksum: %v", err)
+	}
+
+	loaded, err := LoadManifestByTimestamp(dir, cloudID, m.Timestamp)
+	if err != nil {
+		t.Fatalf("load timestamp: %v", err)
+	}
+	if loaded.SourceName != "valid" {
+		t.Fatalf("loaded source = %q, want valid", loaded.SourceName)
+	}
 }
 
 func TestSourceRegistryRoundtrip(t *testing.T) {

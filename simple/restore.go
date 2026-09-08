@@ -7,6 +7,8 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -363,7 +365,7 @@ func (r *SimpleRestore) Run(ctx context.Context) (*RestoreResult, error) {
 		if len(file.Chunks) > 0 {
 			restoreErr = r.restoreChunkedFile(ctx, file, dir, name)
 		} else if file.Size >= int64(DefaultChunkSize) {
-			restoreErr = r.downloadBlobToSecureDir(ctx, file.ContentHash, dir, name, file.Mode)
+			restoreErr = r.downloadBlobToSecureDir(ctx, file.ContentHash, dir, name, file.Mode, file.Size)
 		} else {
 			var plaintext []byte
 			plaintext, restoreErr = DownloadBlob(ctx, r.store, r.dec, file.ContentHash)
@@ -574,14 +576,22 @@ func (r *SimpleRestore) restoreChunkedFile(ctx context.Context, file FileEntry, 
 // downloadBlobToSecureDir is the secureDir variant of DownloadBlobToFile
 // for large single-blob files: it streams the blob's decryption into a
 // staging file inside dir (openat(O_EXCL)/renameat on POSIX, verified
-// tmp+rename on Windows) and applies mode on commit.
-func (r *SimpleRestore) downloadBlobToSecureDir(ctx context.Context, hash string, dir secureDir, name string, mode uint32) error {
+// tmp+rename on Windows) and applies mode on commit. The decrypted
+// plaintext is verified against the content-addressed hash and the
+// manifest-recorded size before the staging file is committed — AEAD
+// success alone does not prove the blob's plaintext is the content the
+// manifest references.
+func (r *SimpleRestore) downloadBlobToSecureDir(ctx context.Context, hash string, dir secureDir, name string, mode uint32, expectedSize int64) error {
 	rc, err := r.store.GetStream(ctx, hash)
 	if err != nil {
-		// Non-streaming store: fall back to the buffered path.
+		// Non-streaming store: fall back to the buffered path. DownloadBlob
+		// verifies the plaintext hash internally.
 		plaintext, dErr := DownloadBlob(ctx, r.store, r.dec, hash)
 		if dErr != nil {
 			return dErr
+		}
+		if int64(len(plaintext)) != expectedSize {
+			return fmt.Errorf("restored content size mismatch: manifest says %d bytes, blob restored %d", expectedSize, len(plaintext))
 		}
 		return dir.WriteAtomic(name, plaintext, os.FileMode(mode))
 	}
@@ -593,8 +603,15 @@ func (r *SimpleRestore) downloadBlobToSecureDir(ctx context.Context, hash string
 	}
 	defer st.Cleanup()
 
-	if err := decryptStreamToFile(r.dec, rc, st); err != nil {
+	vw := &verifyingWriter{w: st, h: sha256.New()}
+	if err := decryptStreamToFile(r.dec, rc, vw); err != nil {
 		return fmt.Errorf("stream decrypt: %w", err)
+	}
+	if got := hex.EncodeToString(vw.h.Sum(nil)); got != hash {
+		return fmt.Errorf("restored content hash mismatch: expected %s, got %s", hash, got)
+	}
+	if vw.n != expectedSize {
+		return fmt.Errorf("restored content size mismatch: manifest says %d bytes, blob restored %d", expectedSize, vw.n)
 	}
 	if err := st.Chmod(os.FileMode(mode)); err != nil {
 		slog.Warn("GBF restore: chmod tmp file failed",

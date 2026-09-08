@@ -55,10 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`maxGCMCacheEntries`): insertions are size-checked under a mutex, so
   the cache never exceeds the cap even transiently under concurrency,
   ending unbounded memory growth under many distinct keys.
+- `LoadManifestByTimestamp` now skips corrupt or half-committed candidates
+  and tries another manifest from the same second before failing.
 
 ### Added
 - Open-source governance files: `SECURITY.md`, `CONTRIBUTING.md`,
   `CODE_OF_CONDUCT.md`, `NOTICE`, `CHANGELOG.md`.
+- Added an SPDX 2.3 dependency SBOM generator under `tools/sbom`; release
+  builds publish the SBOM, SHA-256/SHA-512 checksums, and GitHub build
+  provenance attestations.
 - GitHub issue templates (bug report, feature request) and issue chooser.
 - Pull request template.
 - GitHub Actions CI workflow: `lint` (golangci-lint), `fmt` (gofmt gate),

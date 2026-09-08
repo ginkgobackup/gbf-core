@@ -11,6 +11,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   verify:
@@ -82,13 +84,37 @@ jobs:
           go-version: "1.25"
           cache: true
 
+      - name: Verify module dependencies
+        run: go mod verify
+
+      - name: Verify release tag matches module metadata
+        shell: bash
+        run: |
+          test "${GITHUB_REF_NAME#v}" != "" || { echo "invalid release tag"; exit 1; }
+          grep -q '^module github.com/ginkgobackup/gbf-core$' go.mod
+
       - name: Build demo binaries
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o dist/demo-linux-amd64       ./cmd/demo
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -o dist/demo-linux-arm64       ./cmd/demo
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/demo-windows-amd64.exe ./cmd/demo
           CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -o dist/demo-darwin-amd64      ./cmd/demo
           CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o dist/demo-darwin-arm64      ./cmd/demo
+
+      - name: Write release metadata and checksums
+        shell: bash
+        run: |
+          printf 'tag=%s\ncommit=%s\ngo=%s\n' "$GITHUB_REF_NAME" "$(git rev-parse HEAD)" "$(go version)" > dist/BUILD-METADATA.txt
+          sha256sum dist/demo-* > dist/SHA256SUMS
+          sha512sum dist/demo-* > dist/SHA512SUMS
+          go run ./tools/sbom -output dist/sbom.spdx.json
+          go mod verify
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/demo-*"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

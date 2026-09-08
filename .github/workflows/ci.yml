@@ -95,6 +95,24 @@ jobs:
       - name: Build
         run: go build ./...
 
+  fuzz:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    needs: [lint, vet, fmt]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Fuzz parsers
+        run: |
+          go test ./simple -run '^$' -fuzz '^FuzzLoadManifestFromData$' -fuzztime=30s
+          go test ./simple -run '^$' -fuzz '^FuzzExtractHashesFromJSON$' -fuzztime=30s
+          go test ./compress -run '^$' -fuzz '^FuzzZstdDecompress$' -fuzztime=30s
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, vet, fmt]
@@ -113,6 +131,9 @@ jobs:
           go-version: "1.25"
           cache: true
 
+      - name: Verify module dependencies
+        run: go mod verify
+
       - name: Test with race detector
         run: go test -race ./...
 
@@ -120,4 +141,6 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           go test -coverprofile=coverage.out ./...
-          go tool cover -func=coverage.out
+          go tool cover -func=coverage.out | tee coverage.txt
+          total=$(awk '/^total:/ {gsub("%", "", $NF); print $NF}' coverage.txt)
+          awk -v total="$total" 'BEGIN { if (total < 65.0) { printf "coverage %.1f%% is below 65%%\n", total; exit 1 } }'
