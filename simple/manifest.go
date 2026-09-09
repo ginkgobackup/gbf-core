@@ -601,7 +601,15 @@ func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) (string
 		}
 	}
 	sum := sha256.Sum256(compressed)
-	checksumHex := hex.EncodeToString(sum[:])
+	// Single-commit-unit envelope: GBR1 magic + sha256 + payload, staged
+	// and committed as ONE file. The old body+sidecar layout had a
+	// divergence window (a crash between the body and sidecar commits
+	// left an uncommitted manifest that readers had to infer from the
+	// missing sidecar); now the checksum travels inside the file.
+	envelope := make([]byte, 0, registryEnvelopeHeaderSize+len(compressed))
+	envelope = append(envelope, RegistryEnvelopeMagic...)
+	envelope = append(envelope, sum[:]...)
+	envelope = append(envelope, compressed...)
 
 	// Stage the manifest body once (fsynced, unique name so cross-process
 	// savers cannot clobber each other's staging file), then commit it
@@ -609,7 +617,7 @@ func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) (string
 	// another save (possibly from another process) already claimed that
 	// name this second, under a random 6-hex suffix.
 	staging := path + "." + uuid.NewString() + ".tmp"
-	if err := fsutil.WriteStagingFile(staging, compressed, 0600); err != nil {
+	if err := fsutil.WriteStagingFile(staging, envelope, 0600); err != nil {
 		return "", fmt.Errorf("stage manifest: %w", err)
 	}
 
@@ -652,17 +660,10 @@ func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) (string
 		return "", fmt.Errorf("commit manifest: %w", err)
 	}
 
-	// The sidecar is written AFTER the commit. A crash in between leaves a
-	// committed manifest without its sidecar, which LoadManifest rejects
-	// and LoadLatestManifest skips via its fallback-to-older-manifest
-	// logic — the interrupted save is effectively rolled back, and no
-	// other save's files are ever damaged. After a successful commit the
-	// final name is exclusively ours, so overwriting the sidecar (e.g. a
-	// leftover from a crashed attempt) is always safe.
-	checksumPath := manifestChecksumPath(finalPath)
-	if err := fsutil.WriteFileAtomic(checksumPath, []byte(checksumHex), 0600); err != nil {
-		return "", fmt.Errorf("write manifest checksum: %w", err)
-	}
+	// No sidecar write: the checksum is embedded in the GBR1 envelope,
+	// so the commit is a single file and a crash can never leave a
+	// half-committed manifest. Legacy manifests (body + .sha256 sidecar)
+	// keep loading through the compatibility path in LoadManifest.
 
 	m.FilePath = finalPath
 	return finalPath, nil
@@ -699,8 +700,13 @@ func LoadManifest(path string) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	if err := verifyManifestChecksum(path, data); err != nil {
-		return nil, err
+	// Legacy manifests (body + .sha256 sidecar) verify against the
+	// sidecar here. GBR1-envelope manifests carry their checksum inside
+	// the file and are verified in LoadManifestFromData.
+	if !isGBREnvelope(data) {
+		if err := verifyManifestChecksum(path, data); err != nil {
+			return nil, err
+		}
 	}
 	m, err := LoadManifestFromData(data)
 	if err != nil {
@@ -710,7 +716,34 @@ func LoadManifest(path string) (*Manifest, error) {
 	return m, nil
 }
 
+// isGBREnvelope reports whether data starts with the GBR1 checksum
+// envelope magic (shared by source registries and manifests).
+func isGBREnvelope(data []byte) bool {
+	return len(data) >= registryEnvelopeHeaderSize &&
+		string(data[:len(RegistryEnvelopeMagic)]) == RegistryEnvelopeMagic
+}
+
+// stripGBREnvelope verifies the embedded checksum and returns the
+// payload. Only call it after isGBREnvelope returned true.
+func stripGBREnvelope(data []byte) ([]byte, error) {
+	want := data[len(RegistryEnvelopeMagic):registryEnvelopeHeaderSize]
+	payload := data[registryEnvelopeHeaderSize:]
+	got := sha256.Sum256(payload)
+	if !bytes.Equal(want, got[:]) {
+		return nil, fmt.Errorf("manifest envelope checksum mismatch: header says %s, payload is %s",
+			hex.EncodeToString(want), hex.EncodeToString(got[:]))
+	}
+	return payload, nil
+}
+
 func LoadManifestFromData(data []byte) (*Manifest, error) {
+	if isGBREnvelope(data) {
+		var err error
+		data, err = stripGBREnvelope(data)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(data) >= MagicSize && string(data[:MagicSize]) == GKM1Magic {
 		hook := GetManifestDecryptHook()
 		if hook == nil {
@@ -1248,6 +1281,13 @@ func LoadTrashSourceRegistry(metaDir string, cloudID string) (*SourceRegistry, e
 	if err != nil {
 		return nil, fmt.Errorf("read trash source registry: %w", err)
 	}
+	// The trash copy keeps the format it was saved in: current
+	// registries are GBR1 envelopes (zstd inside), legacy ones are bare
+	// JSON or bare zstd. DecodeSourceRegistry handles the envelope; the
+	// fallback covers legacy layouts.
+	if isGBREnvelope(data) {
+		return DecodeSourceRegistry(data)
+	}
 	if localManifestCompressor.IsCompressed(data) {
 		data, err = localManifestCompressor.Decompress(data)
 		if err != nil {
@@ -1421,7 +1461,14 @@ func extractHashesFromManifestFile(path string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	if err := verifyManifestChecksum(path, data); err != nil {
+	// GBR1-envelope manifests verify via the embedded checksum; legacy
+	// body+sidecar manifests verify against the sidecar.
+	if isGBREnvelope(data) {
+		data, err = stripGBREnvelope(data)
+		if err != nil {
+			return nil, err
+		}
+	} else if err := verifyManifestChecksum(path, data); err != nil {
 		return nil, err
 	}
 	if len(data) >= MagicSize && string(data[:MagicSize]) == GKM1Magic {

@@ -4,6 +4,8 @@
 package simple
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -140,41 +142,48 @@ func TestManifestChecksumSidecar(t *testing.T) {
 	}
 }
 
-func TestManifestChecksumSidecarMissingIsRejected(t *testing.T) {
+// TestManifestLegacySidecarLayoutStillLoads pins backward compatibility
+// with the pre-envelope layout (bare zstd body + .sha256 sidecar): repos
+// written before the GBR1 envelope keep loading, and the sidecar remains
+// mandatory for that layout — a body without its sidecar is an
+// incomplete commit and must be rejected.
+func TestManifestLegacySidecarLayoutStillLoads(t *testing.T) {
 	dir := t.TempDir()
-
 	m := NewManifest(1, "", "src", "/data", "dev1")
 	m.Timestamp = "2026-05-19T10:00:00Z"
 	m.AddFile(FileEntry{Name: "a.txt", Size: 10})
-	if _, err := SaveManifest(dir, m); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-
-	manifestDir := ManifestDir(dir, ManifestPathKey("dev1", "1"))
-	entries, err := os.ReadDir(manifestDir)
+	data, err := json.Marshal(m)
 	if err != nil {
-		t.Fatalf("readdir: %v", err)
+		t.Fatalf("marshal: %v", err)
 	}
-	var manifestPath string
-	for _, e := range entries {
-		if isManifestFile(e.Name()) {
-			manifestPath = filepath.Join(manifestDir, e.Name())
-			break
-		}
+	compressed, err := localManifestCompressor.Compress(data)
+	if err != nil {
+		t.Fatalf("compress: %v", err)
 	}
-	if manifestPath == "" {
-		t.Fatal("no manifest file found")
+	manifestPath := filepath.Join(dir, "1779184800_dev1.json.zst")
+	if err := os.WriteFile(manifestPath, compressed, 0600); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+	sum := sha256.Sum256(compressed)
+	sidecar := manifestChecksumPath(manifestPath)
+	if err := os.WriteFile(sidecar, []byte(hex.EncodeToString(sum[:])), 0600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
 	}
 
-	if err := os.Remove(manifestChecksumPath(manifestPath)); err != nil {
-		t.Fatalf("remove checksum: %v", err)
+	loaded, err := LoadManifest(manifestPath)
+	if err != nil {
+		t.Fatalf("legacy manifest must load via sidecar: %v", err)
+	}
+	if loaded.SourceID != 1 {
+		t.Fatalf("SourceID: got %d, want 1", loaded.SourceID)
 	}
 
-	// A manifest without a sidecar checksum is not trustworthy: an attacker
-	// (or partial sync) could tamper with the body without detection. Load
-	// must refuse encrypted manifests for the same reason as plaintext ones.
+	// Removing the sidecar makes the legacy commit unverifiable.
+	if err := os.Remove(sidecar); err != nil {
+		t.Fatalf("remove sidecar: %v", err)
+	}
 	if _, err := LoadManifest(manifestPath); err == nil {
-		t.Fatal("expected error when encrypted checksum sidecar is missing")
+		t.Fatal("legacy manifest without sidecar must be rejected")
 	}
 }
 
@@ -333,7 +342,10 @@ func TestSaveManifestWithKey(t *testing.T) {
 	}
 }
 
-func TestEncryptedManifestChecksumSidecarMissingIsRejected(t *testing.T) {
+// TestEncryptedManifestEnvelopeIntegrity verifies that encrypted
+// manifests are committed as a single GBR1-envelope file and that any
+// payload tampering is rejected by the embedded checksum.
+func TestEncryptedManifestEnvelopeIntegrity(t *testing.T) {
 	dir := t.TempDir()
 	key, err := GenerateRandomKey()
 	if err != nil {
@@ -346,16 +358,30 @@ func TestEncryptedManifestChecksumSidecarMissingIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	if err := os.Remove(manifestChecksumPath(manifestPath)); err != nil {
-		t.Fatalf("remove checksum: %v", err)
+	// Single-file commit: no sidecar exists anymore.
+	if _, err := os.Stat(manifestChecksumPath(manifestPath)); !os.IsNotExist(err) {
+		t.Fatalf("envelope manifests must not have a sidecar (stat err: %v)", err)
 	}
 	origHook := GetManifestDecryptHook()
 	SetManifestDecryptHook(func(encrypted []byte) ([]byte, error) {
 		return DecryptManifest(encrypted, key)
 	})
 	defer SetManifestDecryptHook(origHook)
+	if _, err := LoadManifest(manifestPath); err != nil {
+		t.Fatalf("envelope manifest must load: %v", err)
+	}
+
+	// Tamper with the payload; the embedded checksum must catch it.
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	data[len(data)-1] ^= 0xFF
+	if err := os.WriteFile(manifestPath, data, 0600); err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
 	if _, err := LoadManifest(manifestPath); err == nil {
-		t.Fatal("expected encrypted manifest without checksum to be rejected")
+		t.Fatal("tampered envelope manifest must be rejected")
 	}
 }
 
@@ -825,8 +851,8 @@ func TestCleanTrashManifests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clean: %v", err)
 	}
-	if cleaned != 2 {
-		t.Fatalf("cleaned: got %d, want 2 (manifest + checksum)", cleaned)
+	if cleaned != 1 {
+		t.Fatalf("cleaned: got %d, want 1 (manifest envelope)", cleaned)
 	}
 
 	remaining, _ := os.ReadDir(trashDir)
@@ -858,8 +884,8 @@ func TestCleanTrashManifestsRecentFilesKept(t *testing.T) {
 
 	trashDir := ManifestTrashDir(dir, ManifestPathKey("dev1", "1"))
 	remaining, _ := os.ReadDir(trashDir)
-	if len(remaining) != 2 {
-		t.Fatalf("trash should still have 2 entries, got %d", len(remaining))
+	if len(remaining) != 1 {
+		t.Fatalf("trash should still have 1 entry (manifest envelope), got %d", len(remaining))
 	}
 }
 

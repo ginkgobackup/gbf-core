@@ -207,6 +207,86 @@ func (kf *KeyFileData) DecodeKey() ([]byte, error) {
 	return key, nil
 }
 
+// Key protection modes reported by KeyFileProtectionMode.
+const (
+	// KeyProtectionGEK1: the master key is wrapped by a password (GEK1).
+	KeyProtectionGEK1 = "gek1"
+	// KeyProtectionLegacyPlaintext: the master key sits in plaintext
+	// (base64) in repo.key. Provides no security against an attacker
+	// with file access; migrate via MigrateKeyFileToGEK1.
+	KeyProtectionLegacyPlaintext = "legacy_plaintext"
+	// KeyProtectionNone: the repo has no encrypted flag / no key file.
+	KeyProtectionNone = "none"
+)
+
+// KeyFileProtectionMode reports how the repo's master key is protected,
+// derived from the keyfile format itself (single source of truth — no
+// config field that can drift from reality). Callers should surface
+// KeyProtectionLegacyPlaintext as a warning at startup or backup time
+// and offer MigrateKeyFileToGEK1 as the fix.
+func KeyFileProtectionMode(repoRoot string) (string, error) {
+	path := KeyFilePath(repoRoot)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return KeyProtectionNone, nil
+		}
+		return "", fmt.Errorf("read key file: %w", err)
+	}
+	if len(data) >= 4 && data[0] == 'G' && data[1] == 'E' && data[2] == 'K' && data[3] == 1 {
+		return KeyProtectionGEK1, nil
+	}
+	// Anything that parses as the legacy JSON keyfile is plaintext.
+	var kf KeyFileData
+	if err := json.Unmarshal(data, &kf); err != nil {
+		return "", fmt.Errorf("parse key file: %w", err)
+	}
+	return KeyProtectionLegacyPlaintext, nil
+}
+
+// MigrateKeyFileToGEK1 upgrades a legacy plaintext keyfile in place:
+// the master key is read from the plaintext JSON keyfile, wrapped with
+// Argon2id-derived password keying (GEK1), and atomically written back
+// over repo.key. The master key itself is unchanged, so existing blobs
+// and manifests remain readable without re-encryption. Fails without
+// touching the file if the repo is not legacy-plaintext.
+func MigrateKeyFileToGEK1(repoRoot string, password string) error {
+	if password == "" {
+		return fmt.Errorf("migration requires a non-empty password")
+	}
+	mode, err := KeyFileProtectionMode(repoRoot)
+	if err != nil {
+		return err
+	}
+	if mode == KeyProtectionGEK1 {
+		return fmt.Errorf("repo already uses a GEK1 key file")
+	}
+	if mode != KeyProtectionLegacyPlaintext {
+		return fmt.Errorf("no legacy plaintext key file to migrate (mode %q)", mode)
+	}
+	kf, err := LoadKeyFile(repoRoot)
+	if err != nil {
+		return err
+	}
+	masterKey, err := kf.DecodeKey()
+	if err != nil {
+		return err
+	}
+	if err := SaveGEK1KeyFile(repoRoot, masterKey, password); err != nil {
+		return err
+	}
+	// Verify the freshly written file actually unlocks with the password
+	// before declaring success.
+	unlocked, err := UnlockRepoWithPassword(repoRoot, password)
+	if err != nil {
+		return fmt.Errorf("post-migration verification failed: %w", err)
+	}
+	if string(unlocked) != string(masterKey) {
+		return fmt.Errorf("post-migration verification mismatch")
+	}
+	return nil
+}
+
 // InitRepoWithKeyFile initializes a repo with a plaintext keyfile (legacy
 // format, kept for backward compatibility). New code should use
 // InitRepoWithPassword to produce a GEK1 keyfile. This function generates
@@ -215,6 +295,10 @@ func (kf *KeyFileData) DecodeKey() ([]byte, error) {
 // plaintext in repo.key — this provides no security against an attacker
 // with file access, only against accidental reads. For true encryption at
 // rest, use InitRepoWithPassword.
+//
+// Deprecated: creating plaintext keyfiles is a legacy path. Existing
+// repositories can be upgraded with MigrateKeyFileToGEK1; new encrypted
+// repositories must use InitRepoWithPassword.
 func InitRepoWithKeyFile(repoRoot string, deviceID string) error {
 	if err := InitRepo(InitParams{RepoRoot: repoRoot, DeviceID: deviceID}); err != nil {
 		return err

@@ -191,7 +191,11 @@ func (s *LocalBlobStore) Get(ctx context.Context, hash string) ([]byte, error) {
 	if !validateHash(hash) {
 		return nil, ErrInvalidHash
 	}
-	return os.ReadFile(s.BlobPath(hash))
+	data, err := os.ReadFile(s.BlobPath(hash))
+	if err != nil {
+		return nil, classifyOSError("get", hash, err)
+	}
+	return data, nil
 }
 
 func (s *LocalBlobStore) PutStream(ctx context.Context, hash string, r io.Reader, size int64) error {
@@ -231,7 +235,11 @@ func (s *LocalBlobStore) GetStream(ctx context.Context, hash string) (io.ReadClo
 	if !validateHash(hash) {
 		return nil, ErrInvalidHash
 	}
-	return os.Open(s.BlobPath(hash))
+	f, err := os.Open(s.BlobPath(hash))
+	if err != nil {
+		return nil, classifyOSError("open", hash, err)
+	}
+	return f, nil
 }
 
 // Exists reports whether the blob identified by hash is present in the

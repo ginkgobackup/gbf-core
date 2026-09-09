@@ -322,11 +322,11 @@ func TestDecryptRejectsTrailingDataGB2(t *testing.T) {
 	}
 }
 
-// TestSaveManifestSidecarPrecedesManifest asserts the crash-consistency
-// ordering: after a successful save, both files exist; and if only the
-// first write of the pair had happened (sidecar), no half-committed
-// manifest can be observed because the manifest is written last.
-func TestSaveManifestSidecarPrecedesManifest(t *testing.T) {
+// TestSaveManifestSingleFileCommit asserts the crash-consistency
+// contract of the GBR1 envelope layout: after a successful save the
+// manifest is a single self-verifying file (checksum embedded, no
+// sidecar), and it loads back cleanly.
+func TestSaveManifestSingleFileCommit(t *testing.T) {
 	metaDir := t.TempDir()
 	cloudID := ResolveCloudID("dev", 1)
 	m := NewManifest(1, cloudID, "s", "/src", "dev")
@@ -338,11 +338,11 @@ func TestSaveManifestSidecarPrecedesManifest(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("manifest missing after save: %v", err)
 	}
-	if _, err := os.Stat(manifestChecksumPath(path)); err != nil {
-		t.Fatalf("checksum sidecar missing after save: %v", err)
+	if _, err := os.Stat(manifestChecksumPath(path)); !os.IsNotExist(err) {
+		t.Fatalf("envelope manifests must not have a sidecar (stat err: %v)", err)
 	}
-	// Loading must succeed — order of writes is an implementation detail,
-	// but a successful save must always yield a loadable manifest.
+	// Loading must succeed — a successful save must always yield a
+	// loadable manifest.
 	if _, err := LoadManifest(path); err != nil {
 		t.Fatalf("load after save: %v", err)
 	}
