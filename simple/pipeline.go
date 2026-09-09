@@ -955,6 +955,13 @@ func (p *SimplePipeline) checkAndUploadBlob(ctx context.Context, fe scanEntry, h
 			return entry, 0, false, false, nil
 		}
 		if blobErr != nil {
+			// A permission/auth failure means EVERY subsequent exists
+			// check will fail too: re-uploading would turn an auth
+			// outage into a full redundant re-upload. Abort the backup
+			// instead so the user fixes credentials first.
+			if errors.Is(blobErr, ErrPermissionDenied) {
+				return nil, 0, false, false, fmt.Errorf("blob exists check for %s: %w", fe.relPath, blobErr)
+			}
 			slog.Warn("GBF blob exists check failed for unchanged file, re-uploading",
 				"source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "file", fe.relPath, "hash", contentHash[:16], "error", blobErr, "session_id", p.cfg.SessionID)
 		} else {
@@ -967,6 +974,9 @@ func (p *SimplePipeline) checkAndUploadBlob(ctx context.Context, fe scanEntry, h
 
 	exists, err := p.store.Exists(ctx, contentHash)
 	if err != nil {
+		if errors.Is(err, ErrPermissionDenied) {
+			return nil, 0, false, false, fmt.Errorf("blob exists check for %s: %w", fe.relPath, err)
+		}
 		slog.Warn("GBF exists check failed, will upload", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "file", fe.relPath, "hash", contentHash[:16], "error", err, "session_id", p.cfg.SessionID)
 	} else if exists {
 		return makeFileEntry(fe, contentHash, status), 0, isChanged, isNew, nil

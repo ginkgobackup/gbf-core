@@ -267,7 +267,7 @@ func (s *LocalBlobStore) Exists(ctx context.Context, hash string) (bool, error) 
 	if os.IsNotExist(err) {
 		return false, nil
 	}
-	return false, err
+	return false, ClassifyPathError("exists", hash, err)
 }
 
 // ExistsBatch implements BatchExistencer. It resolves the whole batch with a
