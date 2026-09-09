@@ -285,6 +285,7 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	newManifest.Stats.UnchangedFiles = stats.unchangedFiles
 	newManifest.Stats.DeletedFiles = result.DeletedFiles
 	newManifest.Stats.NewBytes = stats.uploadedBytes
+	newManifest.Completeness = newManifest.DeriveCompleteness()
 
 	p.logUploadAnomalies(len(files), stats)
 

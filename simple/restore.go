@@ -314,7 +314,7 @@ func (r *SimpleRestore) Run(ctx context.Context) (*RestoreResult, error) {
 		// ContentHash — no blob was ever uploaded for them (see
 		// pipeline.go). Skip these entries instead of letting store.Get("")
 		// abort the whole restore.
-		if file.Status == "locked" || file.Status == "error" || file.ContentHash == "" {
+		if !file.IsRestorable() {
 			result.SkippedFiles++
 			slog.Warn("GBF restore: skipping file that was not backed up",
 				"file", file.Name, "status", file.Status, "size", file.Size)

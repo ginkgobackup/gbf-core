@@ -40,6 +40,10 @@ type Manifest struct {
 	DeviceID   string          `json:"deviceId"`
 	Dirs       map[string]*Dir `json:"dirs"`
 	Stats      ManifestStats   `json:"stats"`
+	// Completeness is the explicit snapshot state ("complete" or
+	// "incomplete"). Written by the pipeline on save; manifests without
+	// the field derive it from contents via EffectiveCompleteness.
+	Completeness SnapshotCompleteness `json:"completeness,omitempty"`
 
 	// FilePath is the actual on-disk path this manifest was loaded from or
 	// written to. It is set by LoadManifest and SaveManifestWithKey and is
@@ -558,6 +562,11 @@ var manifestSaveMu sync.Mutex
 func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) (string, error) {
 	manifestSaveMu.Lock()
 	defer manifestSaveMu.Unlock()
+	// Structural validation only: header tolerance (e.g. invalid
+	// timestamps falling back to time.Now) is a documented save contract.
+	if err := m.ValidateStructure(); err != nil {
+		return "", fmt.Errorf("manifest structure: %w", err)
+	}
 	ts, err := time.Parse(time.RFC3339, m.Timestamp)
 	if err != nil {
 		ts = time.Now()
@@ -726,6 +735,9 @@ func LoadManifestFromData(data []byte) (*Manifest, error) {
 	}
 	if m.Version < 2 {
 		migrateV1Manifest(&m, data)
+	}
+	if err := m.ValidateStructure(); err != nil {
+		return nil, fmt.Errorf("manifest validation: %w", err)
 	}
 	return &m, nil
 }

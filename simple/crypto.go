@@ -7,9 +7,12 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"golang.org/x/crypto/hkdf"
 )
 
 const (
@@ -365,7 +368,29 @@ func (d *Decryptor) DecryptStream(r io.Reader) ([]byte, error) {
 	return d.Decrypt(data)
 }
 
+// metadataKeyPurpose is the HKDF salt separating the manifest encryption
+// key from other keys derived from the same repo master key. Blobs keep
+// using the raw master key for now (GB1/GB2 have no key-version field to
+// signal a change); manifests move to a purpose-derived key so metadata
+// and data no longer share one key. The salt string matches the
+// convention of crypto.AESEncryptor.DeriveKey.
+const metadataKeyPurpose = "gbf/metadata-key/v1"
+
+// DeriveMetadataKey derives the manifest encryption key from the repo
+// master key via HKDF-SHA256. Deterministic: the same master key always
+// yields the same metadata key, so decryption needs no extra state.
+func DeriveMetadataKey(masterKey []byte) []byte {
+	reader := hkdf.New(sha256.New, masterKey, []byte(metadataKeyPurpose), nil)
+	key := make([]byte, 32)
+	// HKDF-SHA256 never errors on a 32-byte read from a non-empty secret.
+	_, _ = io.ReadFull(reader, key)
+	return key
+}
+
 func EncryptManifest(plaintext []byte, key []byte) ([]byte, error) {
+	// Manifests are always encrypted under the purpose-derived metadata
+	// key, never the raw master key (see DeriveMetadataKey).
+	key = DeriveMetadataKey(key)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("aes cipher: %w", err)
@@ -390,7 +415,15 @@ func DecryptManifest(data []byte, key []byte) ([]byte, error) {
 	if len(data) < MagicSize || string(data[:MagicSize]) != GKM1Magic {
 		return nil, fmt.Errorf("not a GKM1 manifest")
 	}
-	return NewDecryptor(key, DefaultChunkSize).decryptSmall(data[MagicSize:])
+	payload := data[MagicSize:]
+	// Current manifests are encrypted under the HKDF-derived metadata key.
+	if plaintext, err := NewDecryptor(DeriveMetadataKey(key), DefaultChunkSize).decryptSmall(payload); err == nil {
+		return plaintext, nil
+	}
+	// Legacy manifests (written before key separation) were encrypted
+	// under the raw master key. GCM authentication makes the fallback
+	// unambiguous; the first attempt fails fast for the wrong key.
+	return NewDecryptor(key, DefaultChunkSize).decryptSmall(payload)
 }
 
 func DecryptIfEncrypted(data []byte, key []byte) ([]byte, error) {
