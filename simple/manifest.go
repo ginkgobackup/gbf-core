@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -424,14 +425,67 @@ func ManifestDir(metaDir string, cloudID string) string {
 
 // ErrInvalidCloudID is returned when a cloudID or deviceID contains path
 // components that could escape the manifest directory (e.g. ".." segments,
-// absolute paths, or Windows drive letters). cloudID may legitimately
-// contain "/" (the layout is "deviceID/sourceID"), but it must never resolve
-// to a path above the manifest root.
+// absolute paths, or Windows drive letters), or characters / names that are
+// not safely representable as a filesystem path on every supported OS.
+// cloudID may legitimately contain "/" (the layout is "deviceID/sourceID"),
+// but it must never resolve to a path above the manifest root.
 var ErrInvalidCloudID = errors.New("invalid cloudID: path escapes manifest root")
+
+// MaxCloudIDLength bounds a cloudID string. Device fingerprints and decimal
+// source IDs are tiny; the cap exists only so a crafted registry payload
+// cannot smuggle an unbounded path into path joins.
+const MaxCloudIDLength = 1024
+
+// windowsReservedNames are the DOS device names Windows refuses to use as a
+// file or directory stem, with or without an extension ("CON" and "CON.txt"
+// are both invalid). Comparison is case-insensitive.
+var windowsReservedNames = map[string]struct{}{
+	"CON": {}, "PRN": {}, "AUX": {}, "NUL": {},
+	"COM1": {}, "COM2": {}, "COM3": {}, "COM4": {}, "COM5": {},
+	"COM6": {}, "COM7": {}, "COM8": {}, "COM9": {},
+	"LPT1": {}, "LPT2": {}, "LPT3": {}, "LPT4": {}, "LPT5": {},
+	"LPT6": {}, "LPT7": {}, "LPT8": {}, "LPT9": {},
+}
+
+// invalidCloudIDChar reports whether r cannot appear in a cloudID. Control
+// characters are rejected because they corrupt logs, JSON and terminal
+// output; ':' (Windows alternate data streams / drive separators), '*' and
+// '?' (Windows wildcards) are rejected because they are not valid in a
+// Windows path component.
+func invalidCloudIDChar(r rune) bool {
+	if r < 0x20 || r == 0x7f {
+		return true
+	}
+	switch r {
+	case ':', '*', '?':
+		return true
+	default:
+		return false
+	}
+}
+
+// isWindowsReservedName reports whether seg is a Windows reserved device
+// name. A trailing extension is stripped first ("CON.txt") and trailing dots
+// and spaces are ignored, matching Windows' own filename rules.
+func isWindowsReservedName(seg string) bool {
+	base := seg
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	base = strings.TrimRight(base, " .")
+	if base == "" {
+		return false
+	}
+	_, reserved := windowsReservedNames[strings.ToUpper(base)]
+	return reserved
+}
 
 func validateCloudID(cloudID string) error {
 	if cloudID == "" {
 		return fmt.Errorf("cloudID is empty: %w", ErrInvalidCloudID)
+	}
+	if len(cloudID) > MaxCloudIDLength {
+		return fmt.Errorf("cloudID exceeds %d bytes (%d): %w", MaxCloudIDLength, len(cloudID), ErrInvalidCloudID)
 	}
 	// Reject absolute paths (Unix or Windows).
 	if strings.HasPrefix(cloudID, "/") || strings.HasPrefix(cloudID, "\\") {
@@ -440,13 +494,26 @@ func validateCloudID(cloudID string) error {
 	if len(cloudID) >= 2 && cloudID[1] == ':' && ((cloudID[0] >= 'A' && cloudID[0] <= 'Z') || (cloudID[0] >= 'a' && cloudID[0] <= 'z')) {
 		return fmt.Errorf("cloudID is absolute (Windows drive): %q: %w", cloudID, ErrInvalidCloudID)
 	}
-	// Reject any path segment equal to ".." — these would escape upward.
-	// Split on both '/' and '\\': on Windows a backslash is also a path
-	// separator, so `..\..\evil` must be caught here just like `../../evil`.
-	for _, seg := range strings.FieldsFunc(cloudID, func(r rune) bool { return r == '/' || r == '\\' }) {
-		seg = strings.TrimSpace(seg)
-		if seg == ".." {
-			return fmt.Errorf("cloudID contains parent reference: %q: %w", cloudID, ErrInvalidCloudID)
+	for _, r := range cloudID {
+		if invalidCloudIDChar(r) {
+			return fmt.Errorf("cloudID contains invalid character %q: %w", string(r), ErrInvalidCloudID)
+		}
+	}
+	// Reject empty, "." and ".." segments and Windows reserved names. Split
+	// on both '/' and '\\': on Windows a backslash is also a path separator,
+	// so `..\..\evil` must be caught here just like `../../evil`. Empty
+	// segments (e.g. "dev1//42", "dev1/") are rejected too — they do not
+	// change the resolved path but indicate a malformed key.
+	for _, seg := range strings.Split(strings.ReplaceAll(cloudID, "\\", "/"), "/") {
+		if seg == "" {
+			return fmt.Errorf("cloudID contains empty path segment: %q: %w", cloudID, ErrInvalidCloudID)
+		}
+		trimmed := strings.TrimSpace(seg)
+		if trimmed == "." || trimmed == ".." {
+			return fmt.Errorf("cloudID contains relative path segment: %q: %w", cloudID, ErrInvalidCloudID)
+		}
+		if isWindowsReservedName(trimmed) {
+			return fmt.Errorf("cloudID contains Windows reserved name: %q: %w", cloudID, ErrInvalidCloudID)
 		}
 	}
 	return nil
@@ -466,6 +533,41 @@ func ResolveCloudID(deviceID string, sourceID int64) string {
 		return fmt.Sprintf("%d", sourceID)
 	}
 	return ManifestPathKey(deviceID, fmt.Sprintf("%d", sourceID))
+}
+
+// EncodeCloudIDSegment returns a filesystem-safe, reversible encoding of an
+// arbitrary deviceID for use as a single cloudID path segment. base64url
+// (raw, unpadded) never emits '/', '\', '.', ':' or control characters, so
+// the result always passes validateCloudID regardless of the input.
+func EncodeCloudIDSegment(deviceID string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(deviceID))
+}
+
+// DecodeCloudIDSegment reverses EncodeCloudIDSegment. It returns an error if
+// s is not valid raw base64url text.
+func DecodeCloudIDSegment(s string) (string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return "", fmt.Errorf("decode cloudID segment: %w", err)
+	}
+	return string(raw), nil
+}
+
+// StructuredCloudID returns an opt-in alternative to ManifestPathKey that is
+// immune to the encoding hazards any raw string concatenation shares: the
+// deviceID is base64url-encoded so a device identifier containing '/', '\',
+// ':' or a Windows reserved name can never change the directory layout or
+// escape the manifest root. The sourceID is a decimal integer and needs no
+// encoding.
+//
+// This does NOT change the historical "{deviceID}/{sourceID}" layout produced
+// by ResolveCloudID — existing data keeps loading unchanged. New callers that
+// accept externally-supplied device IDs should prefer this encoding.
+func StructuredCloudID(deviceID string, sourceID int64) string {
+	if deviceID == "" {
+		return strconv.FormatInt(sourceID, 10)
+	}
+	return EncodeCloudIDSegment(deviceID) + "/" + strconv.FormatInt(sourceID, 10)
 }
 
 // localManifestCompressor uses the manifest decompression limit (256 MiB),

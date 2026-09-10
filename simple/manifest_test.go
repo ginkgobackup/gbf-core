@@ -1248,6 +1248,21 @@ func TestValidateCloudID(t *testing.T) {
 		"..",                // bare parent
 		"a/../../../b",      // embedded escape
 		`a\..\b`,            // backslash-separated parent segment
+		"a/./b",             // current-dir segment
+		"dev1/",             // trailing empty segment
+		"dev1//42",          // embedded empty segment
+		"con",               // Windows reserved device name
+		"CON",               // reserved, uppercase
+		"dev1/con",          // reserved name as a segment
+		"a/CON.txt",         // reserved stem with extension
+		"nul",               // reserved
+		"lpt1",              // reserved
+		"a/b*c",             // Windows wildcard '*'
+		"a/b?c",             // Windows wildcard '?'
+		"a:b",               // ':' (ADS / drive separator)
+		"dev1/4:2",          // ':' inside a segment
+		"a/\x01b",           // control character
+		"a/\x7fb",           // DEL control character
 	}
 	for _, id := range invalid {
 		if err := validateCloudID(id); err == nil {
@@ -1255,6 +1270,61 @@ func TestValidateCloudID(t *testing.T) {
 		} else if !errors.Is(err, ErrInvalidCloudID) {
 			t.Errorf("validateCloudID(%q) error should wrap ErrInvalidCloudID, got %v", id, err)
 		}
+	}
+
+	// An overlong cloudID must be rejected so a crafted payload cannot smuggle
+	// an unbounded string into path joins.
+	if err := validateCloudID(strings.Repeat("a", MaxCloudIDLength+1)); err == nil {
+		t.Errorf("validateCloudID(overlong, %d bytes) should fail", MaxCloudIDLength+1)
+	}
+	if err := validateCloudID(strings.Repeat("a", MaxCloudIDLength)); err != nil {
+		t.Errorf("validateCloudID(max-length) should pass, got %v", err)
+	}
+}
+
+func TestEncodeCloudIDSegment(t *testing.T) {
+	cases := []string{"dev1", "device-fingerprint", "CON", "a/b", `a\b`, "a:b", "a.b", "设备", ""}
+	for _, in := range cases {
+		enc := EncodeCloudIDSegment(in)
+		if strings.ContainsAny(enc, `/\:*?`) {
+			t.Errorf("EncodeCloudIDSegment(%q) = %q contains a path/Windows-reserved character", in, enc)
+		}
+		got, err := DecodeCloudIDSegment(enc)
+		if err != nil {
+			t.Errorf("DecodeCloudIDSegment(%q): %v", enc, err)
+			continue
+		}
+		if got != in {
+			t.Errorf("round trip: got %q, want %q", got, in)
+		}
+	}
+	if _, err := DecodeCloudIDSegment("not base64!!"); err == nil {
+		t.Error("DecodeCloudIDSegment should reject invalid base64")
+	}
+}
+
+// TestStructuredCloudIDIsAlwaysValid ensures the structured encoding produces
+// a cloudID that passes the strict validator even for deviceIDs that would be
+// rejected — or change the directory layout — under raw concatenation.
+func TestStructuredCloudIDIsAlwaysValid(t *testing.T) {
+	nasty := []string{"", "dev1", "../../evil", `C:\evil`, "a/b", "con", "a:b", "a*b?c"}
+	for _, deviceID := range nasty {
+		id := StructuredCloudID(deviceID, 42)
+		if err := validateCloudID(id); err != nil {
+			t.Errorf("StructuredCloudID(%q, 42) = %q should be valid, got %v", deviceID, id, err)
+		}
+	}
+	if got := StructuredCloudID("", 42); got != "42" {
+		t.Errorf("StructuredCloudID with empty deviceID = %q, want 42", got)
+	}
+	// The encoded device segment must round-trip back to the raw deviceID.
+	id := StructuredCloudID("a/b", 7)
+	seg, _, ok := strings.Cut(id, "/")
+	if !ok {
+		t.Fatalf("StructuredCloudID(%q) = %q has no separator", "a/b", id)
+	}
+	if dec, err := DecodeCloudIDSegment(seg); err != nil || dec != "a/b" {
+		t.Errorf("decode segment %q = %q, %v; want a/b", seg, dec, err)
 	}
 }
 
