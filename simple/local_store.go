@@ -301,7 +301,11 @@ func (s *LocalBlobStore) ExistsBatch(ctx context.Context, hashes []string) (map[
 			result[h] = true
 			found = append(found, h)
 		} else if !os.IsNotExist(err) {
-			return nil, err
+			// Join the shared taxonomy instead of returning a bare
+			// filesystem error: a permission failure here must be
+			// recognizable as ErrPermissionDenied by callers that abort
+			// the backup rather than re-uploading everything.
+			return nil, ClassifyPathError("exists-batch", h, err)
 		}
 	}
 	if len(found) > 0 {

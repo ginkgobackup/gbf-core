@@ -1088,7 +1088,10 @@ func TestBlobsExist_BatchPathUsed(t *testing.T) {
 	store.blobs[h2] = []byte("batch-blob-2")
 
 	p := newBatchTestPipeline(t, store)
-	got := p.blobsExist(context.Background(), []string{h1, h2, h3, h1})
+	got, err := p.blobsExist(context.Background(), []string{h1, h2, h3, h1})
+	if err != nil {
+		t.Fatalf("blobsExist: %v", err)
+	}
 
 	if len(got) != 3 {
 		t.Fatalf("result size = %d, want 3 (deduplicated)", len(got))
@@ -1122,8 +1125,10 @@ func TestBlobsExist_FallbackWithoutBatch(t *testing.T) {
 	store.blobs[h2] = []byte("batch-blob-2")
 
 	p := newBatchTestPipeline(t, store)
-	got := p.blobsExist(context.Background(), []string{h1, h2, h3, h1})
-
+	got, err := p.blobsExist(context.Background(), []string{h1, h2, h3, h1})
+	if err != nil {
+		t.Fatalf("blobsExist: %v", err)
+	}
 	if !got[h1] || !got[h2] || got[h3] {
 		t.Fatalf("fallback presence mismatch: h1=%v h2=%v h3=%v", got[h1], got[h2], got[h3])
 	}
@@ -1143,8 +1148,10 @@ func TestBlobsExist_FallbackOnBatchError(t *testing.T) {
 	store.blobs[h1] = []byte("batch-blob-1")
 
 	p := newBatchTestPipeline(t, store)
-	got := p.blobsExist(context.Background(), []string{h1, h3})
-
+	got, err := p.blobsExist(context.Background(), []string{h1, h3})
+	if err != nil {
+		t.Fatalf("blobsExist: %v", err)
+	}
 	if !got[h1] || got[h3] {
 		t.Fatalf("fallback-after-error presence mismatch: h1=%v h3=%v", got[h1], got[h3])
 	}
@@ -1176,7 +1183,10 @@ func TestTryUnchangedEntry_ViaBatchStore(t *testing.T) {
 		Chunks:      []ChunkRef{{Hash: h1, Size: 1}, {Hash: h2, Size: 1}},
 	}
 
-	entry, ok := p.tryUnchangedEntry(context.Background(), fe, prev, "filehash")
+	entry, ok, err := p.tryUnchangedEntry(context.Background(), fe, prev, "filehash")
+	if err != nil {
+		t.Fatalf("tryUnchangedEntry: %v", err)
+	}
 	if !ok {
 		t.Fatal("tryUnchangedEntry rejected an entry whose blobs are all present")
 	}
@@ -1192,7 +1202,9 @@ func TestTryUnchangedEntry_ViaBatchStore(t *testing.T) {
 
 	// A missing referenced blob must reject the fast path (re-upload).
 	prev.Chunks = append(prev.Chunks, ChunkRef{Hash: h3, Size: 1})
-	if _, ok := p.tryUnchangedEntry(context.Background(), fe, prev, "filehash"); ok {
+	if _, ok, err := p.tryUnchangedEntry(context.Background(), fe, prev, "filehash"); err != nil {
+		t.Fatalf("tryUnchangedEntry: %v", err)
+	} else if ok {
 		t.Error("tryUnchangedEntry accepted an entry with a missing blob; want re-upload fallback")
 	}
 }
@@ -1298,7 +1310,9 @@ func BenchmarkBlobsExist_LocalBatch(b *testing.B) {
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p.blobsExist(ctx, hashes)
+		if _, err := p.blobsExist(ctx, hashes); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -1308,7 +1322,9 @@ func BenchmarkBlobsExist_LocalPerHash(b *testing.B) {
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p.blobsExist(ctx, hashes)
+		if _, err := p.blobsExist(ctx, hashes); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

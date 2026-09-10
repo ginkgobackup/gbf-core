@@ -789,13 +789,19 @@ func openFileWithRetry(ctx context.Context, path string) (*os.File, error) {
 // blobsExist resolves the presence of the given (deduplicated) hashes in
 // the store. Stores implementing BatchExistencer answer the whole batch
 // with one call; otherwise — and whenever the batch call fails — the code
-// falls back to per-hash Exists with the historical error semantics (an
-// error counts as "missing" so the caller re-uploads instead of failing
-// the backup).
-func (p *SimplePipeline) blobsExist(ctx context.Context, hashes []string) map[string]bool {
+// falls back to per-hash Exists.
+//
+// Error semantics mirror checkAndUploadBlob: a confirmed absence counts as
+// "missing" (the caller re-uploads, which is cheap when the blob really is
+// gone), and so does a transient failure (the upload may well succeed).
+// ErrPermissionDenied is different — an auth/permission outage makes every
+// subsequent Exists fail identically, so treating it as "missing" would
+// turn one outage into a full redundant re-upload. It is returned to the
+// caller, which must abort the backup.
+func (p *SimplePipeline) blobsExist(ctx context.Context, hashes []string) (map[string]bool, error) {
 	result := make(map[string]bool, len(hashes))
 	if len(hashes) == 0 {
-		return result
+		return result, nil
 	}
 	uniq := make([]string, 0, len(hashes))
 	for _, h := range hashes {
@@ -808,32 +814,47 @@ func (p *SimplePipeline) blobsExist(ctx context.Context, hashes []string) map[st
 		uniq = append(uniq, h)
 	}
 	if be, ok := p.store.(BatchExistencer); ok {
-		if batch, bErr := be.ExistsBatch(ctx, uniq); bErr == nil {
+		switch batch, bErr := be.ExistsBatch(ctx, uniq); {
+		case bErr == nil:
 			for _, h := range uniq {
 				result[h] = batch[h]
 			}
-			return result
+			return result, nil
+		case errors.Is(bErr, ErrPermissionDenied):
+			return nil, fmt.Errorf("batch blob exists check: %w", bErr)
 		}
+		// Other batch errors fall through to the per-hash path, which may
+		// still succeed and gives per-blob error classification.
 	}
 	for _, h := range uniq {
 		exists, eErr := p.store.Exists(ctx, h)
-		if eErr == nil && exists {
+		if eErr != nil {
+			if errors.Is(eErr, ErrPermissionDenied) {
+				return nil, fmt.Errorf("blob exists check for %s: %w", h, eErr)
+			}
+			// Transient/unclassified: treat as missing and let the caller
+			// re-upload, matching the historical behavior.
+			continue
+		}
+		if exists {
 			result[h] = true
 		}
 	}
-	return result
+	return result, nil
 }
 
 // tryUnchangedEntry returns an "unchanged" FileEntry for fe if every blob
-// referenced by prevFile is still present in the store. Any Exists() error
-// is treated as "blob missing" so we fall back to re-uploading rather than
-// failing the whole backup — the same defensive behavior the inline loops
-// used before this helper extracted them.
+// referenced by prevFile is still present in the store. A transient or
+// unclassified Exists() error is treated as "blob missing" so we fall back
+// to re-uploading rather than failing the whole backup. An
+// ErrPermissionDenied error is propagated: an auth/permission outage would
+// make every other file's check fail the same way, so the caller aborts
+// instead of re-uploading the entire source.
 //
 // Shared by the mtime/size fast path in processFile and the content-hash
 // fast path in processFileStreaming so the existence-check loop can't drift
 // between the two callers.
-func (p *SimplePipeline) tryUnchangedEntry(ctx context.Context, fe scanEntry, prevFile FileEntry, contentHash string) (*FileEntry, bool) {
+func (p *SimplePipeline) tryUnchangedEntry(ctx context.Context, fe scanEntry, prevFile FileEntry, contentHash string) (*FileEntry, bool, error) {
 	var hashes []string
 	if len(prevFile.Chunks) > 0 {
 		hashes = make([]string, 0, len(prevFile.Chunks))
@@ -843,17 +864,20 @@ func (p *SimplePipeline) tryUnchangedEntry(ctx context.Context, fe scanEntry, pr
 	} else {
 		hashes = []string{contentHash}
 	}
-	presence := p.blobsExist(ctx, hashes)
+	presence, err := p.blobsExist(ctx, hashes)
+	if err != nil {
+		return nil, false, err
+	}
 	for _, h := range hashes {
 		if !presence[h] {
-			return nil, false
+			return nil, false, nil
 		}
 	}
 	entry := makeFileEntry(fe, contentHash, "unchanged")
 	if len(prevFile.Chunks) > 0 {
 		entry.Chunks = prevFile.Chunks
 	}
-	return entry, true
+	return entry, true, nil
 }
 
 func (p *SimplePipeline) processFile(ctx context.Context, fe scanEntry, prevFiles map[string]FileEntry) (_ *FileEntry, _ int64, _ bool, _ bool, ferr error) {
@@ -865,7 +889,11 @@ func (p *SimplePipeline) processFile(ctx context.Context, fe scanEntry, prevFile
 	// hash set and fail again — halving the existence checks for this file.
 	fastPathBlobMissing := false
 	if hasPrev && string(prevFile.Mtime) == fe.mtime && prevFile.Size == fe.size && len(prevFile.ContentHash) >= 2 {
-		if entry, ok := p.tryUnchangedEntry(ctx, fe, prevFile, prevFile.ContentHash); ok {
+		entry, ok, chkErr := p.tryUnchangedEntry(ctx, fe, prevFile, prevFile.ContentHash)
+		if chkErr != nil {
+			return nil, 0, false, false, chkErr
+		}
+		if ok {
 			return entry, 0, false, false, nil
 		}
 		fastPathBlobMissing = true
@@ -920,7 +948,11 @@ func (p *SimplePipeline) processFileStreaming(ctx context.Context, fe scanEntry,
 	}
 
 	if hasPrev && prevFile.ContentHash == contentHash && !skipUnchangedEntry {
-		if entry, ok := p.tryUnchangedEntry(ctx, fe, prevFile, contentHash); ok {
+		entry, ok, chkErr := p.tryUnchangedEntry(ctx, fe, prevFile, contentHash)
+		if chkErr != nil {
+			return nil, 0, false, false, chkErr
+		}
+		if ok {
 			return entry, 0, false, false, nil
 		}
 	}
@@ -1155,7 +1187,10 @@ func (p *SimplePipeline) uploadChangedChunks(ctx context.Context, filePath strin
 			prevChunkMap[c.Hash] = false
 			prevHashes = append(prevHashes, c.Hash)
 		}
-		presence := p.blobsExist(ctx, prevHashes)
+		presence, err := p.blobsExist(ctx, prevHashes)
+		if err != nil {
+			return 0, err
+		}
 		for h := range prevChunkMap {
 			prevChunkMap[h] = presence[h]
 		}

@@ -92,3 +92,73 @@ func TestCheckAndUploadBlobReuploadsOnTransientExistsError(t *testing.T) {
 		t.Fatal("expected the blob to be (re-)uploaded after transient exists failure")
 	}
 }
+
+// TestBlobsExistPropagatesPermissionDenied pins the fail-fast contract on
+// the dedup probe path: an auth/permission outage must surface as an
+// error, NOT be silently read as "blob missing" — otherwise every chunk
+// and every unchanged file would be re-uploaded during the outage.
+func TestBlobsExistPropagatesPermissionDenied(t *testing.T) {
+	store := &permissionDeniedStore{
+		mockBlobStore: newMockBlobStore(),
+		existsErr:     ErrPermissionDenied,
+	}
+	p := NewSimplePipeline(PipelineConfig{DisableCDC: true}, store)
+
+	_, err := p.blobsExist(context.Background(), []string{sha256HexOf([]byte("x"))})
+	if err == nil {
+		t.Fatal("blobsExist must propagate ErrPermissionDenied, got nil")
+	}
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("want ErrPermissionDenied in chain, got: %v", err)
+	}
+}
+
+// TestBlobsExistTreatsTransientAsMissing pins the other side: a transient
+// failure stays non-fatal (treated as "missing") so a flaky store does not
+// abort the whole backup.
+func TestBlobsExistTreatsTransientAsMissing(t *testing.T) {
+	store := &permissionDeniedStore{
+		mockBlobStore: newMockBlobStore(),
+		existsErr:     ErrTransientFailure,
+	}
+	p := NewSimplePipeline(PipelineConfig{DisableCDC: true}, store)
+
+	presence, err := p.blobsExist(context.Background(), []string{sha256HexOf([]byte("y"))})
+	if err != nil {
+		t.Fatalf("transient error must not fail blobsExist: %v", err)
+	}
+	for h, present := range presence {
+		if present {
+			t.Fatalf("hash %s reported present after a transient failure", h)
+		}
+	}
+}
+
+// TestUploadChangedChunksAbortsOnPermissionDenied pins the wiring: the
+// chunk-upload path must abort (not re-upload) when the dedup probe hits
+// an auth/permission outage.
+func TestUploadChangedChunksAbortsOnPermissionDenied(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte("chunk permission abort payload")
+	fp := filepath.Join(dir, "c.bin")
+	if err := os.WriteFile(fp, content, 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	store := &permissionDeniedStore{
+		mockBlobStore: newMockBlobStore(),
+		existsErr:     ErrPermissionDenied,
+	}
+	p := NewSimplePipeline(PipelineConfig{DisableCDC: true}, store)
+
+	prevChunks := []ChunkRef{{Hash: sha256HexOf([]byte("prev")), Size: 4}}
+	chunks := []ChunkRef{{Hash: sha256HexOf(content), Size: int64(len(content))}}
+
+	_, err := p.uploadChangedChunks(context.Background(), fp, int64(len(content)), chunks, [][]byte{content}, prevChunks)
+	if err == nil {
+		t.Fatal("uploadChangedChunks must abort on permission-denied dedup probe")
+	}
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("want ErrPermissionDenied in chain, got: %v", err)
+	}
+}

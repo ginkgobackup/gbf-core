@@ -149,20 +149,33 @@ func TestRunScanErrorAllowedNotBaseline(t *testing.T) {
 
 // makeDirLink creates a directory symlink (or a junction on Windows when
 // symlinks require privileges). Skips the test when neither can be created.
+//
+// Success is verified with Lstat rather than trusted from the error
+// return: sandboxed and restricted environments can silently no-op a
+// symlink creation while reporting success, which would otherwise make
+// the caller's assertions fail as if the production code were broken.
 func makeDirLink(t *testing.T, target, link string) {
 	t.Helper()
-	err := os.Symlink(target, link)
-	if err == nil {
+	linkExists := func() bool {
+		_, statErr := os.Lstat(link)
+		return statErr == nil
+	}
+
+	symErr := os.Symlink(target, link)
+	if symErr == nil && linkExists() {
 		return
 	}
 	if runtime.GOOS == "windows" {
 		out, jerr := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
-		if jerr == nil {
+		if jerr == nil && linkExists() {
 			return
 		}
-		t.Skipf("cannot create symlink or junction: %v / %v (%s)", err, jerr, out)
+		t.Skipf("cannot create symlink or junction: %v / %v (%s)", symErr, jerr, out)
 	}
-	t.Skipf("cannot create symlink: %v", err)
+	if symErr == nil {
+		t.Skipf("symlink reported success but %s does not exist (restricted environment)", link)
+	}
+	t.Skipf("cannot create symlink: %v", symErr)
 }
 
 func TestLinkCheckerRejectsSymlinkComponents(t *testing.T) {
