@@ -1646,6 +1646,7 @@ func extractHashesFromJSON(data []byte) ([]string, error) {
 }
 
 type SourceRegistry struct {
+	SchemaVersion int                `json:"schemaVersion"`
 	CloudID       string             `json:"cloudId"`
 	Name          string             `json:"name"`
 	Path          string             `json:"path"`
@@ -1727,10 +1728,26 @@ const RegistryEnvelopeMagic = "GBR1"
 
 const registryEnvelopeHeaderSize = len(RegistryEnvelopeMagic) + sha256.Size
 
+// SourceRegistrySchemaVersion is the current schema version of the JSON
+// payload inside a source registry. It is written into every registry so a
+// future reader can tell which fields to expect. Legacy registries written
+// before this field existed decode as version 0 and are treated as version 1
+// (the only format that ever existed before the field was added).
+const SourceRegistrySchemaVersion = 1
+
+// ErrUnsupportedRegistryVersion is returned when a registry payload declares
+// a schema version newer than this build understands. Loading it would
+// silently drop fields, so the registry is rejected instead.
+var ErrUnsupportedRegistryVersion = errors.New("unsupported source registry schema version")
+
 // EncodeSourceRegistry serializes reg into the GBR1 checksum envelope.
 // Shared by the local store and the cloud store so both write the same
-// on-disk/on-object format.
+// on-disk/on-object format. The SchemaVersion is stamped to the current
+// version so every file this build writes is self-describing.
 func EncodeSourceRegistry(reg *SourceRegistry) ([]byte, error) {
+	if reg.SchemaVersion == 0 {
+		reg.SchemaVersion = SourceRegistrySchemaVersion
+	}
 	data, err := json.Marshal(reg)
 	if err != nil {
 		return nil, fmt.Errorf("marshal source registry: %w", err)
@@ -1772,6 +1789,16 @@ func DecodeSourceRegistry(data []byte) (*SourceRegistry, error) {
 	if err := json.Unmarshal(data, &reg); err != nil {
 		return nil, fmt.Errorf("unmarshal source registry: %w", err)
 	}
+	// Legacy registries predate the schemaVersion field (0); treat them as
+	// the only version that ever existed before it. A newer version means a
+	// newer writer produced fields this build cannot represent — refuse it
+	// rather than silently drop them.
+	if reg.SchemaVersion == 0 {
+		reg.SchemaVersion = SourceRegistrySchemaVersion
+	} else if reg.SchemaVersion > SourceRegistrySchemaVersion {
+		return nil, fmt.Errorf("%w: file is version %d, this build supports up to %d",
+			ErrUnsupportedRegistryVersion, reg.SchemaVersion, SourceRegistrySchemaVersion)
+	}
 	return &reg, nil
 }
 
@@ -1809,7 +1836,6 @@ func (e *SourceRegistryLoadError) Error() string {
 	}
 	return fmt.Sprintf("%d source registries failed to load: %s", len(e.Failures), strings.Join(parts, "; "))
 }
-
 
 func SaveSourceRegistry(metaDir string, reg *SourceRegistry) error {
 	if err := validateCloudID(reg.CloudID); err != nil {

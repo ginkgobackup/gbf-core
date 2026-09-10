@@ -4,6 +4,7 @@
 package simple
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -59,6 +60,52 @@ func TestDecodeSourceRegistryLegacyFormats(t *testing.T) {
 	// Legacy layout 2: plain (uncompressed) JSON.
 	if _, err := DecodeSourceRegistry(mustMarshalJSON(t, reg)); err != nil {
 		t.Fatalf("legacy plain JSON decode: %v", err)
+	}
+}
+
+// TestSourceRegistrySchemaVersion pins the self-describing schemaVersion
+// field: new writes are stamped, legacy payloads without the field load as
+// the current version, and a newer writer's payload is refused rather than
+// loaded with unknown fields silently dropped.
+func TestSourceRegistrySchemaVersion(t *testing.T) {
+	reg := &SourceRegistry{CloudID: "v", Name: "Versioned", Path: "/v"}
+	encoded, err := EncodeSourceRegistry(reg)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if reg.SchemaVersion != SourceRegistrySchemaVersion {
+		t.Fatalf("EncodeSourceRegistry did not stamp SchemaVersion: got %d", reg.SchemaVersion)
+	}
+	decoded, err := DecodeSourceRegistry(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.SchemaVersion != SourceRegistrySchemaVersion {
+		t.Fatalf("round-trip SchemaVersion = %d, want %d", decoded.SchemaVersion, SourceRegistrySchemaVersion)
+	}
+
+	// Legacy payload with no schemaVersion field (json decodes it as 0).
+	legacy := mustMarshalJSON(t, &SourceRegistry{CloudID: "old", Name: "Old"})
+	legacy = bytes.ReplaceAll(legacy, []byte(`"schemaVersion":0,`), nil)
+	if bytes.Contains(legacy, []byte("schemaVersion")) {
+		t.Fatalf("test setup failed to strip schemaVersion: %s", legacy)
+	}
+	legacyDecoded, err := DecodeSourceRegistry(legacy)
+	if err != nil {
+		t.Fatalf("decode legacy: %v", err)
+	}
+	if legacyDecoded.SchemaVersion != SourceRegistrySchemaVersion {
+		t.Fatalf("legacy SchemaVersion = %d, want %d", legacyDecoded.SchemaVersion, SourceRegistrySchemaVersion)
+	}
+
+	// A registry written by a newer build must be refused.
+	future := &SourceRegistry{SchemaVersion: SourceRegistrySchemaVersion + 1, CloudID: "future", Name: "Future"}
+	futureEncoded, err := EncodeSourceRegistry(future)
+	if err != nil {
+		t.Fatalf("encode future: %v", err)
+	}
+	if _, err := DecodeSourceRegistry(futureEncoded); !errors.Is(err, ErrUnsupportedRegistryVersion) {
+		t.Fatalf("decode future: got %v, want ErrUnsupportedRegistryVersion", err)
 	}
 }
 
