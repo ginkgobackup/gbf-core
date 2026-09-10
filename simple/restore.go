@@ -459,10 +459,10 @@ func readAllBounded(buf []byte, r io.Reader, limit int) ([]byte, error) {
 // dst. ctBuf and ptBuf are scratch buffers reused across the chunks of one
 // file: ctBuf holds the raw blob (read via readAllBounded), ptBuf is the
 // AEAD output buffer (gcm.Open appends into it without reallocating).
-// Blobs that don't match the single-blob layout (GB2 containers or legacy
-// ambiguous IVs whose first 4 bytes look like a chunk count) fall back to
-// the full Decrypt path, which tries every interpretation. The possibly
-// grown buffers are returned for the next chunk.
+// Blobs that don't match the single-blob layout (GB2 or GB3 containers, or
+// legacy ambiguous IVs whose first 4 bytes look like a chunk count) fall
+// back to the full Decrypt path, which tries every interpretation. The
+// possibly grown buffers are returned for the next chunk.
 func decryptChunkBlobStream(dec *Decryptor, src io.Reader, dst io.Writer, expectedHash string, ctBuf, ptBuf []byte) ([]byte, []byte, error) {
 	data, err := readAllBounded(ctBuf, src, maxChunkBlobSize)
 	if err != nil {

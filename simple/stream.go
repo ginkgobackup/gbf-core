@@ -196,30 +196,48 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
 	}
-	chunkCount := uint32((info.Size() + int64(enc.chunkSize) - 1) / int64(enc.chunkSize))
-	if chunkCount >= MaxChunkCount {
-		return fmt.Errorf("encryptFileToWriter: chunk count %d exceeds MaxChunkCount %d (file too large for chunk size %d; increase chunk size)", chunkCount, MaxChunkCount, enc.chunkSize)
-	}
+	chunkSize := int64(enc.chunkSize)
+	chunkCount := uint64((info.Size() + chunkSize - 1) / chunkSize)
+	// GB1/GB2 disambiguate small blobs from large ones via the 4-byte chunk
+	// count, so a blob with chunkCount >= MaxChunkCount could be misread as
+	// a small blob. The legacy formats therefore cannot represent it. Such
+	// oversized blobs are written in the self-describing GB3 format, whose
+	// magic unambiguously marks a chunked blob and whose header carries the
+	// chunk size and plaintext size explicitly, lifting the ~390 GiB limit.
+	useGB3 := chunkCount >= MaxChunkCount
 
 	tryCompress := compressor != nil
-	magic := MagicGB1
-	if tryCompress {
-		magic = MagicGB2
-	}
 
-	if _, err := dst.Write([]byte(magic)); err != nil {
-		return fmt.Errorf("write magic: %w", err)
-	}
-	countBuf := make([]byte, ChunkCountSize)
-	binary.BigEndian.PutUint32(countBuf, chunkCount)
-	if _, err := dst.Write(countBuf); err != nil {
-		return fmt.Errorf("write count: %w", err)
+	if useGB3 {
+		compressAlg := byte(GB3CompressNone)
+		var headerFlags byte
+		if tryCompress {
+			compressAlg = GB3CompressZstd
+			headerFlags = GB3FlagChunkCompressed
+		}
+		hdr := encodeGB3Header(headerFlags, compressAlg, uint32(enc.chunkSize), uint64(info.Size()))
+		if _, err := dst.Write(hdr); err != nil {
+			return fmt.Errorf("write gb3 header: %w", err)
+		}
+	} else {
+		magic := MagicGB1
+		if tryCompress {
+			magic = MagicGB2
+		}
+		if _, err := dst.Write([]byte(magic)); err != nil {
+			return fmt.Errorf("write magic: %w", err)
+		}
+		countBuf := make([]byte, ChunkCountSize)
+		binary.BigEndian.PutUint32(countBuf, uint32(chunkCount))
+		if _, err := dst.Write(countBuf); err != nil {
+			return fmt.Errorf("write count: %w", err)
+		}
 	}
 
 	bp := getChunkBuf(enc.chunkSize)
 	defer putChunkBuf(bp)
 	buf := (*bp)[:enc.chunkSize]
-	for i := uint32(0); i < chunkCount; i++ {
+	for i := uint64(0); i < chunkCount; i++ {
 		n, err := io.ReadFull(src, buf)
 		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 			return fmt.Errorf("read chunk %d: %w", i, err)
@@ -247,7 +265,7 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 		}
 		encrypted := gcm.Seal(nil, iv, toStore, nil)
 
-		if tryCompress {
+		if tryCompress || useGB3 {
 			sizeBuf := make([]byte, ChunkCountSize)
 			binary.BigEndian.PutUint32(sizeBuf, uint32(len(encrypted)))
 			if _, err := dst.Write(sizeBuf); err != nil {
@@ -255,7 +273,7 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 			}
 			flags := byte(0)
 			if compressed {
-				flags = 1
+				flags = GB3FlagChunkCompressed
 			}
 			if _, err := dst.Write([]byte{flags}); err != nil {
 				return fmt.Errorf("write flags %d: %w", i, err)
@@ -375,6 +393,9 @@ func decryptStreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error {
 		return fmt.Errorf("read magic: %w", err)
 	}
 	magic := string(magicBuf)
+	if magic == MagicGB3 {
+		return decryptGB3StreamToFile(dec, src, dst)
+	}
 	if magic == MagicGB2 {
 		return decryptGB2StreamToFile(dec, src, dst)
 	}
@@ -482,6 +503,75 @@ func decryptGB2StreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error 
 		// compression expansion.
 		if storedSize > uint32(MaxStoredSize) {
 			return fmt.Errorf("chunk %d: storedSize %d exceeds max %d", i, storedSize, MaxStoredSize)
+		}
+
+		iv := make([]byte, IVSize)
+		if _, err := io.ReadFull(src, iv); err != nil {
+			return fmt.Errorf("read iv chunk %d: %w", i, err)
+		}
+
+		encryptedBuf := make([]byte, storedSize)
+		if _, err := io.ReadFull(src, encryptedBuf); err != nil {
+			return fmt.Errorf("read chunk %d: %w", i, err)
+		}
+
+		decrypted, err := gcm.Open(nil, iv, encryptedBuf, nil)
+		if err != nil {
+			return fmt.Errorf("decrypt chunk %d: %w", i, err)
+		}
+		if compressed {
+			decompressed, derr := defaultStreamDecompressor.Decompress(decrypted)
+			if derr != nil {
+				return fmt.Errorf("decompress chunk %d: %w", i, derr)
+			}
+			decrypted = decompressed
+		}
+		if _, err := dst.Write(decrypted); err != nil {
+			return fmt.Errorf("write chunk %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// decryptGB3StreamToFile decrypts a GB3 blob from a stream. Unlike the GB1
+// streaming decoder it does not need the small/large heuristic: the magic
+// unambiguously marks a chunked blob and the header carries the chunk size
+// and chunk count, so blobs are not bounded by MaxChunkCount. Each chunk is
+// framed GB2-style: storedSize(4B) || flags(1B) || IV(12B) || ciphertext.
+func decryptGB3StreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error {
+	rest := make([]byte, GB3HeaderSize-MagicSize)
+	if _, err := io.ReadFull(src, rest); err != nil {
+		return fmt.Errorf("read gb3 header: %w", err)
+	}
+	full := make([]byte, GB3HeaderSize)
+	copy(full, MagicGB3)
+	copy(full[MagicSize:], rest)
+	hdr, err := ParseGB3Header(full)
+	if err != nil {
+		return err
+	}
+
+	block, err := aes.NewCipher(dec.key)
+	if err != nil {
+		return fmt.Errorf("aes cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return fmt.Errorf("gcm: %w", err)
+	}
+
+	maxStored := int64(hdr.ChunkSize) + TagSize + 1024
+	chunkCount := hdr.ChunkCount()
+	for i := uint64(0); i < chunkCount; i++ {
+		headerBuf := make([]byte, ChunkCountSize+FlagsSize)
+		if _, err := io.ReadFull(src, headerBuf); err != nil {
+			return fmt.Errorf("read chunk %d header: %w", i, err)
+		}
+		storedSize := binary.BigEndian.Uint32(headerBuf[:ChunkCountSize])
+		compressed := headerBuf[ChunkCountSize]&GB3FlagChunkCompressed != 0
+
+		if int64(storedSize) > maxStored {
+			return fmt.Errorf("chunk %d: storedSize %d exceeds max %d", i, storedSize, maxStored)
 		}
 
 		iv := make([]byte, IVSize)
