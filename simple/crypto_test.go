@@ -574,3 +574,25 @@ func TestPipelineRejectsNonAES256Key(t *testing.T) {
 		t.Fatalf("empty key must be the no-encryption path: gcm=%v err=%v", gcm, err)
 	}
 }
+
+func TestGB3HeaderIsAuthenticated(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	e := NewEncryptor(key, 1024)
+	plaintext := []byte("authenticated gb3 header test")
+	blob, err := e.encryptLargeV3(plaintext)
+	if err != nil {
+		t.Fatalf("encryptLargeV3: %v", err)
+	}
+	d := NewDecryptor(key, 1024)
+	if got, err := d.Decrypt(blob); err != nil || string(got) != string(plaintext) {
+		t.Fatalf("roundtrip: %q, %v", got, err)
+	}
+	tampered := append([]byte(nil), blob...)
+	tampered[gb3OffPlainSize+7] ^= 0x01
+	if _, err := d.Decrypt(tampered); err == nil {
+		t.Fatal("tampered GB3 header was accepted")
+	}
+}

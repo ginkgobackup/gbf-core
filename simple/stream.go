@@ -221,15 +221,16 @@ func encryptReaderToWriter(enc *Encryptor, src io.Reader, size int64, dst io.Wri
 
 	tryCompress := compressor != nil
 
+	var gb3Header []byte
 	if useGB3 {
 		compressAlg := byte(GB3CompressNone)
-		var headerFlags byte
+		headerFlags := byte(GB3FlagHeaderAuthenticated)
 		if tryCompress {
 			compressAlg = GB3CompressZstd
-			headerFlags = GB3FlagChunkCompressed
+			headerFlags |= GB3FlagChunkCompressed
 		}
-		hdr := encodeGB3Header(headerFlags, compressAlg, uint32(enc.chunkSize), uint64(size))
-		if _, err := dst.Write(hdr); err != nil {
+		gb3Header = encodeGB3Header(headerFlags, compressAlg, uint32(enc.chunkSize), uint64(size))
+		if _, err := dst.Write(gb3Header); err != nil {
 			return fmt.Errorf("write gb3 header: %w", err)
 		}
 	} else {
@@ -280,7 +281,11 @@ func encryptReaderToWriter(enc *Encryptor, src io.Reader, size int64, dst io.Wri
 		if _, err := rand.Read(iv); err != nil {
 			return fmt.Errorf("iv chunk %d: %w", i, err)
 		}
-		encrypted := gcm.Seal(nil, iv, toStore, nil)
+		var aad []byte
+		if useGB3 {
+			aad = gb3Header
+		}
+		encrypted := gcm.Seal(nil, iv, toStore, aad)
 
 		if tryCompress || useGB3 {
 			sizeBuf := make([]byte, ChunkCountSize)
@@ -578,8 +583,13 @@ func decryptGB3StreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error 
 		return fmt.Errorf("gcm: %w", err)
 	}
 
+	var headerAAD []byte
+	if hdr.Flags&GB3FlagHeaderAuthenticated != 0 {
+		headerAAD = full
+	}
 	maxStored := int64(hdr.ChunkSize) + TagSize + 1024
 	chunkCount := hdr.ChunkCount()
+	var written int64
 	for i := uint64(0); i < chunkCount; i++ {
 		headerBuf := make([]byte, ChunkCountSize+FlagsSize)
 		if _, err := io.ReadFull(src, headerBuf); err != nil {
@@ -602,7 +612,7 @@ func decryptGB3StreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error 
 			return fmt.Errorf("read chunk %d: %w", i, err)
 		}
 
-		decrypted, err := gcm.Open(nil, iv, encryptedBuf, nil)
+		decrypted, err := gcm.Open(nil, iv, encryptedBuf, headerAAD)
 		if err != nil {
 			return fmt.Errorf("decrypt chunk %d: %w", i, err)
 		}
@@ -616,6 +626,10 @@ func decryptGB3StreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error 
 		if _, err := dst.Write(decrypted); err != nil {
 			return fmt.Errorf("write chunk %d: %w", i, err)
 		}
+		written += int64(len(decrypted))
+	}
+	if uint64(written) != hdr.PlaintextSize {
+		return fmt.Errorf("gb3 plaintext size mismatch: header %d, decrypted %d", hdr.PlaintextSize, written)
 	}
 	return nil
 }

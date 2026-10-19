@@ -54,6 +54,10 @@ const (
 	MaxGB3ChunkSize = 64 * 1024 * 1024
 	// GB3 flag bits (header offset 5).
 	GB3FlagChunkCompressed = 1 << 0
+	// GB3FlagHeaderAuthenticated means every chunk's AEAD uses the full
+	// GB3 header as additional authenticated data. New blobs set this flag;
+	// legacy blobs leave it clear and are decrypted with nil AAD.
+	GB3FlagHeaderAuthenticated = 1 << 1
 	// GB3 algorithm identifiers. Zero means "none" where applicable.
 	GB3HashSHA256     = 1
 	GB3CompressNone   = 0
@@ -243,7 +247,8 @@ func (e *Encryptor) encryptLargeV3(plaintext []byte) ([]byte, error) {
 
 	perChunk := ChunkCountSize + FlagsSize + IVSize + e.chunkSize + TagSize
 	result := make([]byte, 0, GB3HeaderSize+len(plaintext)+chunkCount*perChunk)
-	result = append(result, encodeGB3Header(0, GB3CompressNone, uint32(e.chunkSize), uint64(len(plaintext)))...)
+	header := encodeGB3Header(GB3FlagHeaderAuthenticated, GB3CompressNone, uint32(e.chunkSize), uint64(len(plaintext)))
+	result = append(result, header...)
 
 	sizeBuf := make([]byte, ChunkCountSize)
 	for i := 0; i < chunkCount; i++ {
@@ -257,7 +262,7 @@ func (e *Encryptor) encryptLargeV3(plaintext []byte) ([]byte, error) {
 		if _, err := rand.Read(iv); err != nil {
 			return nil, fmt.Errorf("iv chunk %d: %w", i, err)
 		}
-		encrypted := gcm.Seal(nil, iv, chunk, nil)
+		encrypted := gcm.Seal(nil, iv, chunk, header)
 		binary.BigEndian.PutUint32(sizeBuf, uint32(len(encrypted)))
 		result = append(result, sizeBuf...)
 		result = append(result, 0)
@@ -612,6 +617,10 @@ func (d *Decryptor) decryptLargeV3(full []byte) ([]byte, error) {
 		return nil, fmt.Errorf("gcm: %w", err)
 	}
 
+	var headerAAD []byte
+	if hdr.Flags&GB3FlagHeaderAuthenticated != 0 {
+		headerAAD = full[:GB3HeaderSize]
+	}
 	maxStored := int64(hdr.ChunkSize) + TagSize + 1024
 	var plaintext []byte
 	for i := uint64(0); i < chunkCount; i++ {
@@ -634,7 +643,7 @@ func (d *Decryptor) decryptLargeV3(full []byte) ([]byte, error) {
 		}
 		encrypted := data[:storedSize]
 		data = data[storedSize:]
-		decrypted, err := gcm.Open(nil, iv, encrypted, nil)
+		decrypted, err := gcm.Open(nil, iv, encrypted, headerAAD)
 		if err != nil {
 			return nil, fmt.Errorf("gb3 decrypt chunk %d: %w", i, err)
 		}
@@ -650,6 +659,9 @@ func (d *Decryptor) decryptLargeV3(full []byte) ([]byte, error) {
 	// Same trailing-data check as GB1/GB2: the blob must be fully consumed.
 	if len(data) != 0 {
 		return nil, fmt.Errorf("gb3 trailing data after final chunk: %d bytes", len(data))
+	}
+	if uint64(len(plaintext)) != hdr.PlaintextSize {
+		return nil, fmt.Errorf("gb3 plaintext size mismatch: header %d, decrypted %d", hdr.PlaintextSize, len(plaintext))
 	}
 	return plaintext, nil
 }
