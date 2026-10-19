@@ -193,6 +193,25 @@ func (p *SimplePipeline) getGCM() (cipher.AEAD, error) {
 	return p.gcm, p.gcmErr
 }
 
+// Close zeroes the pipeline's owned encryption/decryption key copies.
+// Run must not be called after Close.
+func (p *SimplePipeline) Close() error {
+	var firstErr error
+	if p.enc != nil {
+		if err := p.enc.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if p.dec != nil {
+		if err := p.dec.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	p.cfg.Key = nil
+	p.gcm = nil
+	return firstErr
+}
+
 func (p *SimplePipeline) WithProgress(cb ProgressCallback) *SimplePipeline {
 	p.progress = NewProgressTracker(p.cfg.SourceID, p.cfg.SourceName, cb)
 	return p

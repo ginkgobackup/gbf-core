@@ -31,6 +31,14 @@ const (
 	GEK2HeaderSize = 24
 )
 
+// ZeroKeyMaterial overwrites key bytes in place. Callers should defer it for
+// derived keys and for any master-key slice they own after use.
+func ZeroKeyMaterial(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
 func DeriveKeyFromPassword(password string, salt []byte) []byte {
 	return DeriveKeyFromPasswordParams(password, salt, Argon2Time, Argon2Memory, Argon2Threads, Argon2KeyLen)
 }
@@ -65,6 +73,7 @@ func EncodeGEK1KeyFile(masterKey []byte, password string) ([]byte, error) {
 		return nil, err
 	}
 	encKey := DeriveKeyFromPassword(password, salt)
+	defer ZeroKeyMaterial(encKey)
 	block, aesErr := aes.NewCipher(encKey)
 	if aesErr != nil {
 		return nil, fmt.Errorf("create cipher: %w", aesErr)
@@ -106,6 +115,7 @@ func EncodeGEK2KeyFileWithParams(masterKey []byte, password string, timeCost, me
 		return nil, err
 	}
 	encKey := DeriveKeyFromPasswordParams(password, salt, timeCost, memoryKiB, threads, keyLen)
+	defer ZeroKeyMaterial(encKey)
 	block, err := aes.NewCipher(encKey)
 	if err != nil {
 		return nil, fmt.Errorf("create cipher: %w", err)
@@ -158,6 +168,7 @@ func ChangeRepoPassword(repoRoot, oldPassword, newPassword string) error {
 	if err != nil {
 		return err
 	}
+	defer ZeroKeyMaterial(masterKey)
 	if err := SaveGEK2KeyFile(repoRoot, masterKey, newPassword); err != nil {
 		return err
 	}
@@ -245,6 +256,7 @@ func unlockGEK2KeyFile(data []byte, password string) ([]byte, error) {
 	salt := data[GEK2HeaderSize : GEK2HeaderSize+int(saltLen)]
 	encryptedKey := data[GEK2HeaderSize+int(saltLen):]
 	encKey := DeriveKeyFromPasswordParams(password, salt, timeCost, memoryKiB, threads, keyLen)
+	defer ZeroKeyMaterial(encKey)
 	block, err := aes.NewCipher(encKey)
 	if err != nil {
 		return nil, err
@@ -266,6 +278,7 @@ func unlockGEK2KeyFile(data []byte, password string) ([]byte, error) {
 
 func DecryptGEK1MasterKey(salt []byte, encryptedKey []byte, password string) ([]byte, error) {
 	encKey := DeriveKeyFromPassword(password, salt)
+	defer ZeroKeyMaterial(encKey)
 	block, err := aes.NewCipher(encKey)
 	if err != nil {
 		return nil, err

@@ -596,3 +596,27 @@ func TestGB3HeaderIsAuthenticated(t *testing.T) {
 		t.Fatal("tampered GB3 header was accepted")
 	}
 }
+
+func TestCryptoCloseRejectsUse(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	enc := NewEncryptor(key, 1024)
+	if _, err := enc.Encrypt([]byte("before close")); err != nil {
+		t.Fatalf("encrypt before close: %v", err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatalf("close encryptor: %v", err)
+	}
+	if _, err := enc.Encrypt([]byte("after close")); err == nil {
+		t.Fatal("encryptor accepted data after Close")
+	}
+	dec := NewDecryptor(key, 1024)
+	if err := dec.Close(); err != nil {
+		t.Fatalf("close decryptor: %v", err)
+	}
+	if _, err := dec.Decrypt([]byte(MagicGB1)); err == nil {
+		t.Fatal("decryptor accepted data after Close")
+	}
+}

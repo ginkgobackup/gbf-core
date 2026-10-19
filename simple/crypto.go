@@ -100,6 +100,7 @@ type Encryptor struct {
 	key       []byte
 	chunkSize int
 	keyErr    error
+	closed    bool
 }
 
 // validateAESKeySize enforces the GBF key contract: an empty key is the
@@ -120,7 +121,18 @@ func NewEncryptor(key []byte, chunkSize int) *Encryptor {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
-	return &Encryptor{key: key, chunkSize: chunkSize, keyErr: validateAESKeySize(key)}
+	owned := append([]byte(nil), key...)
+	return &Encryptor{key: owned, chunkSize: chunkSize, keyErr: validateAESKeySize(key)}
+}
+
+// Close zeroes the owned key copy. The caller's key slice is not modified.
+func (e *Encryptor) Close() error {
+	if e.closed {
+		return nil
+	}
+	e.closed = true
+	ZeroKeyMaterial(e.key)
+	return nil
 }
 
 // keyError reports a key-length problem detected at construction. The
@@ -128,6 +140,9 @@ func NewEncryptor(key []byte, chunkSize int) *Encryptor {
 // expression position), so the error surfaces on the first Encrypt/Decrypt
 // call instead.
 func (e *Encryptor) keyError() error {
+	if e.closed {
+		return fmt.Errorf("encryptor is closed")
+	}
 	if e.keyErr != nil {
 		return e.keyErr
 	}
@@ -276,18 +291,33 @@ type Decryptor struct {
 	key       []byte
 	chunkSize int
 	keyErr    error
+	closed    bool
 }
 
 func NewDecryptor(key []byte, chunkSize int) *Decryptor {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
-	return &Decryptor{key: key, chunkSize: chunkSize, keyErr: validateAESKeySize(key)}
+	owned := append([]byte(nil), key...)
+	return &Decryptor{key: owned, chunkSize: chunkSize, keyErr: validateAESKeySize(key)}
+}
+
+// Close zeroes the owned key copy. The caller's key slice is not modified.
+func (d *Decryptor) Close() error {
+	if d.closed {
+		return nil
+	}
+	d.closed = true
+	ZeroKeyMaterial(d.key)
+	return nil
 }
 
 // keyError mirrors Encryptor.keyError: the constructor signature is frozen,
 // so an invalid key length is reported by Decrypt instead.
 func (d *Decryptor) keyError() error {
+	if d.closed {
+		return fmt.Errorf("decryptor is closed")
+	}
 	if d.keyErr != nil {
 		return d.keyErr
 	}
