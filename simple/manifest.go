@@ -1373,6 +1373,14 @@ func DeleteSourceRegistry(metaDir string, cloudID string) error {
 	return os.Remove(srcPath)
 }
 
+// LoadTrashSourceRegistry reads the trashed copy of a source registry.
+//
+// NOTE: nothing writes these files any more. TrashSourceRegistry was added in
+// 28e43ec8 and removed in 6dbc817e (one day later, before the first release),
+// so trash/_sources only holds data in repositories touched inside that
+// window. Callers must not depend on it: the device that produced a trashed
+// manifest is already carried by the directory layout
+// (trash/{device-fingerprint}/{sourceID}) and needs no side file.
 func LoadTrashSourceRegistry(metaDir string, cloudID string) (*SourceRegistry, error) {
 	if err := validateCloudID(cloudID); err != nil {
 		return nil, err
@@ -1403,7 +1411,18 @@ func LoadTrashSourceRegistry(metaDir string, cloudID string) (*SourceRegistry, e
 	return &reg, nil
 }
 
-func ListTrashSourceIDs(metaDir string) ([]string, error) {
+// ListTrashCloudIDs lists the trashed sources of a repository as cloudIDs.
+// The trash directory mirrors the manifest layout, so a trashed source lives
+// at trash/{device-fingerprint}/{sourceID} and is addressed by exactly the
+// same cloudID as its live counterpart (see ManifestPathKey). Callers that
+// operate on a source's trash directory — CleanTrashManifestsForSource, for
+// one — must pass these values: the bare top-level directory name is only the
+// fingerprint, and ManifestTrashDir would resolve it to a directory that
+// holds source sub-directories instead of manifests.
+//
+// The "_sources" directory (per-source registries, not manifests) is skipped,
+// as are fingerprints with no source directories under them.
+func ListTrashCloudIDs(metaDir string) ([]string, error) {
 	trashBase := filepath.Join(metaDir, "trash")
 	entries, err := os.ReadDir(trashBase)
 	if err != nil {
@@ -1414,8 +1433,17 @@ func ListTrashSourceIDs(metaDir string) ([]string, error) {
 	}
 	var result []string
 	for _, e := range entries {
-		if e.IsDir() && e.Name() != "_sources" {
-			result = append(result, e.Name())
+		if !e.IsDir() || e.Name() == "_sources" {
+			continue
+		}
+		subEntries, subErr := os.ReadDir(filepath.Join(trashBase, e.Name()))
+		if subErr != nil {
+			continue
+		}
+		for _, se := range subEntries {
+			if se.IsDir() {
+				result = append(result, ManifestPathKey(e.Name(), se.Name()))
+			}
 		}
 	}
 	return result, nil
@@ -1447,8 +1475,25 @@ func CleanTrashManifestsForSource(metaDir string, cloudID string, maxAge time.Du
 	if len(remaining) == 0 {
 		_ = os.Remove(dir)
 		cleanTrashSourceRegistry(metaDir, cloudID)
+		removeEmptyTrashFingerprintDir(metaDir, dir)
 	}
 	return cleaned, nil
+}
+
+// removeEmptyTrashFingerprintDir drops the fingerprint directory that used to
+// contain the source directory just removed, so a repository backing up from
+// the same device for years does not keep one empty directory per device
+// forever. It never touches the trash root itself.
+func removeEmptyTrashFingerprintDir(metaDir string, sourceDir string) {
+	parent := filepath.Dir(sourceDir)
+	if parent == filepath.Join(metaDir, "trash") {
+		return
+	}
+	siblings, err := os.ReadDir(parent)
+	if err != nil || len(siblings) > 0 {
+		return
+	}
+	_ = os.Remove(parent)
 }
 
 func cleanTrashSourceRegistry(metaDir string, cloudID string) {

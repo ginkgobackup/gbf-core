@@ -680,9 +680,20 @@ func (p *SimplePipeline) updateSourceRegistry(metaDir, cloudID string, m *Manife
 
 func (p *SimplePipeline) logRunSummary(result *PipelineResult, stats uploadStats, totalSourceSize int64) {
 	totalFiles := stats.newFiles + stats.changedFiles + stats.unchangedFiles
+	// dedupRatio is the share of *files* that were unchanged since the previous
+	// snapshot — NOT the share of bytes that came from the existing blob store.
+	// A brand-new source always reports 0.0% here even when every byte it
+	// writes is served from blobs that already exist (cross-source dedup),
+	// which is exactly the case that hid the 2026-10-19 GC/backup race.
 	var dedupRatio float64
 	if totalFiles > 0 {
 		dedupRatio = float64(stats.unchangedFiles) / float64(totalFiles)
+	}
+	// blobReuse is the honest one: how much of the source data was NOT written
+	// because the blob already existed in the repository.
+	var blobReuse float64
+	if totalSourceSize > 0 {
+		blobReuse = 1 - float64(stats.uploadedBytes)/float64(totalSourceSize)
 	}
 	var throughputMBps float64
 	if result.Duration.Seconds() > 0 {
@@ -701,6 +712,7 @@ func (p *SimplePipeline) logRunSummary(result *PipelineResult, stats uploadStats
 		"uploaded_bytes", stats.uploadedBytes,
 		"total_source_bytes", totalSourceSize,
 		"dedup_ratio", fmt.Sprintf("%.1f%%", dedupRatio*100),
+		"blob_reuse", fmt.Sprintf("%.1f%%", blobReuse*100),
 		"throughput_mbps", fmt.Sprintf("%.1f", throughputMBps),
 		"duration", result.Duration.Round(time.Millisecond),
 		"session_id", p.cfg.SessionID,

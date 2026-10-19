@@ -154,26 +154,29 @@ func TestRunScanErrorAllowedNotBaseline(t *testing.T) {
 // return: sandboxed and restricted environments can silently no-op a
 // symlink creation while reporting success, which would otherwise make
 // the caller's assertions fail as if the production code were broken.
+// The symlink bit must be set, not merely the path present — some
+// sandboxes degrade os.Symlink into a plain directory, which exists and
+// therefore passes an existence-only check.
 func makeDirLink(t *testing.T, target, link string) {
 	t.Helper()
-	linkExists := func() bool {
-		_, statErr := os.Lstat(link)
-		return statErr == nil
+	isLink := func() bool {
+		fi, statErr := os.Lstat(link)
+		return statErr == nil && fi.Mode()&os.ModeSymlink != 0
 	}
 
 	symErr := os.Symlink(target, link)
-	if symErr == nil && linkExists() {
+	if symErr == nil && isLink() {
 		return
 	}
 	if runtime.GOOS == "windows" {
 		out, jerr := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
-		if jerr == nil && linkExists() {
+		if jerr == nil && isLink() {
 			return
 		}
 		t.Skipf("cannot create symlink or junction: %v / %v (%s)", symErr, jerr, out)
 	}
 	if symErr == nil {
-		t.Skipf("symlink reported success but %s does not exist (restricted environment)", link)
+		t.Skipf("symlink reported success but %s is not a symlink (restricted environment degrades it to a plain directory)", link)
 	}
 	t.Skipf("cannot create symlink: %v", symErr)
 }

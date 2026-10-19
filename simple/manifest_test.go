@@ -900,6 +900,116 @@ func TestCleanTrashManifestsNoTrashDir(t *testing.T) {
 	}
 }
 
+func TestListTrashCloudIDs(t *testing.T) {
+	dir := t.TempDir()
+
+	trashOne := func(sourceID int64, deviceID string, timestamp string) {
+		t.Helper()
+		m := NewManifest(sourceID, "", "src", "/data", deviceID)
+		m.Timestamp = timestamp
+		if _, err := SaveManifest(dir, m); err != nil {
+			t.Fatalf("save %s: %v", deviceID, err)
+		}
+		if err := TrashManifest(dir, ManifestPathKey(deviceID, fmt.Sprintf("%d", sourceID)), timestamp, deviceID); err != nil {
+			t.Fatalf("trash %s: %v", deviceID, err)
+		}
+	}
+	trashOne(1, "dev1", "2026-05-19T10:00:00Z")
+	trashOne(2, "dev1", "2026-05-19T11:00:00Z")
+	trashOne(1, "dev2", "2026-05-19T12:00:00Z")
+
+	// The registry directory holds no manifests and must never be reported.
+	if err := os.MkdirAll(filepath.Join(dir, "trash", "_sources"), 0755); err != nil {
+		t.Fatalf("mkdir _sources: %v", err)
+	}
+
+	ids, err := ListTrashCloudIDs(dir)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	want := []string{
+		ManifestPathKey("dev1", "1"),
+		ManifestPathKey("dev1", "2"),
+		ManifestPathKey("dev2", "1"),
+	}
+	got := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		got[id] = true
+	}
+	if len(ids) != len(want) {
+		t.Fatalf("got %d trash cloudIDs %v, want %d", len(ids), ids, len(want))
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("missing trash cloudID %q (got %v)", w, ids)
+		}
+	}
+
+	// Each reported cloudID must resolve to a directory that actually holds
+	// trashed manifests — the property the retention GC depends on.
+	for _, id := range ids {
+		entries, readErr := readManifestFiles(ManifestTrashDir(dir, id))
+		if readErr != nil {
+			t.Errorf("cloudID %q does not resolve to a readable trash dir: %v", id, readErr)
+			continue
+		}
+		if len(entries) == 0 {
+			t.Errorf("cloudID %q resolves to a trash dir holding no manifests", id)
+		}
+	}
+}
+
+func TestListTrashCloudIDsNoTrashDir(t *testing.T) {
+	ids, err := ListTrashCloudIDs(t.TempDir())
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("got %v, want none", ids)
+	}
+}
+
+func TestCleanTrashManifestsForSourceDropsEmptyDirs(t *testing.T) {
+	dir := t.TempDir()
+
+	m := NewManifest(1, "", "src", "/data", "dev1")
+	m.Timestamp = "2026-05-19T10:00:00Z"
+	if _, err := SaveManifest(dir, m); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	cloudID := ManifestPathKey("dev1", "1")
+	if err := TrashManifest(dir, cloudID, "2026-05-19T10:00:00Z", "dev1"); err != nil {
+		t.Fatalf("trash: %v", err)
+	}
+
+	trashDir := ManifestTrashDir(dir, cloudID)
+	entries, _ := os.ReadDir(trashDir)
+	for _, e := range entries {
+		old := filepath.Join(trashDir, e.Name())
+		newTime := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(old, newTime, newTime); err != nil {
+			t.Fatalf("chtimes %s: %v", old, err)
+		}
+	}
+
+	cleaned, err := CleanTrashManifestsForSource(dir, cloudID, time.Hour)
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if cleaned == 0 {
+		t.Fatal("cleaned 0 entries, want the expired trash removed")
+	}
+	if _, statErr := os.Stat(trashDir); !os.IsNotExist(statErr) {
+		t.Errorf("source trash dir still present (stat err %v)", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "trash", "dev1")); !os.IsNotExist(statErr) {
+		t.Errorf("empty fingerprint dir still present (stat err %v)", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "trash")); statErr != nil {
+		t.Errorf("trash root should survive: %v", statErr)
+	}
+}
+
 func TestManifestExistsByTimestamp(t *testing.T) {
 	dir := t.TempDir()
 
