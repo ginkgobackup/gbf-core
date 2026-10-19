@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -389,7 +390,7 @@ func TestDecryptStreamGB1SmallBlobWithChunkCountIV(t *testing.T) {
 	blob := buildSmallBlobWithIV(t, key, plaintext, iv)
 
 	var out bytes.Buffer
-	if err := decryptStreamToFile(dec, bytes.NewReader(blob), &out); err != nil {
+	if err := decryptStreamToFile(dec, bytes.NewReader(blob), &out, SHA256Bytes(plaintext)); err != nil {
 		t.Fatalf("decryptStreamToFile ambiguous small blob: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), plaintext) {
@@ -494,5 +495,82 @@ func TestGB2StreamRoundtrip(t *testing.T) {
 	}
 	if !bytes.Equal(restored, data) {
 		t.Fatalf("stream decrypt mismatch: got %d bytes, want %d", len(restored), len(data))
+	}
+}
+
+// TestEncryptorRejectsNonAES256Keys enforces the AES-256-only contract:
+// aes.NewCipher would happily accept 16- and 24-byte keys, but GBF is
+// defined as AES-256, so any other non-empty length must fail with a clear
+// error at the first use (the constructor signature is frozen).
+func TestEncryptorRejectsNonAES256Keys(t *testing.T) {
+	for _, n := range []int{1, 16, 24, 31, 33} {
+		enc := NewEncryptor(make([]byte, n), DefaultChunkSize)
+		if _, err := enc.Encrypt([]byte("data")); err == nil {
+			t.Fatalf("key length %d: expected Encrypt error", n)
+		} else if !strings.Contains(err.Error(), "key length") {
+			t.Fatalf("key length %d: error = %q, want key length error", n, err)
+		}
+	}
+}
+
+func TestDecryptorRejectsNonAES256Keys(t *testing.T) {
+	key := make([]byte, 32)
+	blob, err := NewEncryptor(key, DefaultChunkSize).Encrypt([]byte("data"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	for _, n := range []int{16, 24} {
+		dec := NewDecryptor(make([]byte, n), DefaultChunkSize)
+		if _, err := dec.Decrypt(blob); err == nil {
+			t.Fatalf("key length %d: expected Decrypt error", n)
+		} else if !strings.Contains(err.Error(), "key length") {
+			t.Fatalf("key length %d: error = %q, want key length error", n, err)
+		}
+	}
+}
+
+// TestEncryptorEmptyKeyIsNoEncryption pins the explicit empty-key path:
+// the constructors must keep accepting it (the pipeline branches on
+// len(key)==0 and never calls Encrypt), while a 32-byte key round-trips.
+func TestEncryptorEmptyKeyIsNoEncryption(t *testing.T) {
+	enc := NewEncryptor(nil, DefaultChunkSize)
+	if err := enc.keyError(); err != nil {
+		t.Fatalf("empty key must be accepted: %v", err)
+	}
+	dec := NewDecryptor(nil, DefaultChunkSize)
+	if err := dec.keyError(); err != nil {
+		t.Fatalf("empty key must be accepted: %v", err)
+	}
+
+	key := make([]byte, 32)
+	enc = NewEncryptor(key, DefaultChunkSize)
+	dec = NewDecryptor(key, DefaultChunkSize)
+	blob, err := enc.Encrypt([]byte("aes-256 roundtrip"))
+	if err != nil {
+		t.Fatalf("encrypt with 32-byte key: %v", err)
+	}
+	got, err := dec.Decrypt(blob)
+	if err != nil {
+		t.Fatalf("decrypt with 32-byte key: %v", err)
+	}
+	if string(got) != "aes-256 roundtrip" {
+		t.Fatalf("roundtrip mismatch: %q", got)
+	}
+}
+
+// TestPipelineRejectsNonAES256Key verifies the pipeline surface reports the
+// same clear error instead of silently building an AES-128/192 cipher.
+func TestPipelineRejectsNonAES256Key(t *testing.T) {
+	for _, n := range []int{16, 24} {
+		p := NewSimplePipeline(PipelineConfig{Key: make([]byte, n)}, nil)
+		if _, err := p.getGCM(); err == nil {
+			t.Fatalf("key length %d: expected getGCM error", n)
+		} else if !strings.Contains(err.Error(), "key length") {
+			t.Fatalf("key length %d: error = %q, want key length error", n, err)
+		}
+	}
+	p := NewSimplePipeline(PipelineConfig{Key: nil}, nil)
+	if gcm, err := p.getGCM(); err != nil || gcm != nil {
+		t.Fatalf("empty key must be the no-encryption path: gcm=%v err=%v", gcm, err)
 	}
 }

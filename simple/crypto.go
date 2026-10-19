@@ -95,16 +95,45 @@ const (
 type Encryptor struct {
 	key       []byte
 	chunkSize int
+	keyErr    error
+}
+
+// validateAESKeySize enforces the GBF key contract: an empty key is the
+// explicit "no encryption" path used by the pipeline, and any non-empty key
+// must be exactly 32 bytes (AES-256). aes.NewCipher would also accept 16 and
+// 24-byte keys, but GBF is defined as AES-256-only; silently encrypting new
+// data with AES-128/192 would make the format depend on the key length.
+func validateAESKeySize(key []byte) error {
+	switch len(key) {
+	case 0, 32:
+		return nil
+	default:
+		return fmt.Errorf("invalid encryption key length %d: expected 32 bytes (AES-256) or empty for no encryption", len(key))
+	}
 }
 
 func NewEncryptor(key []byte, chunkSize int) *Encryptor {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
-	return &Encryptor{key: key, chunkSize: chunkSize}
+	return &Encryptor{key: key, chunkSize: chunkSize, keyErr: validateAESKeySize(key)}
+}
+
+// keyError reports a key-length problem detected at construction. The
+// constructors keep their historical signature (callers use them in
+// expression position), so the error surfaces on the first Encrypt/Decrypt
+// call instead.
+func (e *Encryptor) keyError() error {
+	if e.keyErr != nil {
+		return e.keyErr
+	}
+	return validateAESKeySize(e.key)
 }
 
 func (e *Encryptor) Encrypt(plaintext []byte) ([]byte, error) {
+	if err := e.keyError(); err != nil {
+		return nil, err
+	}
 	if len(plaintext) < e.chunkSize {
 		return e.encryptSmall(plaintext)
 	}
@@ -241,16 +270,29 @@ func (e *Encryptor) encryptLargeV3(plaintext []byte) ([]byte, error) {
 type Decryptor struct {
 	key       []byte
 	chunkSize int
+	keyErr    error
 }
 
 func NewDecryptor(key []byte, chunkSize int) *Decryptor {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
-	return &Decryptor{key: key, chunkSize: chunkSize}
+	return &Decryptor{key: key, chunkSize: chunkSize, keyErr: validateAESKeySize(key)}
+}
+
+// keyError mirrors Encryptor.keyError: the constructor signature is frozen,
+// so an invalid key length is reported by Decrypt instead.
+func (d *Decryptor) keyError() error {
+	if d.keyErr != nil {
+		return d.keyErr
+	}
+	return validateAESKeySize(d.key)
 }
 
 func (d *Decryptor) Decrypt(ciphertext []byte) ([]byte, error) {
+	if err := d.keyError(); err != nil {
+		return nil, err
+	}
 	if len(ciphertext) < MagicSize {
 		return nil, fmt.Errorf("data too short: %d bytes", len(ciphertext))
 	}

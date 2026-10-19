@@ -44,7 +44,21 @@ func NewAESEncryptor() *AESEncryptor {
 	return &AESEncryptor{cache: make(map[string]*gcmEntry)}
 }
 
+// validateAESKeyLength enforces AES-256-only keys. aes.NewCipher would also
+// accept 16 and 24-byte keys, but every value this package protects is
+// defined as AES-256; accepting shorter keys would silently weaken the
+// encryption and make the on-disk format depend on the key length.
+func validateAESKeyLength(key []byte) error {
+	if len(key) != 32 {
+		return fmt.Errorf("invalid AES key length %d: expected 32 bytes (AES-256)", len(key))
+	}
+	return nil
+}
+
 func newGCM(key []byte) (cipher.AEAD, error) {
+	if err := validateAESKeyLength(key); err != nil {
+		return nil, err
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -53,6 +67,9 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 }
 
 func (e *AESEncryptor) getGCM(key []byte) (cipher.AEAD, error) {
+	if err := validateAESKeyLength(key); err != nil {
+		return nil, err
+	}
 	// Use SHA-256 of the key as the cache key instead of the raw key bytes.
 	// This avoids retaining the actual secret key material in the map.
 	hash := sha256.Sum256(key)

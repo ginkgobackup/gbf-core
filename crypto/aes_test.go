@@ -6,6 +6,7 @@ package crypto
 import (
 	"crypto/rand"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -164,4 +165,42 @@ func TestDeriveKey(t *testing.T) {
 
 func TestAESEncryptor_InterfaceCheck(t *testing.T) {
 	var _ vault.Encryptor = (*AESEncryptor)(nil)
+}
+
+// TestAESEncryptorRejectsNonAES256Keys pins the AES-256-only contract:
+// aes.NewCipher accepts 16/24-byte keys, but this package must not silently
+// produce AES-128/192 ciphertext. Empty keys are rejected as well — unlike
+// simple.Encryptor, this type has no no-encryption mode.
+func TestAESEncryptorRejectsNonAES256Keys(t *testing.T) {
+	e := NewAESEncryptor()
+	for _, n := range []int{0, 1, 16, 24, 31, 33} {
+		key := make([]byte, n)
+		if _, err := e.Encrypt([]byte("payload"), key); err == nil {
+			t.Fatalf("key length %d: expected Encrypt error", n)
+		} else if !strings.Contains(err.Error(), "key length") {
+			t.Fatalf("key length %d: error = %q, want key length error", n, err)
+		}
+		if _, err := e.Decrypt(make([]byte, 12+16), key); err == nil {
+			t.Fatalf("key length %d: expected Decrypt error", n)
+		} else if !strings.Contains(err.Error(), "key length") {
+			t.Fatalf("key length %d: error = %q, want key length error", n, err)
+		}
+	}
+	if n := cacheSize(e); n != 0 {
+		t.Fatalf("invalid keys must not be cached: cache size = %d", n)
+	}
+
+	// A 32-byte key still works after the rejected ones.
+	key := make([]byte, 32)
+	ct, err := e.Encrypt([]byte("payload"), key)
+	if err != nil {
+		t.Fatalf("encrypt with 32-byte key: %v", err)
+	}
+	pt, err := e.Decrypt(ct, key)
+	if err != nil {
+		t.Fatalf("decrypt with 32-byte key: %v", err)
+	}
+	if string(pt) != "payload" {
+		t.Fatalf("roundtrip mismatch: %q", pt)
+	}
 }

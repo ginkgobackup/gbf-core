@@ -183,6 +183,23 @@ func UploadBlobFromPath(ctx context.Context, store SimpleBlobStore, enc *Encrypt
 // read from src, letting the caller compute the content hash in the same
 // pass as the encryption (no second read of the source).
 func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor *compress.ZstdCompressor, plainHash hash.Hash) error {
+	info, err := src.Stat()
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+	return encryptReaderToWriter(enc, src, info.Size(), dst, compressor, plainHash)
+}
+
+// encryptReaderToWriter is encryptFileToWriter with an explicit size, split
+// out so the truncation guard can be tested with a shrinking reader. size
+// is the size observed by the scan (and encoded in the chunk count/header);
+// if src yields fewer bytes than that — e.g. the file shrank after the scan
+// — the upload must fail instead of returning a blob whose header promises
+// chunks that were never written.
+func encryptReaderToWriter(enc *Encryptor, src io.Reader, size int64, dst io.Writer, compressor *compress.ZstdCompressor, plainHash hash.Hash) error {
+	if err := enc.keyError(); err != nil {
+		return err
+	}
 	block, err := aes.NewCipher(enc.key)
 	if err != nil {
 		return fmt.Errorf("aes cipher: %w", err)
@@ -192,12 +209,8 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 		return fmt.Errorf("gcm: %w", err)
 	}
 
-	info, err := src.Stat()
-	if err != nil {
-		return fmt.Errorf("stat: %w", err)
-	}
 	chunkSize := int64(enc.chunkSize)
-	chunkCount := uint64((info.Size() + chunkSize - 1) / chunkSize)
+	chunkCount := uint64((size + chunkSize - 1) / chunkSize)
 	// GB1/GB2 disambiguate small blobs from large ones via the 4-byte chunk
 	// count, so a blob with chunkCount >= MaxChunkCount could be misread as
 	// a small blob. The legacy formats therefore cannot represent it. Such
@@ -215,7 +228,7 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 			compressAlg = GB3CompressZstd
 			headerFlags = GB3FlagChunkCompressed
 		}
-		hdr := encodeGB3Header(headerFlags, compressAlg, uint32(enc.chunkSize), uint64(info.Size()))
+		hdr := encodeGB3Header(headerFlags, compressAlg, uint32(enc.chunkSize), uint64(size))
 		if _, err := dst.Write(hdr); err != nil {
 			return fmt.Errorf("write gb3 header: %w", err)
 		}
@@ -237,13 +250,17 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 	bp := getChunkBuf(enc.chunkSize)
 	defer putChunkBuf(bp)
 	buf := (*bp)[:enc.chunkSize]
+	var written int64
 	for i := uint64(0); i < chunkCount; i++ {
 		n, err := io.ReadFull(src, buf)
 		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 			return fmt.Errorf("read chunk %d: %w", i, err)
 		}
 		if n == 0 {
-			break
+			return fmt.Errorf("file truncated during backup: read %d of %d bytes, chunk %d of %d missing", written, size, i, chunkCount)
+		}
+		if err != nil && i+1 < chunkCount {
+			return fmt.Errorf("unexpected EOF before declared chunk count: read %d of %d bytes at chunk %d of %d", written+int64(n), size, i, chunkCount)
 		}
 		chunk := buf[:n]
 		if plainHash != nil {
@@ -286,6 +303,10 @@ func encryptFileToWriter(enc *Encryptor, src *os.File, dst io.Writer, compressor
 		if _, err := dst.Write(encrypted); err != nil {
 			return fmt.Errorf("write chunk %d: %w", i, err)
 		}
+		written += int64(n)
+	}
+	if written != size {
+		return fmt.Errorf("file size changed during backup: expected %d bytes, read %d", size, written)
 	}
 	return nil
 }
@@ -324,12 +345,9 @@ func DownloadBlobToFile(ctx context.Context, store SimpleBlobStore, dec *Decrypt
 		if err2 != nil {
 			return fmt.Errorf("decrypt: %w", err2)
 		}
-		if defaultStreamDecompressor.IsCompressed(plaintext) {
-			decompressed, derr := defaultStreamDecompressor.Decompress(plaintext)
-			if derr != nil {
-				return fmt.Errorf("decompress: %w", derr)
-			}
-			plaintext = decompressed
+		plaintext, err2 = restoreDecompress(plaintext, hash)
+		if err2 != nil {
+			return err2
 		}
 		actualHash := SHA256Bytes(plaintext)
 		if actualHash != hash {
@@ -362,7 +380,7 @@ func DownloadBlobToFile(ctx context.Context, store SimpleBlobStore, dec *Decrypt
 	}()
 
 	vw := &verifyingWriter{w: tmpF, h: sha256.New()}
-	if err := decryptStreamToFile(dec, rc, vw); err != nil {
+	if err := decryptStreamToFile(dec, rc, vw, hash); err != nil {
 		return fmt.Errorf("stream decrypt: %w", err)
 	}
 	// The streaming path verifies the decrypted plaintext against the
@@ -387,7 +405,7 @@ func DownloadBlobToFile(ctx context.Context, store SimpleBlobStore, dec *Decrypt
 	return os.Rename(tmp, targetPath)
 }
 
-func decryptStreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error {
+func decryptStreamToFile(dec *Decryptor, src io.Reader, dst io.Writer, expectedHash string) error {
 	magicBuf := make([]byte, MagicSize)
 	if _, err := io.ReadFull(src, magicBuf); err != nil {
 		return fmt.Errorf("read magic: %w", err)
@@ -406,7 +424,7 @@ func decryptStreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error {
 	countBuf := make([]byte, ChunkCountSize)
 	if _, err := io.ReadFull(src, countBuf); err != nil {
 		data := append(magicBuf[MagicSize:], countBuf...)
-		return decryptSmallStream(dec, data, src, dst)
+		return decryptSmallStream(dec, data, src, dst, expectedHash)
 	}
 
 	if !isChunkCount(countBuf) {
@@ -415,7 +433,7 @@ func decryptStreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error {
 			return fmt.Errorf("read iv: %w", err)
 		}
 		ivData := append(countBuf, ivBuf...)
-		return decryptSmallStreamFromIV(dec, ivData, src, dst)
+		return decryptSmallStreamFromIV(dec, ivData, src, dst, expectedHash)
 	}
 
 	chunkCount := binary.BigEndian.Uint32(countBuf)
@@ -455,7 +473,7 @@ func decryptStreamToFile(dec *Decryptor, src io.Reader, dst io.Writer) error {
 				smallData = append(smallData, iv...)
 				smallData = append(smallData, encrypted...)
 				if plaintext, serr := dec.decryptSmall(smallData); serr == nil {
-					if werr := writeSmallPlaintext(dst, plaintext); werr != nil {
+					if werr := writeSmallPlaintext(dst, plaintext, expectedHash); werr != nil {
 						return fmt.Errorf("write small blob: %w", werr)
 					}
 					return nil
@@ -620,24 +638,23 @@ func readBoundedSmall(initialData []byte, src io.Reader) ([]byte, error) {
 }
 
 // writeSmallPlaintext writes a decrypted GB1 small blob to dst, applying
-// the same IsCompressed→Decompress step as the buffered DownloadBlob path.
+// the same hash-aware decompression step as the buffered DownloadBlob path.
 // The pipeline (hashAndEncryptFile) and UploadBlobFromPath compress
 // small-blob plaintext before encryption while keying the blob by the hash
 // of the RAW content — without this step the streaming small-blob path
-// would write zstd frames and fail the content-hash verification.
-func writeSmallPlaintext(dst io.Writer, plaintext []byte) error {
-	if defaultStreamDecompressor.IsCompressed(plaintext) {
-		decompressed, err := defaultStreamDecompressor.Decompress(plaintext)
-		if err != nil {
-			return fmt.Errorf("decompress: %w", err)
-		}
-		plaintext = decompressed
+// would write zstd frames and fail the content-hash verification. A user
+// file that is itself a zstd frame must NOT be decompressed, which is why
+// expectedHash is passed through to restoreDecompress.
+func writeSmallPlaintext(dst io.Writer, plaintext []byte, expectedHash string) error {
+	plaintext, err := restoreDecompress(plaintext, expectedHash)
+	if err != nil {
+		return err
 	}
-	_, err := dst.Write(plaintext)
+	_, err = dst.Write(plaintext)
 	return err
 }
 
-func decryptSmallStream(dec *Decryptor, initialData []byte, src io.Reader, dst io.Writer) error {
+func decryptSmallStream(dec *Decryptor, initialData []byte, src io.Reader, dst io.Writer, expectedHash string) error {
 	all, err := readBoundedSmall(initialData, src)
 	if err != nil {
 		return err
@@ -646,10 +663,10 @@ func decryptSmallStream(dec *Decryptor, initialData []byte, src io.Reader, dst i
 	if err != nil {
 		return err
 	}
-	return writeSmallPlaintext(dst, plaintext)
+	return writeSmallPlaintext(dst, plaintext, expectedHash)
 }
 
-func decryptSmallStreamFromIV(dec *Decryptor, ivData []byte, src io.Reader, dst io.Writer) error {
+func decryptSmallStreamFromIV(dec *Decryptor, ivData []byte, src io.Reader, dst io.Writer, expectedHash string) error {
 	all, err := readBoundedSmall(ivData, src)
 	if err != nil {
 		return err
@@ -658,5 +675,5 @@ func decryptSmallStreamFromIV(dec *Decryptor, ivData []byte, src io.Reader, dst 
 	if err != nil {
 		return err
 	}
-	return writeSmallPlaintext(dst, plaintext)
+	return writeSmallPlaintext(dst, plaintext, expectedHash)
 }

@@ -174,6 +174,10 @@ func (p *SimplePipeline) getGCM() (cipher.AEAD, error) {
 		if len(p.enc.key) == 0 {
 			return
 		}
+		if err := validateAESKeySize(p.enc.key); err != nil {
+			p.gcmErr = err
+			return
+		}
 		block, err := aes.NewCipher(p.enc.key)
 		if err != nil {
 			p.gcmErr = err

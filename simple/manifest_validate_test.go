@@ -116,6 +116,55 @@ func TestManifestValidateRejectsBadHashFormat(t *testing.T) {
 	}
 }
 
+func TestManifestValidateHashes(t *testing.T) {
+	m := validTestManifest()
+	if err := m.ValidateHashes(); err != nil {
+		t.Fatalf("valid manifest rejected: %v", err)
+	}
+
+	badContent := validTestManifest()
+	badContent.Dirs[""].Files[0].ContentHash = "not-a-hash"
+	if err := badContent.ValidateHashes(); err == nil || !strings.Contains(err.Error(), "content hash is not sha-256 hex") {
+		t.Fatalf("want content hash error, got %v", err)
+	}
+
+	badChunk := validTestManifest()
+	badChunk.Dirs["sub"].Files[0].Chunks[0].Hash = "zzzz"
+	if err := badChunk.ValidateHashes(); err == nil || !strings.Contains(err.Error(), "chunk hash is not sha-256 hex") {
+		t.Fatalf("want chunk hash error, got %v", err)
+	}
+
+	if err := (*Manifest)(nil).ValidateHashes(); err == nil {
+		t.Fatal("nil manifest should be rejected")
+	}
+
+	// Locked/errored files carry no hash and are not restorable; they must
+	// not fail the hash check.
+	incomplete := validTestManifest()
+	incomplete.AddFile(FileEntry{Name: "locked.txt", Size: 5, Status: FileStatusLocked})
+	if err := incomplete.ValidateHashes(); err != nil {
+		t.Fatalf("locked file should not fail hash validation: %v", err)
+	}
+}
+
+// TestManifestValidateHashesKeepsTolerantLoad pins the split between the
+// strict opt-in hash check and the tolerant load path: a legacy/synthetic
+// manifest with placeholder hashes must still load, so consumers that need
+// hash correctness (e.g. restore) call ValidateHashes explicitly.
+func TestManifestValidateHashesKeepsTolerantLoad(t *testing.T) {
+	m := validTestManifest()
+	m.Dirs[""].Files[0].ContentHash = "placeholder"
+	data := mustMarshalManifestJSON(t, m)
+
+	loaded, err := LoadManifestFromData(data)
+	if err != nil {
+		t.Fatalf("tolerant load must accept placeholder hash: %v", err)
+	}
+	if err := loaded.ValidateHashes(); err == nil {
+		t.Fatal("ValidateHashes must reject the placeholder hash")
+	}
+}
+
 func TestManifestValidateRejectsChunkSizeMismatch(t *testing.T) {
 	m := validTestManifest()
 	m.Dirs["sub"].Files[0].Chunks[1].Size = 999
