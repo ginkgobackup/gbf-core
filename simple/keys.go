@@ -4,10 +4,12 @@
 package simple
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,16 +21,22 @@ import (
 )
 
 const (
-	Argon2Time    = 3
-	Argon2Memory  = 64 * 1024
-	Argon2Threads = 4
-	Argon2KeyLen  = 32
-	SaltSize      = 32
-	GEK1Magic     = "GEK1"
+	Argon2Time     = 3
+	Argon2Memory   = 64 * 1024
+	Argon2Threads  = 4
+	Argon2KeyLen   = 32
+	SaltSize       = 32
+	GEK1Magic      = "GEK1"
+	GEK2Magic      = "GEK2"
+	GEK2HeaderSize = 24
 )
 
 func DeriveKeyFromPassword(password string, salt []byte) []byte {
-	return argon2.IDKey([]byte(password), salt, Argon2Time, Argon2Memory, Argon2Threads, Argon2KeyLen)
+	return DeriveKeyFromPasswordParams(password, salt, Argon2Time, Argon2Memory, Argon2Threads, Argon2KeyLen)
+}
+
+func DeriveKeyFromPasswordParams(password string, salt []byte, timeCost, memoryKiB uint32, threads uint8, keyLen uint32) []byte {
+	return argon2.IDKey([]byte(password), salt, timeCost, memoryKiB, threads, keyLen)
 }
 
 func GenerateSalt() ([]byte, error) {
@@ -80,6 +88,90 @@ func EncodeGEK1KeyFile(masterKey []byte, password string) ([]byte, error) {
 	return keyFileData, nil
 }
 
+// EncodeGEK2KeyFile wraps masterKey with Argon2id parameters embedded in the
+// header, so future KDF tuning does not make old key files unreadable.
+func EncodeGEK2KeyFile(masterKey []byte, password string) ([]byte, error) {
+	return EncodeGEK2KeyFileWithParams(masterKey, password, Argon2Time, Argon2Memory, Argon2Threads, Argon2KeyLen)
+}
+
+func EncodeGEK2KeyFileWithParams(masterKey []byte, password string, timeCost, memoryKiB uint32, threads uint8, keyLen uint32) ([]byte, error) {
+	if len(masterKey) == 0 {
+		return nil, fmt.Errorf("empty master key")
+	}
+	if keyLen != 32 {
+		return nil, fmt.Errorf("unsupported derived key length %d", keyLen)
+	}
+	salt, err := GenerateSalt()
+	if err != nil {
+		return nil, err
+	}
+	encKey := DeriveKeyFromPasswordParams(password, salt, timeCost, memoryKiB, threads, keyLen)
+	block, err := aes.NewCipher(encKey)
+	if err != nil {
+		return nil, fmt.Errorf("create cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("create gcm: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("generate nonce: %w", err)
+	}
+	encryptedKey := gcm.Seal(nonce, nonce, masterKey, nil)
+	out := make([]byte, GEK2HeaderSize+len(salt)+len(encryptedKey))
+	copy(out, GEK2Magic)
+	binary.BigEndian.PutUint32(out[4:], timeCost)
+	binary.BigEndian.PutUint32(out[8:], memoryKiB)
+	binary.BigEndian.PutUint32(out[12:], uint32(threads))
+	binary.BigEndian.PutUint32(out[16:], keyLen)
+	binary.BigEndian.PutUint32(out[20:], SaltSize)
+	copy(out[GEK2HeaderSize:], salt)
+	copy(out[GEK2HeaderSize+len(salt):], encryptedKey)
+	return out, nil
+}
+
+func SaveGEK2KeyFile(repoRoot string, masterKey []byte, password string) error {
+	data, err := EncodeGEK2KeyFile(masterKey, password)
+	if err != nil {
+		return err
+	}
+	if err := fsutil.WriteFileAtomic(KeyFilePath(repoRoot), data, 0600); err != nil {
+		return fmt.Errorf("write key file: %w", err)
+	}
+	return nil
+}
+
+// ChangeRepoPassword re-wraps the master key with a new password. Existing
+// blobs do not need re-encryption. The old key file is restored if the new
+// one cannot be verified.
+func ChangeRepoPassword(repoRoot, oldPassword, newPassword string) error {
+	if newPassword == "" {
+		return fmt.Errorf("new password must not be empty")
+	}
+	path := KeyFilePath(repoRoot)
+	oldData, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read key file: %w", err)
+	}
+	masterKey, err := UnlockRepoWithPassword(repoRoot, oldPassword)
+	if err != nil {
+		return err
+	}
+	if err := SaveGEK2KeyFile(repoRoot, masterKey, newPassword); err != nil {
+		return err
+	}
+	unlocked, err := UnlockRepoWithPassword(repoRoot, newPassword)
+	if err != nil || !bytes.Equal(unlocked, masterKey) {
+		_ = fsutil.WriteFileAtomic(path, oldData, 0600)
+		if err != nil {
+			return fmt.Errorf("verify new password: %w", err)
+		}
+		return fmt.Errorf("verify new password: master key mismatch")
+	}
+	return nil
+}
+
 func SaveGEK1KeyFile(repoRoot string, masterKey []byte, password string) error {
 	keyFileData, err := EncodeGEK1KeyFile(masterKey, password)
 	if err != nil {
@@ -120,6 +212,9 @@ func UnlockRepoWithPassword(repoRoot string, password string) ([]byte, error) {
 	if len(data) >= 4 && data[0] == 'G' && data[1] == 'E' && data[2] == 'K' && data[3] == 1 {
 		return unlockGEK1KeyFile(data, password)
 	}
+	if len(data) >= GEK2HeaderSize && string(data[:4]) == GEK2Magic {
+		return unlockGEK2KeyFile(data, password)
+	}
 	return nil, fmt.Errorf("unsupported key file format")
 }
 
@@ -130,6 +225,43 @@ func unlockGEK1KeyFile(data []byte, password string) ([]byte, error) {
 	salt := data[4 : 4+SaltSize]
 	encryptedKey := data[4+SaltSize:]
 	return DecryptGEK1MasterKey(salt, encryptedKey, password)
+}
+
+func unlockGEK2KeyFile(data []byte, password string) ([]byte, error) {
+	if len(data) < GEK2HeaderSize {
+		return nil, fmt.Errorf("invalid GEK2 key file: too short")
+	}
+	timeCost := binary.BigEndian.Uint32(data[4:])
+	memoryKiB := binary.BigEndian.Uint32(data[8:])
+	threads := uint8(binary.BigEndian.Uint32(data[12:]))
+	keyLen := binary.BigEndian.Uint32(data[16:])
+	saltLen := binary.BigEndian.Uint32(data[20:])
+	if saltLen != SaltSize || len(data) < GEK2HeaderSize+int(saltLen) {
+		return nil, fmt.Errorf("invalid GEK2 key file: bad salt length")
+	}
+	if keyLen != 32 || threads == 0 || timeCost == 0 || memoryKiB == 0 {
+		return nil, fmt.Errorf("invalid GEK2 KDF parameters")
+	}
+	salt := data[GEK2HeaderSize : GEK2HeaderSize+int(saltLen)]
+	encryptedKey := data[GEK2HeaderSize+int(saltLen):]
+	encKey := DeriveKeyFromPasswordParams(password, salt, timeCost, memoryKiB, threads, keyLen)
+	block, err := aes.NewCipher(encKey)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(encryptedKey) < gcm.NonceSize()+gcm.Overhead() {
+		return nil, fmt.Errorf("encrypted key data too short")
+	}
+	nonce := encryptedKey[:gcm.NonceSize()]
+	masterKey, err := gcm.Open(nil, nonce, encryptedKey[gcm.NonceSize():], nil)
+	if err != nil {
+		return nil, fmt.Errorf("wrong password or corrupted key file")
+	}
+	return masterKey, nil
 }
 
 func DecryptGEK1MasterKey(salt []byte, encryptedKey []byte, password string) ([]byte, error) {
@@ -234,6 +366,9 @@ func KeyFileProtectionMode(repoRoot string) (string, error) {
 		return "", fmt.Errorf("read key file: %w", err)
 	}
 	if len(data) >= 4 && data[0] == 'G' && data[1] == 'E' && data[2] == 'K' && data[3] == 1 {
+		return KeyProtectionGEK1, nil
+	}
+	if len(data) >= GEK2HeaderSize && string(data[:4]) == GEK2Magic {
 		return KeyProtectionGEK1, nil
 	}
 	// Anything that parses as the legacy JSON keyfile is plaintext.

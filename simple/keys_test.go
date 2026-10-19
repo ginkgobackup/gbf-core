@@ -172,3 +172,34 @@ func TestGEK1KeyFileNotPlaintext(t *testing.T) {
 		}
 	}
 }
+
+func TestGEK2AndChangePassword(t *testing.T) {
+	dir := t.TempDir()
+	if err := InitRepoWithPassword(dir, "dev", "old-pass"); err != nil {
+		t.Fatalf("init repo: %v", err)
+	}
+	keyBefore, err := UnlockRepoWithPassword(dir, "old-pass")
+	if err != nil {
+		t.Fatalf("unlock v1: %v", err)
+	}
+	if err := ChangeRepoPassword(dir, "old-pass", "new-pass"); err != nil {
+		t.Fatalf("change password: %v", err)
+	}
+	if _, err := UnlockRepoWithPassword(dir, "old-pass"); err == nil {
+		t.Fatal("old password still unlocks after change")
+	}
+	keyAfter, err := UnlockRepoWithPassword(dir, "new-pass")
+	if err != nil {
+		t.Fatalf("unlock new password: %v", err)
+	}
+	if !bytes.Equal(keyBefore, keyAfter) {
+		t.Fatal("master key changed during password change")
+	}
+	data, err := os.ReadFile(KeyFilePath(dir))
+	if err != nil {
+		t.Fatalf("read key file: %v", err)
+	}
+	if string(data[:4]) != GEK2Magic {
+		t.Fatalf("key file magic = %q, want GEK2", data[:4])
+	}
+}
