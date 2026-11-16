@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/klauspost/compress v1.18.5
+	github.com/klauspost/compress v1.20.4
 	github.com/restic/chunker v0.4.0
 	golang.org/x/crypto v0.52.0
 )
