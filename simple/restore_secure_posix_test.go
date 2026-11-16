@@ -30,7 +30,7 @@ func TestSecureDirPosixRejectsSymlinkComponent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openSecureDir: %v", err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	_, err = d.Child("evil")
 	if err == nil {
@@ -59,7 +59,7 @@ func TestSecureDirPosixChildCreatesDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openSecureDir: %v", err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	sub, err := d.Child("a")
 	if err != nil {
@@ -89,7 +89,7 @@ func TestSecureDirPosixWriteAtomicAndChtimes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openSecureDir: %v", err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	if err := d.WriteAtomic("file.txt", []byte("payload"), 0640); err != nil {
 		t.Fatalf("WriteAtomic: %v", err)
@@ -159,7 +159,7 @@ func TestSecureDirPosixExistsNoFollow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openSecureDir: %v", err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	if err := os.Symlink("nowhere", filepath.Join(root, "dangling")); err != nil {
 		t.Fatalf("symlink: %v", err)
