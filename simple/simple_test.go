@@ -1209,7 +1209,7 @@ func TestUploadChangedChunks_ReReadPath_RestoreRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openSecureDir: %v", err)
 	}
-	defer secureRoot.Close()
+	defer func() { _ = secureRoot.Close() }()
 	if err := r.restoreChunkedFile(ctx, entry, secureRoot, "twopass.bin"); err != nil {
 		t.Fatalf("restoreChunkedFile: %v", err)
 	}

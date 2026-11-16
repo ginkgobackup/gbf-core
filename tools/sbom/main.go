@@ -21,10 +21,6 @@ type module struct {
 	Replace *module
 }
 
-type moduleGraph struct {
-	Modules []module `json:"-"`
-}
-
 func main() {
 	output := flag.String("output", "", "output SPDX JSON file")
 	flag.Parse()

@@ -35,7 +35,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("PutGetRoundTrip", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		h := newHash("a1")
 		data := []byte("conformance round trip payload")
 		if err := s.Put(ctx, h, data); err != nil {
@@ -52,7 +52,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("PutEmptyBlob", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		h := newHash("b2")
 		if err := s.Put(ctx, h, nil); err != nil {
 			t.Fatalf("Put empty: %v", err)
@@ -68,7 +68,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("PutExistingIdempotent", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		h := newHash("c3")
 		// Content addressing: the hash determines the content. Re-Putting
 		// the same blob is a no-op success (the first commit wins).
@@ -89,7 +89,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("GetMissingClassifiesNotFound", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		_, err := s.Get(ctx, newHash("d4"))
 		if err == nil {
 			t.Fatal("Get of missing blob must fail")
@@ -101,7 +101,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("GetStreamMissingClassifiesNotFound", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		_, err := s.GetStream(ctx, newHash("e5"))
 		if err == nil {
 			t.Fatal("GetStream of missing blob must fail")
@@ -113,7 +113,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("PutStreamGetStreamRoundTrip", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		h := newHash("f6")
 		data := []byte("streamed conformance payload")
 		if err := s.PutStream(ctx, h, bytes.NewReader(data), int64(len(data))); err != nil {
@@ -123,7 +123,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 		if err != nil {
 			t.Fatalf("GetStream: %v", err)
 		}
-		defer rc.Close()
+		defer func() { _ = rc.Close() }()
 		var got bytes.Buffer
 		if _, err := got.ReadFrom(rc); err != nil {
 			t.Fatalf("read stream: %v", err)
@@ -135,7 +135,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("Exists", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		h := newHash("07")
 		exists, err := s.Exists(ctx, h)
 		if err != nil || exists {
@@ -152,7 +152,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("DeleteIdempotent", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		h := newHash("18")
 		// Deleting a missing blob is a no-op, not an error.
 		if err := s.Delete(ctx, h); err != nil {
@@ -171,7 +171,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("ListPrefix", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		// The shard-level prefix contract: a prefix of up to 2 chars
 		// (the shard width of the local store) must return every stored
 		// key starting with that prefix, and only such keys. Both local
@@ -211,7 +211,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("ListWithModTime", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		h := newHash("3a")
 		if err := s.Put(ctx, h, []byte("info")); err != nil {
 			t.Fatalf("Put: %v", err)
@@ -239,7 +239,7 @@ func BlobStoreConformance(t *testing.T, newStore func(t *testing.T) SimpleBlobSt
 
 	t.Run("InvalidHash", func(t *testing.T) {
 		s := newStore(t)
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		if _, err := s.Get(ctx, "not-a-hash"); !errors.Is(err, ErrInvalidHash) {
 			t.Fatalf("Get with invalid hash must wrap ErrInvalidHash, got: %v", err)
 		}

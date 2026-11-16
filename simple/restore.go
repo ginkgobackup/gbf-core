@@ -275,7 +275,7 @@ func (r *SimpleRestore) Run(ctx context.Context) (*RestoreResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer secureRoot.Close()
+	defer func() { _ = secureRoot.Close() }()
 
 	// Recreate the directory skeleton before restoring files. Manifest v2
 	// records every directory in Dirs — both dirs containing files and
