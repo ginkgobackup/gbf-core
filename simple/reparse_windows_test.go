@@ -67,7 +67,7 @@ func TestPipelineSkipsJunction(t *testing.T) {
 		DeviceID:   "dev",
 		DataDir:    t.TempDir(),
 	}, NewLocalBlobStore(repo))
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	result, err := p.Run(context.Background())
 	if err != nil {
 		t.Fatalf("pipeline run: %v", err)

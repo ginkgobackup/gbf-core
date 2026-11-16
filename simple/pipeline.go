@@ -1033,7 +1033,13 @@ func (p *SimplePipeline) processFileStreaming(ctx context.Context, fe scanEntry,
 	}
 
 	uploaded, uploadErr := p.uploadChangedChunks(ctx, fe.absPath, fe.size, chunkRefs, chunkData, prevChunks)
-	chunkData = nil // release retained chunk bytes promptly after the upload
+	// Release the retained plaintext right after the upload: for files at the
+	// in-memory threshold these buffers are the bulk of the per-file footprint.
+	// Clearing the element pointers (rather than assigning chunkData = nil)
+	// actually drops the buffers — a nil assignment is a dead store that the
+	// compiler is free to keep alive in the stack slot until this function
+	// returns, which for a whole backup run is a long time.
+	clear(chunkData)
 	if uploadErr != nil {
 		slog.Warn("GBF chunk upload failed", "source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot, "file", fe.relPath, "error", uploadErr, "session_id", p.cfg.SessionID)
 		return nil, 0, false, false, fmt.Errorf("chunk upload %s: %w", fe.relPath, uploadErr)
