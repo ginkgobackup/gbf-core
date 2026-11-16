@@ -140,13 +140,22 @@ func TestSecureDirPosixWriteAtomicAndChtimes(t *testing.T) {
 		t.Fatalf("Chtimes changed outside target mtime")
 	}
 
-	// No staging leftovers.
+	// No staging leftovers. link.txt is the symlink created above, so the
+	// committed file plus that link are the only entries CreateStaging may
+	// not leave behind: anything named "<final>.<uuid>.tmp" is a leak.
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		t.Fatalf("readdir: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Name() != "file.txt" {
-		t.Fatalf("dir entries after commit = %v, want only file.txt", entries)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Fatalf("staging file left behind: %s (entries: %v)", e.Name(), names)
+		}
+	}
+	if len(names) != 2 || names[0] != "file.txt" || names[1] != "link.txt" {
+		t.Fatalf("dir entries after commit = %v, want [file.txt link.txt]", names)
 	}
 }
 
