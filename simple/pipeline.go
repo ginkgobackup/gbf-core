@@ -124,6 +124,11 @@ type PipelineResult struct {
 	FailedErrors    []string
 	LockedFiles     int
 	LockedPaths     []string
+	// SkippedLinks counts symlinks and Windows junctions encountered during
+	// the scan. They are not followed (avoids cycles/duplicate data) and are
+	// not failures.
+	SkippedLinks     int
+	SkippedLinkPaths []string
 }
 
 type SimplePipeline struct {
@@ -139,6 +144,9 @@ type SimplePipeline struct {
 	posExcludes []string
 	negExcludes []string
 	sizeFilters []fsutil.SizeFilter
+	// skippedLinks counts symlinks/junctions skipped by the current scan.
+	skippedLinks     int
+	skippedLinkPaths []string
 	// cdcPolynomial is the per-instance CDC polynomial, loaded from the repo
 	// config in NewSimplePipeline (and re-loaded in Run if the constructor
 	// could not read it). Storing it on the struct — returned directly by
@@ -174,6 +182,10 @@ func (p *SimplePipeline) getGCM() (cipher.AEAD, error) {
 		if len(p.enc.key) == 0 {
 			return
 		}
+		if err := validateAESKeySize(p.enc.key); err != nil {
+			p.gcmErr = err
+			return
+		}
 		block, err := aes.NewCipher(p.enc.key)
 		if err != nil {
 			p.gcmErr = err
@@ -187,6 +199,25 @@ func (p *SimplePipeline) getGCM() (cipher.AEAD, error) {
 		p.gcm = gcm
 	})
 	return p.gcm, p.gcmErr
+}
+
+// Close zeroes the pipeline's owned encryption/decryption key copies.
+// Run must not be called after Close.
+func (p *SimplePipeline) Close() error {
+	var firstErr error
+	if p.enc != nil {
+		if err := p.enc.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if p.dec != nil {
+		if err := p.dec.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	p.cfg.Key = nil
+	p.gcm = nil
+	return firstErr
 }
 
 func (p *SimplePipeline) WithProgress(cb ProgressCallback) *SimplePipeline {
@@ -255,6 +286,13 @@ func (p *SimplePipeline) Run(ctx context.Context) (*PipelineResult, error) {
 		return nil, fmt.Errorf("scan encountered %d unreadable path(s); aborting to prevent an incomplete manifest (set PipelineConfig.AllowScanErrors to allow an incomplete snapshot)", scanErrCount)
 	}
 	newManifest.Stats.ScanErrors = scanErrCount
+	result.SkippedLinks = p.skippedLinks
+	result.SkippedLinkPaths = append([]string(nil), p.skippedLinkPaths...)
+	if p.skippedLinks > 0 {
+		slog.Info("GBF scan skipped symlinks/junctions",
+			"source_id", p.cfg.SourceID, "repo", p.cfg.RepoRoot,
+			"count", p.skippedLinks, "session_id", p.cfg.SessionID)
+	}
 
 	addEmptyDirs(newManifest, files, dirEntries)
 
@@ -383,6 +421,8 @@ func (p *SimplePipeline) loadPreviousFiles(metaDir, cloudID string) (map[string]
 // PipelineConfig.AllowScanErrors.
 func (p *SimplePipeline) scanSourceTree(ctx context.Context, scanPath string) (files []scanEntry, dirEntries []scanEntry, scanErrCount int, err error) {
 	var walkErrorPaths []string
+	p.skippedLinks = 0
+	p.skippedLinkPaths = nil
 	walkErr := filepath.Walk(scanPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			scanErrCount++
@@ -405,6 +445,22 @@ func (p *SimplePipeline) scanSourceTree(ctx context.Context, scanPath string) (f
 		}
 		relPath = filepath.ToSlash(relPath)
 		if relPath == "." {
+			return nil
+		}
+		// Windows junctions are reported as regular files (IsDir false), so
+		// without this check they fall into the file branch and every backup
+		// fails on "Incorrect function" when hashing the reparse point.
+		// Do not follow links: cycles and duplicate data are worse than
+		// skipping an explicit link. OneDrive/CfAPI placeholders are not
+		// symlinks and continue through the normal path.
+		if isReparseLink(info, path) {
+			p.skippedLinks++
+			if len(p.skippedLinkPaths) < 20 {
+				p.skippedLinkPaths = append(p.skippedLinkPaths, relPath)
+			}
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if info.IsDir() {

@@ -191,7 +191,7 @@ func TestGB3StreamRoundTrip(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := decryptStreamToFile(dec, bytes.NewReader(blob.Bytes()), &out); err != nil {
+	if err := decryptStreamToFile(dec, bytes.NewReader(blob.Bytes()), &out, SHA256Bytes(data)); err != nil {
 		t.Fatalf("decryptStreamToFile: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), data) {
@@ -248,7 +248,7 @@ func TestGB3StreamDecryptsCompressedChunks(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := decryptStreamToFile(dec, bytes.NewReader(blob.Bytes()), &out); err != nil {
+	if err := decryptStreamToFile(dec, bytes.NewReader(blob.Bytes()), &out, SHA256Bytes(plaintext)); err != nil {
 		t.Fatalf("decryptStreamToFile: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), plaintext) {

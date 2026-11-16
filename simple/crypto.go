@@ -54,6 +54,10 @@ const (
 	MaxGB3ChunkSize = 64 * 1024 * 1024
 	// GB3 flag bits (header offset 5).
 	GB3FlagChunkCompressed = 1 << 0
+	// GB3FlagHeaderAuthenticated means every chunk's AEAD uses the full
+	// GB3 header as additional authenticated data. New blobs set this flag;
+	// legacy blobs leave it clear and are decrypted with nil AAD.
+	GB3FlagHeaderAuthenticated = 1 << 1
 	// GB3 algorithm identifiers. Zero means "none" where applicable.
 	GB3HashSHA256     = 1
 	GB3CompressNone   = 0
@@ -95,16 +99,60 @@ const (
 type Encryptor struct {
 	key       []byte
 	chunkSize int
+	keyErr    error
+	closed    bool
+}
+
+// validateAESKeySize enforces the GBF key contract: an empty key is the
+// explicit "no encryption" path used by the pipeline, and any non-empty key
+// must be exactly 32 bytes (AES-256). aes.NewCipher would also accept 16 and
+// 24-byte keys, but GBF is defined as AES-256-only; silently encrypting new
+// data with AES-128/192 would make the format depend on the key length.
+func validateAESKeySize(key []byte) error {
+	switch len(key) {
+	case 0, 32:
+		return nil
+	default:
+		return fmt.Errorf("invalid encryption key length %d: expected 32 bytes (AES-256) or empty for no encryption", len(key))
+	}
 }
 
 func NewEncryptor(key []byte, chunkSize int) *Encryptor {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
-	return &Encryptor{key: key, chunkSize: chunkSize}
+	owned := append([]byte(nil), key...)
+	return &Encryptor{key: owned, chunkSize: chunkSize, keyErr: validateAESKeySize(key)}
+}
+
+// Close zeroes the owned key copy. The caller's key slice is not modified.
+func (e *Encryptor) Close() error {
+	if e.closed {
+		return nil
+	}
+	e.closed = true
+	ZeroKeyMaterial(e.key)
+	return nil
+}
+
+// keyError reports a key-length problem detected at construction. The
+// constructors keep their historical signature (callers use them in
+// expression position), so the error surfaces on the first Encrypt/Decrypt
+// call instead.
+func (e *Encryptor) keyError() error {
+	if e.closed {
+		return fmt.Errorf("encryptor is closed")
+	}
+	if e.keyErr != nil {
+		return e.keyErr
+	}
+	return validateAESKeySize(e.key)
 }
 
 func (e *Encryptor) Encrypt(plaintext []byte) ([]byte, error) {
+	if err := e.keyError(); err != nil {
+		return nil, err
+	}
 	if len(plaintext) < e.chunkSize {
 		return e.encryptSmall(plaintext)
 	}
@@ -214,7 +262,8 @@ func (e *Encryptor) encryptLargeV3(plaintext []byte) ([]byte, error) {
 
 	perChunk := ChunkCountSize + FlagsSize + IVSize + e.chunkSize + TagSize
 	result := make([]byte, 0, GB3HeaderSize+len(plaintext)+chunkCount*perChunk)
-	result = append(result, encodeGB3Header(0, GB3CompressNone, uint32(e.chunkSize), uint64(len(plaintext)))...)
+	header := encodeGB3Header(GB3FlagHeaderAuthenticated, GB3CompressNone, uint32(e.chunkSize), uint64(len(plaintext)))
+	result = append(result, header...)
 
 	sizeBuf := make([]byte, ChunkCountSize)
 	for i := 0; i < chunkCount; i++ {
@@ -228,7 +277,7 @@ func (e *Encryptor) encryptLargeV3(plaintext []byte) ([]byte, error) {
 		if _, err := rand.Read(iv); err != nil {
 			return nil, fmt.Errorf("iv chunk %d: %w", i, err)
 		}
-		encrypted := gcm.Seal(nil, iv, chunk, nil)
+		encrypted := gcm.Seal(nil, iv, chunk, header)
 		binary.BigEndian.PutUint32(sizeBuf, uint32(len(encrypted)))
 		result = append(result, sizeBuf...)
 		result = append(result, 0)
@@ -241,16 +290,44 @@ func (e *Encryptor) encryptLargeV3(plaintext []byte) ([]byte, error) {
 type Decryptor struct {
 	key       []byte
 	chunkSize int
+	keyErr    error
+	closed    bool
 }
 
 func NewDecryptor(key []byte, chunkSize int) *Decryptor {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
-	return &Decryptor{key: key, chunkSize: chunkSize}
+	owned := append([]byte(nil), key...)
+	return &Decryptor{key: owned, chunkSize: chunkSize, keyErr: validateAESKeySize(key)}
+}
+
+// Close zeroes the owned key copy. The caller's key slice is not modified.
+func (d *Decryptor) Close() error {
+	if d.closed {
+		return nil
+	}
+	d.closed = true
+	ZeroKeyMaterial(d.key)
+	return nil
+}
+
+// keyError mirrors Encryptor.keyError: the constructor signature is frozen,
+// so an invalid key length is reported by Decrypt instead.
+func (d *Decryptor) keyError() error {
+	if d.closed {
+		return fmt.Errorf("decryptor is closed")
+	}
+	if d.keyErr != nil {
+		return d.keyErr
+	}
+	return validateAESKeySize(d.key)
 }
 
 func (d *Decryptor) Decrypt(ciphertext []byte) ([]byte, error) {
+	if err := d.keyError(); err != nil {
+		return nil, err
+	}
 	if len(ciphertext) < MagicSize {
 		return nil, fmt.Errorf("data too short: %d bytes", len(ciphertext))
 	}
@@ -570,6 +647,10 @@ func (d *Decryptor) decryptLargeV3(full []byte) ([]byte, error) {
 		return nil, fmt.Errorf("gcm: %w", err)
 	}
 
+	var headerAAD []byte
+	if hdr.Flags&GB3FlagHeaderAuthenticated != 0 {
+		headerAAD = full[:GB3HeaderSize]
+	}
 	maxStored := int64(hdr.ChunkSize) + TagSize + 1024
 	var plaintext []byte
 	for i := uint64(0); i < chunkCount; i++ {
@@ -592,7 +673,7 @@ func (d *Decryptor) decryptLargeV3(full []byte) ([]byte, error) {
 		}
 		encrypted := data[:storedSize]
 		data = data[storedSize:]
-		decrypted, err := gcm.Open(nil, iv, encrypted, nil)
+		decrypted, err := gcm.Open(nil, iv, encrypted, headerAAD)
 		if err != nil {
 			return nil, fmt.Errorf("gb3 decrypt chunk %d: %w", i, err)
 		}
@@ -608,6 +689,9 @@ func (d *Decryptor) decryptLargeV3(full []byte) ([]byte, error) {
 	// Same trailing-data check as GB1/GB2: the blob must be fully consumed.
 	if len(data) != 0 {
 		return nil, fmt.Errorf("gb3 trailing data after final chunk: %d bytes", len(data))
+	}
+	if uint64(len(plaintext)) != hdr.PlaintextSize {
+		return nil, fmt.Errorf("gb3 plaintext size mismatch: header %d, decrypted %d", hdr.PlaintextSize, len(plaintext))
 	}
 	return plaintext, nil
 }

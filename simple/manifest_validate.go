@@ -120,11 +120,29 @@ func (m *Manifest) Validate() error {
 	}
 	// Hash format is checked only under full validation: legacy and
 	// synthetic manifests may carry placeholder hashes, so the tolerant
-	// load path skips this.
+	// load path (LoadManifestFromData) skips Validate and must keep loading
+	// them. Restore callers that are about to trust the hashes can call
+	// ValidateHashes directly.
+	return m.ValidateHashes()
+}
+
+// ValidateHashes checks that every referenced content and chunk hash is a
+// 64-character hex SHA-256 value. ValidateStructure deliberately does not
+// check this, because legacy sources and synthetic/golden fixtures carry
+// placeholder hashes that must still load; but a restore that trusts a
+// malformed hash would either fail obscurely deep in blob lookup or restore
+// from the wrong blob. This is the opt-in strict check for that boundary.
+func (m *Manifest) ValidateHashes() error {
+	if m == nil {
+		return errors.New("manifest is nil")
+	}
 	for dirPath, d := range m.Dirs {
+		if d == nil {
+			continue
+		}
 		for _, f := range d.Files {
 			if f.ContentHash != "" && !isSHA256Hex(f.ContentHash) {
-				return fmt.Errorf("file %q: content hash is not sha-256 hex", f.Name)
+				return fmt.Errorf("file %q (in %q): content hash is not sha-256 hex", f.Name, dirPath)
 			}
 			for _, c := range f.Chunks {
 				if !isSHA256Hex(c.Hash) {

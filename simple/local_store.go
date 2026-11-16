@@ -5,6 +5,7 @@ package simple
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -200,35 +201,74 @@ func (s *LocalBlobStore) Get(ctx context.Context, hash string) ([]byte, error) {
 
 func (s *LocalBlobStore) PutStream(ctx context.Context, hash string, r io.Reader, size int64) error {
 	return s.putBlob(ctx, hash, func(f *os.File) error {
-		if s.writeLimiter != nil {
-			w := ratelimit.NewWriter(f, s.writeLimiter)
-			// Honor ctx cancellation during the copy: io.Copy would block on
-			// WriteContext's WaitN with context.Background(), defeating ctx
-			// propagation. A manual loop lets us pass ctx through WriteContext.
-			buf := make([]byte, 32*1024)
-			for {
-				if ctx.Err() != nil {
-					return ctx.Err()
+		return s.writeStream(ctx, f, r, size)
+	})
+}
+
+// writeStream copies exactly size bytes from r into f. The declared size is
+// part of the blob's contract (the caller already hashed those bytes), so a
+// short or long read must fail the upload: silently storing what arrived
+// would either truncate the blob or key it by a hash that does not describe
+// its content. The temp file is removed by putBlob on any error.
+func (s *LocalBlobStore) writeStream(ctx context.Context, f *os.File, r io.Reader, size int64) error {
+	if size < 0 {
+		return fmt.Errorf("write tmp blob stream: invalid declared size %d", size)
+	}
+	if s.writeLimiter != nil {
+		w := ratelimit.NewWriter(f, s.writeLimiter)
+		// Honor ctx cancellation during the copy: io.Copy would block on
+		// WriteContext's WaitN with context.Background(), defeating ctx
+		// propagation. A manual loop lets us pass ctx through WriteContext.
+		buf := make([]byte, 32*1024)
+		var written int64
+		for {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			n, rerr := r.Read(buf)
+			if n > 0 {
+				if written+int64(n) > size {
+					return fmt.Errorf("write tmp blob stream: reader produced more than declared %d bytes", size)
 				}
-				n, rerr := r.Read(buf)
-				if n > 0 {
-					if _, werr := w.WriteContext(ctx, buf[:n]); werr != nil {
-						return fmt.Errorf("write tmp blob stream: %w", werr)
-					}
+				if _, werr := w.WriteContext(ctx, buf[:n]); werr != nil {
+					return fmt.Errorf("write tmp blob stream: %w", werr)
 				}
-				if rerr == io.EOF {
-					return nil
+				written += int64(n)
+			}
+			if rerr == io.EOF {
+				if written != size {
+					return fmt.Errorf("write tmp blob stream: reader ended after %d bytes, declared %d", written, size)
 				}
-				if rerr != nil {
-					return fmt.Errorf("write tmp blob stream: %w", rerr)
-				}
+				return nil
+			}
+			if rerr != nil {
+				return fmt.Errorf("write tmp blob stream: %w", rerr)
 			}
 		}
-		if _, err := io.Copy(f, r); err != nil {
-			return fmt.Errorf("write tmp blob stream: %w", err)
+	}
+
+	written, err := io.CopyN(f, r, size)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return fmt.Errorf("write tmp blob stream: reader ended after %d bytes, declared %d", written, size)
 		}
-		return nil
-	})
+		return fmt.Errorf("write tmp blob stream: %w", err)
+	}
+	// CopyN stops at size, so any remaining byte means the stream is longer
+	// than declared. A non-EOF error also means we cannot prove the size.
+	var extra [1]byte
+	for {
+		n, rerr := r.Read(extra[:])
+		if n > 0 {
+			return fmt.Errorf("write tmp blob stream: reader produced more than declared %d bytes", size)
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			return fmt.Errorf("write tmp blob stream: %w", rerr)
+		}
+	}
 }
 
 func (s *LocalBlobStore) GetStream(ctx context.Context, hash string) (io.ReadCloser, error) {

@@ -505,12 +505,9 @@ func decryptChunkBlobStream(dec *Decryptor, src io.Reader, dst io.Writer, expect
 		}
 	}
 
-	if defaultStreamDecompressor.IsCompressed(plaintext) {
-		decompressed, dErr := defaultStreamDecompressor.Decompress(plaintext)
-		if dErr != nil {
-			return data, ptBuf, fmt.Errorf("decompress chunk blob: %w", dErr)
-		}
-		plaintext = decompressed
+	plaintext, err = restoreDecompress(plaintext, expectedHash)
+	if err != nil {
+		return data, ptBuf, fmt.Errorf("decompress chunk blob: %w", err)
 	}
 
 	actualHash := SHA256Bytes(plaintext)
@@ -542,11 +539,12 @@ func (r *SimpleRestore) restoreChunkedFile(ctx context.Context, file FileEntry, 
 	// Chunk order, tamper verification (per-chunk SHA-256) and the final
 	// fsync/rename semantics are unchanged.
 	var ctBuf, ptBuf []byte
+	vw := &verifyingWriter{w: st, h: sha256.New()}
 	for _, chunk := range file.Chunks {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := r.restoreChunkStream(ctx, chunk.Hash, st, &ctBuf, &ptBuf); err != nil {
+		if err := r.restoreChunkStream(ctx, chunk.Hash, vw, &ctBuf, &ptBuf); err != nil {
 			hashLog := chunk.Hash
 			if len(hashLog) > 12 {
 				hashLog = hashLog[:12]
@@ -555,6 +553,18 @@ func (r *SimpleRestore) restoreChunkedFile(ctx context.Context, file FileEntry, 
 		}
 	}
 	ctBuf, ptBuf = nil, nil // drop the scratch buffers before the fsync
+
+	// Each chunk hash only proves that chunk's bytes are intact; it does not
+	// prove the concatenation is the file the manifest recorded. A reordered,
+	// duplicated, or missing chunk list passes the per-chunk checks while
+	// producing different content, so verify the assembled file against
+	// ContentHash and Size before committing it.
+	if got := hex.EncodeToString(vw.h.Sum(nil)); got != file.ContentHash {
+		return fmt.Errorf("restored content hash mismatch: expected %s, got %s", file.ContentHash, got)
+	}
+	if vw.n != file.Size {
+		return fmt.Errorf("restored content size mismatch: manifest says %d bytes, chunks restored %d", file.Size, vw.n)
+	}
 
 	// Apply the source file's mode bits to the staged file. A failure
 	// here is non-fatal — the file content is already written and durable —
@@ -604,7 +614,7 @@ func (r *SimpleRestore) downloadBlobToSecureDir(ctx context.Context, hash string
 	defer st.Cleanup()
 
 	vw := &verifyingWriter{w: st, h: sha256.New()}
-	if err := decryptStreamToFile(r.dec, rc, vw); err != nil {
+	if err := decryptStreamToFile(r.dec, rc, vw, hash); err != nil {
 		return fmt.Errorf("stream decrypt: %w", err)
 	}
 	if got := hex.EncodeToString(vw.h.Sum(nil)); got != hash {
