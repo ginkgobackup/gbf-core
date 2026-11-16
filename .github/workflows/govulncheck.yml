@@ -6,7 +6,9 @@ on:
     # shared-infrastructure load spikes.
     - cron: "17 3 * * 1"
   push:
-    branches: [master]
+    # Same reason as ci.yml: branch pushes must be scanned too, otherwise a
+    # dependency bump can sit unverified outside master indefinitely.
+    branches: ["**"]
   pull_request:
     branches: [master]
   workflow_dispatch:

@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # Every branch, not just master. Development happens on long-lived
+    # branches that never get a pull request, so a master-only trigger left
+    # them completely unverified — a test that could never pass sat in
+    # restore_secure_posix_test.go for months because of it.
+    branches: ["**"]
   pull_request:
     branches: [master]
 
