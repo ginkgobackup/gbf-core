@@ -215,6 +215,11 @@ func (p *SimplePipeline) Close() error {
 			firstErr = err
 		}
 	}
+	if p.compressor != nil {
+		if err := p.compressor.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	p.cfg.Key = nil
 	p.gcm = nil
 	return firstErr
