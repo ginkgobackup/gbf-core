@@ -270,3 +270,33 @@ func TestNewCompressorStrict(t *testing.T) {
 		t.Errorf("NewCompressorStrict accepted unknown type, got %v", c)
 	}
 }
+
+// TestZstdCompressorCloseReleasesPooledCodecs guards the resource cleanup
+// path used by SimplePipeline.Close: every pipeline owns a private compressor
+// whose encoder/decoder pools keep background goroutines alive until Close.
+func TestZstdCompressorCloseReleasesPooledCodecs(t *testing.T) {
+	c := NewZstdCompressor(1)
+	data := []byte("close releases pooled codecs; repeated words repeated words")
+
+	compressed, err := c.Compress(data)
+	if err != nil {
+		t.Fatalf("Compress: %v", err)
+	}
+	decompressed, err := c.Decompress(compressed)
+	if err != nil {
+		t.Fatalf("Decompress: %v", err)
+	}
+	if !bytes.Equal(decompressed, data) {
+		t.Fatalf("roundtrip mismatch: got %q, want %q", decompressed, data)
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if c.encs != nil || c.decs != nil {
+		t.Fatal("Close left encoder/decoder pools alive")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}

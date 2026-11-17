@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -68,6 +69,34 @@ type ZstdCompressor struct {
 	tooLargeErr error
 	encs        chan *zstd.Encoder
 	decs        chan *zstd.Decoder
+	closeOnce   sync.Once
+	closeErr    error
+}
+
+// Close releases the pooled encoders and decoders. Each instance owns up to
+// 2*GOMAXPROCS objects that keep background goroutines and large buffers alive
+// until explicitly closed, so every pipeline must close the compressor it
+// created. Safe to call more than once; must not race with Compress/Decompress.
+func (c *ZstdCompressor) Close() error {
+	c.closeOnce.Do(func() {
+		if c.encs != nil {
+			close(c.encs)
+			for enc := range c.encs {
+				if err := enc.Close(); err != nil && c.closeErr == nil {
+					c.closeErr = fmt.Errorf("close zstd encoder: %w", err)
+				}
+			}
+			c.encs = nil
+		}
+		if c.decs != nil {
+			close(c.decs)
+			for dec := range c.decs {
+				dec.Close()
+			}
+			c.decs = nil
+		}
+	})
+	return c.closeErr
 }
 
 func NewZstdCompressor(level int) *ZstdCompressor {

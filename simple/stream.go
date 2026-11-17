@@ -366,7 +366,11 @@ func DownloadBlobToFile(ctx context.Context, store SimpleBlobStore, dec *Decrypt
 		if err := os.WriteFile(tmp, plaintext, os.FileMode(mode)); err != nil {
 			return fmt.Errorf("write: %w", err)
 		}
-		return os.Rename(tmp, targetPath)
+		if err := os.Rename(tmp, targetPath); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("rename: %w", err)
+		}
+		return nil
 	}
 	defer func() { _ = rc.Close() }()
 
