@@ -664,6 +664,18 @@ var manifestSaveMu sync.Mutex
 func SaveManifestWithKey(metaDir string, m *Manifest, encryptKey []byte) (string, error) {
 	manifestSaveMu.Lock()
 	defer manifestSaveMu.Unlock()
+	// Files can change between the scan that stamped Size and the read that
+	// produced the chunk layout. The chunk refs describe what was actually
+	// hashed and stored, so align Size to them before validating instead of
+	// failing the whole run on one racing file.
+	if aligned, maxDelta := m.AlignSizesWithChunks(); aligned > 0 {
+		slog.Warn("manifest file sizes realigned to chunk layout",
+			"component", "gbf-manifest",
+			"source_id", m.SourceID,
+			"files", aligned,
+			"max_delta_bytes", maxDelta,
+			"meta_dir", metaDir)
+	}
 	// Structural validation only: header tolerance (e.g. invalid
 	// timestamps falling back to time.Now) is a documented save contract.
 	if err := m.ValidateStructure(); err != nil {

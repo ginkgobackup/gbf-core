@@ -47,6 +47,72 @@ func (f *FileEntry) IsRestorable() bool {
 	return f.ContentHash != ""
 }
 
+// AlignSizesWithChunks rewrites FileEntry.Size to the sum of its chunk sizes
+// wherever the two disagree, and returns how many entries were rewritten plus
+// the largest absolute delta.
+//
+// Size is stamped at scan time, but chunk refs are produced later by actually
+// reading the file. When a file shrinks or grows in between — routine for a
+// live SQLite database, a log being appended to, or any directory a running
+// application owns — the chunk layout describes the bytes that were really
+// read and hashed, while Size describes a version that no longer exists on
+// disk. ValidateStructure rejects such a manifest outright, so a single racing
+// file aborts the entire backup run and nothing is written.
+//
+// For these entries the chunk refs are authoritative: the content hash was
+// computed from exactly those chunks, and restore walks the chunk list rather
+// than Size. Realigning Size keeps the manifest self-consistent and the
+// snapshot restorable, which is strictly better than failing the run.
+//
+// Entries whose chunks carry a negative size are left untouched so that
+// ValidateStructure still reports the real corruption instead of hiding it
+// behind a rewrite.
+func (m *Manifest) AlignSizesWithChunks() (aligned int, maxDelta int64) {
+	if m == nil {
+		return 0, 0
+	}
+	var deltaSum int64
+	for _, d := range m.Dirs {
+		if d == nil {
+			continue
+		}
+		for i := range d.Files {
+			f := &d.Files[i]
+			if len(f.Chunks) == 0 || !f.IsRestorable() {
+				continue
+			}
+			var sum int64
+			corrupt := false
+			for _, c := range f.Chunks {
+				if c.Size < 0 {
+					corrupt = true
+					break
+				}
+				sum += c.Size
+			}
+			if corrupt || sum == f.Size {
+				continue
+			}
+			delta := sum - f.Size
+			if delta < 0 {
+				delta = -delta
+			}
+			if delta > maxDelta {
+				maxDelta = delta
+			}
+			deltaSum += sum - f.Size
+			f.Size = sum
+			aligned++
+		}
+	}
+	if aligned > 0 {
+		// ValidateStructure cross-checks Stats.TotalSize against the file sum,
+		// so the rewrite has to carry through or it trades one error for another.
+		m.Stats.TotalSize += deltaSum
+	}
+	return aligned, maxDelta
+}
+
 // DeriveCompleteness computes snapshot completeness from manifest
 // contents. Used for manifests written before the explicit Completeness
 // field existed: any scan errors, locked files, or failed files make the

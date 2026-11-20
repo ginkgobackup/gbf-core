@@ -240,3 +240,151 @@ func TestManifestValidateRejectsLoadTimeCorruption(t *testing.T) {
 		t.Fatalf("want load-time validation error, got %v", err)
 	}
 }
+
+// shrinkDuringBackupManifest models the race behind "save manifest: manifest
+// structure: chunk sizes sum to N but file size is M": the scan stamped Size
+// before the file grew. The CDC chunker reads to EOF rather than trusting
+// Size, so the appended tail lands in the chunk layout while Size keeps the
+// pre-growth length.
+func shrinkDuringBackupManifest() *Manifest {
+	m := NewManifest(20, "device1-source20", "workbuddy", "C:/data", "device1")
+	m.AddFile(FileEntry{
+		Name:        "session.jsonl",
+		ContentHash: strings.Repeat("a", 64),
+		Size:        4762434, // what the scan saw, before the append
+		Status:      FileStatusChanged,
+		Chunks: []ChunkRef{
+			{Hash: strings.Repeat("b", 64), Size: 2000000},
+			{Hash: strings.Repeat("c", 64), Size: 2786741}, // what was actually read
+		},
+	})
+	m.AddFile(FileEntry{
+		Name:        "stable.txt",
+		ContentHash: strings.Repeat("d", 64),
+		Size:        10,
+		Status:      FileStatusNew,
+	})
+	return m
+}
+
+func TestManifestValidateRejectsScanTimeSizeDrift(t *testing.T) {
+	// Precondition for the realignment: without it the save fails outright.
+	m := shrinkDuringBackupManifest()
+	err := m.ValidateStructure()
+	if err == nil || !strings.Contains(err.Error(), "chunk sizes sum to") {
+		t.Fatalf("want chunk-sum mismatch, got %v", err)
+	}
+}
+
+func TestAlignSizesWithChunksRepairsScanTimeDrift(t *testing.T) {
+	m := shrinkDuringBackupManifest()
+	before := m.Stats.TotalSize
+
+	aligned, maxDelta := m.AlignSizesWithChunks()
+	if aligned != 1 {
+		t.Fatalf("aligned = %d, want 1", aligned)
+	}
+	if maxDelta != 24307 {
+		t.Fatalf("maxDelta = %d, want 24307", maxDelta)
+	}
+
+	got := m.Dirs[""].Files[0]
+	if got.Name != "session.jsonl" {
+		t.Fatalf("unexpected first file %q", got.Name)
+	}
+	if got.Size != 4786741 {
+		t.Fatalf("size = %d, want 4786741 (chunk sum)", got.Size)
+	}
+	// Stats.TotalSize must follow, or ValidateStructure fails on the sum check.
+	if want := before + 24307; m.Stats.TotalSize != want {
+		t.Fatalf("stats totalSize = %d, want %d", m.Stats.TotalSize, want)
+	}
+	if err := m.ValidateStructure(); err != nil {
+		t.Fatalf("realigned manifest still rejected: %v", err)
+	}
+
+	// Idempotent: a second pass finds nothing to fix.
+	if again, _ := m.AlignSizesWithChunks(); again != 0 {
+		t.Fatalf("second pass aligned %d entries, want 0", again)
+	}
+}
+
+func TestAlignSizesWithChunksLeavesConsistentAndChunklessEntries(t *testing.T) {
+	m := NewManifest(1, "dev-1", "s", "C:/d", "dev")
+	m.AddFile(FileEntry{
+		Name:        "ok.txt",
+		ContentHash: strings.Repeat("a", 64),
+		Size:        100,
+		Status:      FileStatusNew,
+		Chunks: []ChunkRef{
+			{Hash: strings.Repeat("b", 64), Size: 60},
+			{Hash: strings.Repeat("c", 64), Size: 40},
+		},
+	})
+	// Blob-mode entry: no chunk refs, so Size is the only record of length.
+	m.AddFile(FileEntry{
+		Name:        "blob.bin",
+		ContentHash: strings.Repeat("d", 64),
+		Size:        777,
+		Status:      FileStatusNew,
+	})
+	// Locked entry: not restorable, must not be touched.
+	m.AddFile(FileEntry{
+		Name:   "locked.dat",
+		Size:   42,
+		Status: FileStatusLocked,
+		Chunks: []ChunkRef{{Hash: strings.Repeat("e", 64), Size: 1}},
+	})
+
+	aligned, maxDelta := m.AlignSizesWithChunks()
+	if aligned != 0 || maxDelta != 0 {
+		t.Fatalf("aligned=%d maxDelta=%d, want 0/0", aligned, maxDelta)
+	}
+	if err := m.ValidateStructure(); err != nil {
+		t.Fatalf("manifest rejected: %v", err)
+	}
+}
+
+func TestAlignSizesWithChunksKeepsNegativeChunkCorruptionVisible(t *testing.T) {
+	// A negative chunk size is real corruption, not a scan race. Rewriting
+	// Size would paper over it, so the entry must survive to ValidateStructure.
+	m := NewManifest(1, "dev-1", "s", "C:/d", "dev")
+	m.AddFile(FileEntry{
+		Name:        "bad.txt",
+		ContentHash: strings.Repeat("a", 64),
+		Size:        10,
+		Status:      FileStatusNew,
+		Chunks:      []ChunkRef{{Hash: strings.Repeat("b", 64), Size: -5}},
+	})
+
+	if aligned, _ := m.AlignSizesWithChunks(); aligned != 0 {
+		t.Fatalf("aligned %d entries, want 0", aligned)
+	}
+	if err := m.ValidateStructure(); err == nil || !strings.Contains(err.Error(), "negative chunk size") {
+		t.Fatalf("want negative chunk size error, got %v", err)
+	}
+}
+
+func TestSaveManifestSurvivesFileShrunkDuringBackup(t *testing.T) {
+	// End to end through the real save path: the run must succeed instead of
+	// aborting the whole backup over a file that changed under it.
+	metaDir := t.TempDir()
+	m := shrinkDuringBackupManifest()
+
+	path, err := SaveManifest(metaDir, m)
+	if err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+	if path == "" {
+		t.Fatal("save returned empty path")
+	}
+
+	loaded, err := LoadManifestFromData(mustMarshalManifestJSON(t, m))
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	entry := loaded.Dirs[""].Files[0]
+	if entry.Size != 4786741 {
+		t.Fatalf("persisted size = %d, want 4786741", entry.Size)
+	}
+}
